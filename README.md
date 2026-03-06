@@ -14,7 +14,7 @@
 ---
 
 <p align="center">
-  <img src="docs/assets/scenario-1-pass.png" width="800" alt="SafeAgentDB - Safe AI Changes Verified">
+  <img src="https://raw.githubusercontent.com/sippinonstraightchlorine/safeagentdb/main/docs/assets/scenario-1-pass.png" width="800" alt="SafeAgentDB - Safe AI Changes Verified">
 </p>
 
 ---
@@ -173,7 +173,7 @@ with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
 The `[BLOCKED]` banner appears:
 
 <p align="center">
-  <img src="docs/assets/scenario-2-blocked.png" width="800" alt="SafeAgentDB - Blocked: Invalid Data Detected">
+  <img src="https://raw.githubusercontent.com/sippinonstraightchlorine/safeagentdb/main/docs/assets/scenario-2-blocked.png" width="800" alt="SafeAgentDB - Blocked: Invalid Data Detected">
 </p>
 
 ---
@@ -352,7 +352,7 @@ sandbox.commit_to_production()
 When an AI agent tries to access another tenant's data, the sandbox simply contains no rows for them -- the diff shows nothing changed:
 
 <p align="center">
-  <img src="docs/assets/scenario-3-approved.png" width="800" alt="SafeAgentDB - Tenant Isolation: No Changes Detected">
+  <img src="https://raw.githubusercontent.com/sippinonstraightchlorine/safeagentdb/main/docs/assets/scenario-3-approved.png" width="800" alt="SafeAgentDB - Tenant Isolation: No Changes Detected">
 </p>
 
 ### Using the Raw SQLAlchemy Session
