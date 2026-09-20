@@ -23,7 +23,8 @@ from safeagentdb.engine import (
     create_sandbox_engine,
     reflect_tables,
 )
-from safeagentdb.sync import SyncError, apply_changeset
+from safeagentdb.errors import SchemaError, SyncError
+from safeagentdb.sync import apply_changeset
 
 
 class ShadowDB:
@@ -42,6 +43,14 @@ class ShadowDB:
         tables: List of table names to clone into the sandbox.
         tenant_id: The tenant/user ID to scope all operations to.
         tenant_column: Column name used for tenant isolation (default: "user_id").
+        row_key: Optional explicit row-identifying key per table, e.g.
+            ``{"events": ["tenant_id", "event_uuid"]}``. Required for tables
+            that have no primary key. The columns must exist and must be unique
+            across the cloned rows, or SchemaError is raised.
+
+    Raises:
+        SchemaError: If a cloned table has no primary key and no usable
+            ``row_key``, or if the production schema cannot be reproduced.
     """
 
     def __init__(
@@ -50,11 +59,14 @@ class ShadowDB:
         tables: Sequence[str],
         tenant_id: Any,
         tenant_column: str = "user_id",
+        *,
+        row_key: dict[str, list[str]] | None = None,
     ) -> None:
         self.prod_engine = prod_engine
         self.table_names = list(tables)
         self.tenant_id = tenant_id
         self.tenant_column = tenant_column
+        self.row_key = {k: list(v) for k, v in (row_key or {}).items()}
 
         self.sandbox_engine: Engine | None = None
         self.session: Session | None = None
@@ -62,6 +74,7 @@ class ShadowDB:
         self._sandbox_metadata: MetaData | None = None
         self._original_snapshot: dict[str, list[dict[str, Any]]] = {}
         self._clone_stats: dict[str, int] = {}
+        self._row_keys: dict[str, list[str]] = {}
         self._committed = False
 
     # ---- Context manager ----
@@ -70,20 +83,29 @@ class ShadowDB:
         self._prod_metadata = reflect_tables(self.prod_engine, self.table_names)
 
         self.sandbox_engine = create_sandbox_engine()
-        self._sandbox_metadata = clone_schema_to_sandbox(
-            self._prod_metadata, self.sandbox_engine
-        )
+        try:
+            self._sandbox_metadata = clone_schema_to_sandbox(
+                self._prod_metadata, self.sandbox_engine
+            )
+            # Fail fast, before any data is copied, if rows cannot be identified.
+            self._row_keys = self._resolve_row_keys()
 
-        self._clone_stats = clone_rows(
-            self.prod_engine,
-            self.sandbox_engine,
-            self._prod_metadata,
-            self._sandbox_metadata,
-            self.tenant_column,
-            self.tenant_id,
-        )
+            self._clone_stats = clone_rows(
+                self.prod_engine,
+                self.sandbox_engine,
+                self._prod_metadata,
+                self._sandbox_metadata,
+                self.tenant_column,
+                self.tenant_id,
+            )
 
-        self._original_snapshot = self._take_snapshot()
+            self._original_snapshot = self._take_snapshot()
+            self._assert_row_keys_unique(self._original_snapshot)
+        except Exception:
+            self.sandbox_engine.dispose()
+            self.sandbox_engine = None
+            raise
+
         self.session = Session(self.sandbox_engine)
         return self
 
@@ -124,21 +146,24 @@ class ShadowDB:
         return compute_diff(
             self._original_snapshot,
             current,
-            self._pk_columns(),
+            self._row_keys,
         )
 
     def commit_to_production(self) -> int:
         """Validate and sync all sandbox changes to production atomically.
 
         Safety gates applied in order:
-        1. Row-level diff computation
+        1. Row-level diff computation, keyed on the primary key or ``row_key``
         2. Pydantic validation on every INSERT/UPDATE row
         3. Tenant ID guard on every row's data
-        4. Tenant ID in WHERE clause of every SQL statement
+        4. Row key + tenant ID in the WHERE clause of every UPDATE/DELETE
         5. Single atomic transaction (all-or-nothing)
 
         Returns the number of rows affected.
-        Raises SyncError on tenant breach, pydantic.ValidationError on bad data.
+
+        Raises:
+            SyncError: On tenant breach or a missing row key.
+            pydantic.ValidationError: If a row fails schema validation.
         """
         if self._committed:
             raise SyncError("This sandbox has already been committed. Create a new ShadowDB.")
@@ -153,6 +178,7 @@ class ShadowDB:
             changeset,
             self.tenant_column,
             self.tenant_id,
+            row_keys=self._row_keys,
         )
         self._committed = True
         return affected
@@ -174,6 +200,11 @@ class ShadowDB:
         """The production database dialect name (e.g. 'postgresql', 'mysql', 'sqlite')."""
         return self.prod_engine.dialect.name
 
+    @property
+    def row_keys(self) -> dict[str, list[str]]:
+        """The row-identifying columns in use for each cloned table."""
+        return {k: list(v) for k, v in self._row_keys.items()}
+
     # ---- Internals ----
 
     def _ensure_open(self) -> None:
@@ -188,8 +219,59 @@ class ShadowDB:
                 snapshot[table_name] = [row._asdict() for row in rows]
         return snapshot
 
-    def _pk_columns(self) -> dict[str, list[str]]:
-        result: dict[str, list[str]] = {}
+    def _resolve_row_keys(self) -> dict[str, list[str]]:
+        """Decide how each cloned table's rows are identified.
+
+        An explicit ``row_key`` wins; otherwise the primary key is used. A table
+        with neither cannot be diffed row by row, so it is rejected outright.
+        """
+        resolved: dict[str, list[str]] = {}
+
         for table_name, table in self._sandbox_metadata.tables.items():
-            result[table_name] = [c.name for c in table.primary_key.columns]
-        return result
+            supplied = self.row_key.get(table_name)
+            if supplied:
+                missing = [c for c in supplied if c not in table.c]
+                if missing:
+                    raise SchemaError(
+                        f"row_key for table '{table_name}' names column(s) "
+                        f"{missing!r} that do not exist. Available columns: "
+                        f"{sorted(c.name for c in table.c)}."
+                    )
+                resolved[table_name] = list(supplied)
+                continue
+
+            pk_columns = [c.name for c in table.primary_key.columns]
+            if not pk_columns:
+                raise SchemaError(
+                    f"Table '{table_name}' has no primary key, so SafeAgentDB cannot "
+                    f"tell its rows apart and cannot diff them safely. Pass an "
+                    f"explicit unique key, e.g. "
+                    f"ShadowDB(..., row_key={{'{table_name}': ['col_a', 'col_b']}}), "
+                    f"or exclude the table from `tables`."
+                )
+            resolved[table_name] = pk_columns
+
+        return resolved
+
+    def _assert_row_keys_unique(
+        self, snapshot: dict[str, list[dict[str, Any]]]
+    ) -> None:
+        """A row key that repeats cannot identify a row, so reject it."""
+        for table_name, columns in self._row_keys.items():
+            seen: set[tuple] = set()
+            for row in snapshot.get(table_name, []):
+                missing = [c for c in columns if c not in row]
+                if missing:
+                    raise SchemaError(
+                        f"row_key for table '{table_name}' names column(s) "
+                        f"{missing!r} that are not present in the cloned rows."
+                    )
+                key = tuple(row[c] for c in columns)
+                if key in seen:
+                    raise SchemaError(
+                        f"row_key {columns!r} is not unique in table '{table_name}': "
+                        f"the value {key!r} appears more than once among the rows "
+                        f"cloned for {self.tenant_column}={self.tenant_id!r}. "
+                        f"Choose columns that uniquely identify a row."
+                    )
+                seen.add(key)

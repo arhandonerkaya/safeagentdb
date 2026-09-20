@@ -38,7 +38,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
-from safeagentdb import SafeModel, ShadowDB, SyncError
+from safeagentdb import SafeModel, SchemaError, ShadowDB, SyncError
 from safeagentdb.engine import (
     _detect_dialect,
     clone_schema_to_sandbox,
@@ -683,109 +683,185 @@ class TestClaim3ValidatorInconsistency:
 
 
 class TestClaim4TablesWithoutPrimaryKey:
-    def test_observed_every_row_collapses_to_one_diff_key(self, tmp_path):
-        engine, _ = _prod_engine(tmp_path, "nopk_keys.db", EVENTS_DDL)
+    """Fixed in 0.2.0: a table with no primary key is rejected unless the caller
+    supplies an explicit row_key, and apply_changeset refuses to execute an
+    UPDATE/DELETE that has no row-identifying predicate."""
+
+    def test_pkless_table_is_rejected_with_an_actionable_error(self, tmp_path):
+        engine, _ = _prod_engine(tmp_path, "nopk_reject.db", EVENTS_DDL)
         _register_event_validator()
 
-        with ShadowDB(engine, tables=["events"], tenant_id=42) as sandbox:
-            assert sandbox._pk_columns() == {"events": []}
-            # Three tenant rows are cloned...
-            assert len(sandbox.query("SELECT * FROM events")) == 3
-            # ...but the diff engine keys them all on the empty tuple.
-            from safeagentdb.diff import _pk_key
+        with pytest.raises(SchemaError) as excinfo:
+            with ShadowDB(engine, tables=["events"], tenant_id=42):
+                pass
 
-            rows = sandbox._original_snapshot["events"]
-            assert [_pk_key(r, []) for r in rows] == [(), (), ()]
+        message = str(excinfo.value)
+        assert "events" in message
+        assert "no primary key" in message
+        assert "row_key" in message
 
-    def test_observed_edit_to_one_row_overwrites_all_tenant_rows(self, tmp_path):
-        engine, _ = _prod_engine(tmp_path, "nopk_update.db", EVENTS_DDL)
+    def test_explicit_row_key_identifies_rows(self, tmp_path):
+        engine, _ = _prod_engine(tmp_path, "nopk_rowkey.db", EVENTS_DDL)
         _register_event_validator()
 
-        with ShadowDB(engine, tables=["events"], tenant_id=42) as sandbox:
+        with ShadowDB(
+            engine,
+            tables=["events"],
+            tenant_id=42,
+            row_key={"events": ["user_id", "kind"]},
+        ) as sandbox:
+            assert sandbox.row_keys == {"events": ["user_id", "kind"]}
+
             sandbox.execute("UPDATE events SET payload='EDITED' WHERE kind='logout'")
             changeset = sandbox.diff()
 
-            # The dashboard shows a single, clean, validated one-row update.
-            assert changeset.summary == {"INSERT": 0, "UPDATE": 1, "DELETE": 0}
             (diff,) = changeset.diffs
-            assert diff.pk == {}
-            assert diff.new == {"user_id": 42, "kind": "logout", "payload": "EDITED"}
-            assert changeset.is_valid is True
-
+            assert diff.pk == {"user_id": 42, "kind": "logout"}
             assert sandbox.commit_to_production() == 1
 
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT user_id, kind, payload FROM events")).fetchall()
-
-        # All three tenant-42 rows were flattened into copies of the edited row:
-        # the UPDATE ran as `SET ... WHERE user_id = 42`, with no pk predicate.
-        assert sorted(rows) == [
-            (42, "logout", "EDITED"),
-            (42, "logout", "EDITED"),
-            (42, "logout", "EDITED"),
-            (99, "login", "other-tenant"),
-        ]
-
-    def test_observed_delete_on_pkless_table_also_mass_overwrites(self, tmp_path):
-        engine, _ = _prod_engine(tmp_path, "nopk_delete.db", EVENTS_DDL)
-        _register_event_validator()
-
-        with ShadowDB(engine, tables=["events"], tenant_id=42) as sandbox:
-            sandbox.execute("DELETE FROM events WHERE kind='logout'")
-            changeset = sandbox.diff()
-            # A DELETE in the sandbox is not even reported as a DELETE.
-            assert changeset.summary == {"INSERT": 0, "UPDATE": 1, "DELETE": 0}
-            assert sandbox.commit_to_production() == 1
-
-        with engine.connect() as conn:
-            rows = conn.execute(text("SELECT user_id, kind, payload FROM events")).fetchall()
-        assert sorted(rows) == [
-            (42, "click", "b"),
-            (42, "click", "b"),
-            (42, "click", "b"),
-            (99, "login", "other-tenant"),
-        ]
-
-    def test_observed_edit_to_a_non_last_row_is_silently_dropped(self, tmp_path):
-        engine, _ = _prod_engine(tmp_path, "nopk_dropped.db", EVENTS_DDL)
-        _register_event_validator()
-
-        with ShadowDB(engine, tables=["events"], tenant_id=42) as sandbox:
-            sandbox.execute("UPDATE events SET payload='EDITED' WHERE kind='login'")
-            changeset = sandbox.diff()
-            # Only the last row per table survives the collapse, so this change
-            # is invisible to the diff and never reaches production.
-            assert changeset.is_empty
-            assert sandbox.commit_to_production() == 0
-
-        with engine.connect() as conn:
-            payload = conn.execute(
-                text("SELECT payload FROM events WHERE kind='login' AND user_id=42")
-            ).scalar_one()
-        assert payload == "a"
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="CLAIM 4 CONFIRMED: with no primary key, _pk_key() collapses the "
-        "table to one row and apply_changeset() emits an UPDATE whose only "
-        "predicate is the tenant column.",
-    )
-    def test_expected_pkless_table_is_rejected_or_handled_row_wise(self, tmp_path):
-        engine, _ = _prod_engine(tmp_path, "nopk_expected.db", EVENTS_DDL)
-        _register_event_validator()
-
-        try:
-            with ShadowDB(engine, tables=["events"], tenant_id=42) as sandbox:
-                sandbox.execute("UPDATE events SET payload='EDITED' WHERE kind='logout'")
-                sandbox.commit_to_production()
-        except SyncError:
-            return  # refusing a PK-less table outright is an acceptable outcome
-
-        with engine.connect() as conn:
-            rows = conn.execute(text("SELECT user_id, kind, payload FROM events")).fetchall()
+        # Exactly one row changed; the other two are intact.
         assert sorted(rows) == [
             (42, "click", "b"),
             (42, "login", "a"),
             (42, "logout", "EDITED"),
             (99, "login", "other-tenant"),
         ]
+
+    def test_edit_to_a_non_last_row_is_no_longer_dropped(self, tmp_path):
+        engine, _ = _prod_engine(tmp_path, "nopk_nonlast.db", EVENTS_DDL)
+        _register_event_validator()
+
+        with ShadowDB(
+            engine,
+            tables=["events"],
+            tenant_id=42,
+            row_key={"events": ["user_id", "kind"]},
+        ) as sandbox:
+            sandbox.execute("UPDATE events SET payload='EDITED' WHERE kind='login'")
+            changeset = sandbox.diff()
+            assert not changeset.is_empty
+            assert sandbox.commit_to_production() == 1
+
+        with engine.connect() as conn:
+            payload = conn.execute(
+                text("SELECT payload FROM events WHERE kind='login' AND user_id=42")
+            ).scalar_one()
+        assert payload == "EDITED"
+
+    def test_delete_removes_only_the_targeted_row(self, tmp_path):
+        engine, _ = _prod_engine(tmp_path, "nopk_del.db", EVENTS_DDL)
+        _register_event_validator()
+
+        with ShadowDB(
+            engine,
+            tables=["events"],
+            tenant_id=42,
+            row_key={"events": ["user_id", "kind"]},
+        ) as sandbox:
+            sandbox.execute("DELETE FROM events WHERE kind='logout'")
+            changeset = sandbox.diff()
+            assert changeset.summary == {"INSERT": 0, "UPDATE": 0, "DELETE": 1}
+            assert sandbox.commit_to_production() == 1
+
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT user_id, kind FROM events")).fetchall()
+        assert sorted(rows) == [
+            (42, "click"),
+            (42, "login"),
+            (99, "login"),
+        ]
+
+    def test_row_key_naming_a_missing_column_is_rejected(self, tmp_path):
+        engine, _ = _prod_engine(tmp_path, "nopk_badcol.db", EVENTS_DDL)
+        _register_event_validator()
+
+        with pytest.raises(SchemaError, match="do not exist"):
+            with ShadowDB(
+                engine,
+                tables=["events"],
+                tenant_id=42,
+                row_key={"events": ["user_id", "nope"]},
+            ):
+                pass
+
+    def test_non_unique_row_key_is_rejected(self, tmp_path):
+        engine, _ = _prod_engine(tmp_path, "nopk_dupe.db", EVENTS_DDL)
+        _register_event_validator()
+
+        # 'user_id' alone repeats across the three cloned rows.
+        with pytest.raises(SchemaError, match="not unique"):
+            with ShadowDB(
+                engine,
+                tables=["events"],
+                tenant_id=42,
+                row_key={"events": ["user_id"]},
+            ):
+                pass
+
+    def test_apply_changeset_refuses_an_update_with_no_row_key(self, tmp_path):
+        """The hard guard, exercised directly: even if a changeset reaches
+        sync.apply_changeset carrying an empty key, nothing is executed."""
+        from safeagentdb.diff import ChangeSet, DiffType, RowDiff
+        from safeagentdb.engine import reflect_tables
+        from safeagentdb.sync import apply_changeset
+
+        engine, _ = _prod_engine(tmp_path, "nopk_guard.db", EVENTS_DDL)
+        _register_event_validator()
+        meta = reflect_tables(engine, ["events"])
+
+        changeset = ChangeSet(
+            diffs=[
+                RowDiff(
+                    table="events",
+                    diff_type=DiffType.UPDATE,
+                    pk={},
+                    old={"user_id": 42, "kind": "logout", "payload": "c"},
+                    new={"user_id": 42, "kind": "logout", "payload": "EDITED"},
+                )
+            ]
+        )
+
+        with pytest.raises(SyncError, match="without a row-identifying key"):
+            apply_changeset(engine, meta, changeset, "user_id", 42)
+
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT user_id, kind, payload FROM events")).fetchall()
+        assert sorted(rows) == [
+            (42, "click", "b"),
+            (42, "login", "a"),
+            (42, "logout", "c"),
+            (99, "login", "other-tenant"),
+        ]
+
+    def test_apply_changeset_rejects_a_key_that_is_not_the_declared_row_key(self, tmp_path):
+        from safeagentdb.diff import ChangeSet, DiffType, RowDiff
+        from safeagentdb.engine import reflect_tables
+        from safeagentdb.sync import apply_changeset
+
+        engine, _ = _prod_engine(tmp_path, "nopk_mismatch.db", EVENTS_DDL)
+        _register_event_validator()
+        meta = reflect_tables(engine, ["events"])
+
+        changeset = ChangeSet(
+            diffs=[
+                RowDiff(
+                    table="events",
+                    diff_type=DiffType.UPDATE,
+                    pk={"user_id": 42},
+                    old={"user_id": 42, "kind": "logout", "payload": "c"},
+                    new={"user_id": 42, "kind": "logout", "payload": "EDITED"},
+                )
+            ]
+        )
+
+        with pytest.raises(SyncError, match="Row key mismatch"):
+            apply_changeset(
+                engine,
+                meta,
+                changeset,
+                "user_id",
+                42,
+                row_keys={"events": ["user_id", "kind"]},
+            )
