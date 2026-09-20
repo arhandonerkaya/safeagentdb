@@ -2,6 +2,11 @@
 
 Date: 2026-09-20 · Version audited: 0.1.2 · Branch: `audit`
 
+> **Status: all four findings fixed in 0.2.0.** See [CHANGELOG.md](../CHANGELOG.md)
+> for what changed and which changes are breaking. The tests below were rewritten
+> as regression guards and now assert the fixed behaviour; this document is kept
+> as the record of what was wrong and why.
+
 Verification only — no library code was changed. Evidence lives in
 [tests/test_weaknesses.py](../tests/test_weaknesses.py).
 
