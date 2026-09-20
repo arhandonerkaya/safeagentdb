@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "safeagentdb"
-version = "0.1.2"
+version = "0.2.0"
 description = "Shadow-Sandbox DB Layer -- let AI agents modify your database safely with tenant isolation, Pydantic validation, and atomic sync."
 readme = "README.md"
 license = "MIT"
