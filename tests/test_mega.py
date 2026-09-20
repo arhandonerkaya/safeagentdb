@@ -159,7 +159,9 @@ class TestImports:
     def test_all_exports(self):
         import safeagentdb
         assert set(safeagentdb.__all__) == {
-            "ShadowDB", "SafeModel", "RowDiff", "DiffType", "ChangeSet", "SyncError",
+            "ShadowDB", "SafeModel", "RowDiff", "DiffType", "ChangeSet",
+            "SafeAgentDBError", "SchemaError", "SyncError", "ConflictError",
+            "MissingValidatorError", "MissingValidatorWarning",
         }
 
 

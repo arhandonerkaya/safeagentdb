@@ -19,11 +19,8 @@ from sqlalchemy import MetaData, delete, insert, update
 from sqlalchemy.engine import Engine
 
 from safeagentdb.diff import ChangeSet, DiffType
+from safeagentdb.errors import SyncError
 from safeagentdb.models import validate_row
-
-
-class SyncError(Exception):
-    """Raised when sync validation or execution fails."""
 
 
 def apply_changeset(

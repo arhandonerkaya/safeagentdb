@@ -1,6 +1,25 @@
-from safeagentdb.sandbox import ShadowDB
+from safeagentdb.diff import ChangeSet, DiffType, RowDiff
+from safeagentdb.errors import (
+    ConflictError,
+    MissingValidatorError,
+    MissingValidatorWarning,
+    SafeAgentDBError,
+    SchemaError,
+    SyncError,
+)
 from safeagentdb.models import SafeModel
-from safeagentdb.diff import RowDiff, DiffType, ChangeSet
-from safeagentdb.sync import SyncError
+from safeagentdb.sandbox import ShadowDB
 
-__all__ = ["ShadowDB", "SafeModel", "RowDiff", "DiffType", "ChangeSet", "SyncError"]
+__all__ = [
+    "ChangeSet",
+    "ConflictError",
+    "DiffType",
+    "MissingValidatorError",
+    "MissingValidatorWarning",
+    "RowDiff",
+    "SafeAgentDBError",
+    "SafeModel",
+    "SchemaError",
+    "ShadowDB",
+    "SyncError",
+]
