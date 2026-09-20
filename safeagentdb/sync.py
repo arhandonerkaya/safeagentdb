@@ -38,6 +38,7 @@ def apply_changeset(
     *,
     row_keys: dict[str, list[str]] | None = None,
     on_conflict: OnConflict = "abort",
+    require_validators: bool = True,
 ) -> int:
     """Apply an approved changeset to the production database atomically.
 
@@ -52,6 +53,9 @@ def apply_changeset(
         on_conflict: ``"abort"`` raises ConflictError when a production row
             drifted since the clone; ``"ignore"`` skips that row and applies
             the rest.
+        require_validators: When True (default), a table with no registered
+            SafeModel raises MissingValidatorError. When False it warns and the
+            row is written unvalidated -- matching RowDiff.validate() exactly.
 
     Returns the number of rows actually written, summed from each statement's
     rowcount.
@@ -89,7 +93,9 @@ def apply_changeset(
                     )
 
                 # ---- Gate 2: Pydantic validation ----
-                validate_row(diff.table, row_data)
+                validate_row(
+                    diff.table, row_data, require_validator=require_validators
+                )
 
             elif diff.diff_type == DiffType.DELETE:
                 if diff.old and diff.old.get(tenant_column) != tenant_id:

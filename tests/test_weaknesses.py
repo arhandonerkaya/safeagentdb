@@ -1,27 +1,31 @@
 """
-test_weaknesses.py -- Audit suite for three suspected weaknesses in SafeAgentDB
-(plus one found while reading the code).
+test_weaknesses.py -- Regression guards for the four findings in docs/AUDIT.md.
+
+Each of these tests describes a way SafeAgentDB used to be unsafe, and asserts
+the behaviour that replaced it in 0.2.0:
+
+1. Schema fidelity  -- the sandbox clone kept only the primary key for any
+   non-SQLite production database, so UNIQUE, CHECK, foreign keys and column
+   defaults were not enforced.
+2. Lost update      -- a production write landing between clone and commit was
+   silently overwritten by a whole-row UPDATE built from the clone-time
+   snapshot.
+3. Validators       -- RowDiff.validate() passed a table with no SafeModel
+   while sync.validate_row() raised KeyError on it.
+4. No primary key   -- every row collapsed onto one diff key, so one edit
+   rewrote every row the tenant owned, or vanished entirely.
 
 Everything here runs on plain pytest in a couple of seconds: file-based SQLite
 in ``tmp_path`` stands in for "production", and dialect-specific behaviour is
 exercised by building ``MetaData`` with postgresql types directly in Python and
 calling the internal functions on it. No server, no network, no Docker.
 
-Each claim is covered by two kinds of test:
-
-* ``test_observed_*`` -- asserts the behaviour the library has **today**.
-  These PASS. They are the proof that the weakness is (or is not) real.
-* ``test_expected_*`` -- asserts the behaviour a safe library **should** have.
-  These are marked ``xfail(strict=True)``: they fail today, and the moment the
-  underlying bug is fixed they XPASS, which strict mode turns into an error --
-  a reminder to drop the marker and keep the test as a regression guard.
-  Run ``pytest --runxfail`` to see them as ordinary hard failures.
-
-No library code is modified by this file.
+If any test in this file fails, a fixed weakness has come back.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal
 
 import pytest
@@ -38,7 +42,16 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
-from safeagentdb import ConflictError, SafeModel, SchemaError, ShadowDB, SyncError
+from safeagentdb import (
+    ConflictError,
+    MissingValidatorError,
+    MissingValidatorWarning,
+    SafeAgentDBError,
+    SafeModel,
+    SchemaError,
+    ShadowDB,
+    SyncError,
+)
 from safeagentdb.engine import (
     _detect_dialect,
     clone_schema_to_sandbox,
@@ -599,7 +612,10 @@ class TestClaim2LostUpdate:
 
 
 class TestClaim3ValidatorInconsistency:
-    def test_observed_diff_says_safe_but_commit_raises_keyerror(self, tmp_path):
+    """Fixed in 0.2.0: RowDiff.validate() and sync.validate_row() share one
+    policy and one wording, so the dashboard can never disagree with the commit."""
+
+    def test_diff_and_commit_agree_when_validators_are_required(self, tmp_path):
         engine, _ = _prod_engine(tmp_path, "novalidator.db", TASKS_DDL)
         assert _model_registry == {}  # no SafeModel registered for "tasks"
 
@@ -607,28 +623,54 @@ class TestClaim3ValidatorInconsistency:
             sandbox.execute("UPDATE tasks SET status = 'archived' WHERE id = 1")
             changeset = sandbox.diff()
 
-            # The dashboard side: green light.
+            # The dashboard side: blocked, with the same wording the sync uses.
             (diff,) = changeset.diffs
-            assert diff.validate() == (True, "No validator")
-            assert changeset.is_valid is True
-            assert "[SAFE] AI CHANGES VERIFIED" in changeset._render_plain()
+            ok, message = diff.validate()
+            assert ok is False
+            assert "No SafeModel registered for table 'tasks'" in message
+            assert changeset.is_valid is False
+            assert "[BLOCKED]" in changeset._render_plain()
 
-            # The sync side: hard failure, and not one of the documented types.
-            with pytest.raises(KeyError) as excinfo:
+            # The sync side: the same verdict, as a typed error.
+            with pytest.raises(MissingValidatorError) as excinfo:
                 sandbox.commit_to_production()
-
             assert "No SafeModel registered for table 'tasks'" in str(excinfo.value)
-            assert not isinstance(excinfo.value, SyncError)
+            assert isinstance(excinfo.value, SafeAgentDBError)
 
-        # The transaction rolled back, so production is untouched.
         with engine.connect() as conn:
             assert (
                 conn.execute(text("SELECT status FROM tasks WHERE id=1")).scalar_one()
                 == "todo"
             )
 
-    def test_observed_both_call_sites_disagree_on_the_same_input(self):
-        """Same table name, same row, opposite answers."""
+    def test_diff_and_commit_agree_when_validators_are_optional(self, tmp_path):
+        engine, _ = _prod_engine(tmp_path, "novalidator_opt.db", TASKS_DDL)
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, require_validators=False
+        ) as sandbox:
+            sandbox.execute("UPDATE tasks SET status = 'archived' WHERE id = 1")
+            changeset = sandbox.diff()
+
+            (diff,) = changeset.diffs
+            ok, message = diff.validate()
+            assert ok is True
+            assert "no validator" in message
+            assert changeset.is_valid is True
+
+            # Same verdict on the sync side -- a warning, not an error.
+            with pytest.warns(MissingValidatorWarning, match="No SafeModel registered"):
+                assert sandbox.commit_to_production() == 1
+
+        with engine.connect() as conn:
+            assert (
+                conn.execute(text("SELECT status FROM tasks WHERE id=1")).scalar_one()
+                == "archived"
+            )
+
+    @pytest.mark.parametrize("require", [True, False])
+    def test_both_call_sites_agree_on_the_same_input(self, require):
+        """Same table name, same row, same policy -- same answer."""
         from safeagentdb.diff import DiffType, RowDiff
         from safeagentdb.models import validate_row
 
@@ -639,33 +681,27 @@ class TestClaim3ValidatorInconsistency:
             pk={"id": 1},
             old=row,
             new=row,
+            require_validator=require,
         )
 
-        assert diff.validate() == (True, "No validator")
-        with pytest.raises(KeyError):
-            validate_row("unregistered", row)
+        diff_ok, _ = diff.validate()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", MissingValidatorWarning)
+                validate_row("unregistered", row, require_validator=require)
+            sync_ok = True
+        except MissingValidatorError:
+            sync_ok = False
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="CLAIM 3 CONFIRMED: RowDiff.validate() passes an unregistered table, "
-        "sync.validate_row() raises KeyError on the same table.",
-    )
-    def test_expected_missing_validator_handled_consistently(self, tmp_path):
-        engine, _ = _prod_engine(tmp_path, "novalidator_expected.db", TASKS_DDL)
+        assert diff_ok == sync_ok
+        assert diff_ok is not require
 
-        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
-            sandbox.execute("UPDATE tasks SET status = 'archived' WHERE id = 1")
-            changeset = sandbox.diff()
-            diff_says_ok = changeset.is_valid
+    def test_missing_validator_error_is_still_a_key_error(self):
+        """0.1.x callers caught a bare KeyError here; that keeps working."""
+        from safeagentdb.models import validate_row
 
-            try:
-                sandbox.commit_to_production()
-                commit_ok = True
-            except (SyncError, KeyError):
-                commit_ok = False
-
-        # Either both accept it or both reject it -- never one and then the other.
-        assert diff_says_ok == commit_ok
+        with pytest.raises(KeyError, match="No SafeModel registered"):
+            validate_row("unregistered", {"x": 1})
 
 
 # ============================================================

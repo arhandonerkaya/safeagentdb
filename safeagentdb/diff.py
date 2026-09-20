@@ -21,7 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from safeagentdb.models import get_validator
+from safeagentdb.models import get_validator, missing_validator_message
 
 
 _OP_STYLES = {
@@ -52,6 +52,7 @@ class RowDiff:
     pk: dict[str, Any]
     old: dict[str, Any] | None = None
     new: dict[str, Any] | None = None
+    require_validator: bool = True
 
     def changed_columns(self) -> list[str]:
         if self.diff_type != DiffType.UPDATE or not self.old or not self.new:
@@ -59,6 +60,12 @@ class RowDiff:
         return [k for k in self.new if self.old.get(k) != self.new[k]]
 
     def validate(self) -> tuple[bool, str]:
+        """Report whether this row would be accepted at commit time.
+
+        A missing validator is treated exactly as sync.validate_row() treats it,
+        so the diff dashboard can never show a green light for a changeset the
+        commit will refuse.
+        """
         if self.diff_type == DiffType.DELETE:
             return True, "OK (delete)"
 
@@ -68,7 +75,9 @@ class RowDiff:
 
         validator_cls = get_validator(self.table)
         if validator_cls is None:
-            return True, "No validator"
+            if self.require_validator:
+                return False, missing_validator_message(self.table)
+            return True, "WARNING: no validator, row unchecked"
 
         try:
             validator_cls.model_validate(row_data)
@@ -376,6 +385,7 @@ def compute_diff(
     current_snapshot: dict[str, list[dict[str, Any]]],
     pk_columns: dict[str, list[str]],
     unsupported_constraints: list[str] | None = None,
+    require_validators: bool = True,
 ) -> ChangeSet:
     changeset = ChangeSet(unsupported_constraints=list(unsupported_constraints or []))
 
@@ -389,6 +399,7 @@ def compute_diff(
                 RowDiff(
                     table=table_name,
                     diff_type=DiffType.DELETE,
+                    require_validator=require_validators,
                     pk=dict(zip(pks, pk_key)),
                     old=orig_rows[pk_key],
                 )
@@ -399,6 +410,7 @@ def compute_diff(
                 RowDiff(
                     table=table_name,
                     diff_type=DiffType.INSERT,
+                    require_validator=require_validators,
                     pk=dict(zip(pks, pk_key)),
                     new=curr_rows[pk_key],
                 )
@@ -410,6 +422,7 @@ def compute_diff(
                     RowDiff(
                         table=table_name,
                         diff_type=DiffType.UPDATE,
+                    require_validator=require_validators,
                         pk=dict(zip(pks, pk_key)),
                         old=orig_rows[pk_key],
                         new=curr_rows[pk_key],

@@ -361,9 +361,16 @@ class TestChangeSet:
         ])
         assert cs.summary == {"INSERT": 1, "UPDATE": 1, "DELETE": 0}
 
-    def test_is_valid_true_no_validators(self):
+    def test_is_valid_false_when_validator_missing_and_required(self):
         cs = ChangeSet(diffs=[
             RowDiff(table="t", diff_type=DiffType.INSERT, pk={"id": 1}, new={"id": 1}),
+        ])
+        assert cs.is_valid is False
+
+    def test_is_valid_true_no_validators_when_not_required(self):
+        cs = ChangeSet(diffs=[
+            RowDiff(table="t", diff_type=DiffType.INSERT, pk={"id": 1}, new={"id": 1},
+                    require_validator=False),
         ])
         assert cs.is_valid is True
 
@@ -433,13 +440,22 @@ class TestRowDiff:
         ok, msg = rd.validate()
         assert ok is True
 
-    def test_validate_no_validator_ok(self):
+    def test_validate_missing_validator_fails_when_required(self):
         rd = RowDiff(
             table="unknown", diff_type=DiffType.INSERT, pk={"id": 1}, new={"id": 1},
         )
         ok, msg = rd.validate()
+        assert ok is False
+        assert "No SafeModel registered" in msg
+
+    def test_validate_missing_validator_warns_when_not_required(self):
+        rd = RowDiff(
+            table="unknown", diff_type=DiffType.INSERT, pk={"id": 1}, new={"id": 1},
+            require_validator=False,
+        )
+        ok, msg = rd.validate()
         assert ok is True
-        assert "No validator" in msg
+        assert "no validator" in msg
 
     def test_validate_catches_bad_data(self):
         _register_task_validator()

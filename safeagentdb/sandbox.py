@@ -53,6 +53,10 @@ class ShadowDB:
             commit. ``"abort"`` (default) raises ConflictError and rolls the
             whole changeset back; ``"ignore"`` skips the drifted row and applies
             the rest.
+        require_validators: When True (default), a table with no registered
+            SafeModel is an error -- reported as a failed row in ``diff()`` and
+            raised as MissingValidatorError at commit time. When False it is a
+            warning in both places instead, and the row is written unvalidated.
 
     Raises:
         SchemaError: If a cloned table has no primary key and no usable
@@ -68,6 +72,7 @@ class ShadowDB:
         *,
         row_key: dict[str, list[str]] | None = None,
         on_conflict: OnConflict = "abort",
+        require_validators: bool = True,
     ) -> None:
         if on_conflict not in _VALID_ON_CONFLICT:
             raise ValueError(
@@ -80,6 +85,7 @@ class ShadowDB:
         self.tenant_column = tenant_column
         self.row_key = {k: list(v) for k, v in (row_key or {}).items()}
         self.on_conflict: OnConflict = on_conflict
+        self.require_validators = require_validators
 
         self.sandbox_engine: Engine | None = None
         self.session: Session | None = None
@@ -166,6 +172,7 @@ class ShadowDB:
             current,
             self._row_keys,
             unsupported_constraints=self._unsupported,
+            require_validators=self.require_validators,
         )
 
     def commit_to_production(self) -> int:
@@ -188,6 +195,8 @@ class ShadowDB:
             ConflictError: If production drifted since the clone and
                 ``on_conflict="abort"``.
             SyncError: On tenant breach or a missing row key.
+            MissingValidatorError: If a table has no SafeModel and
+                ``require_validators`` is True.
             pydantic.ValidationError: If a row fails schema validation.
         """
         if self._committed:
@@ -205,6 +214,7 @@ class ShadowDB:
             self.tenant_id,
             row_keys=self._row_keys,
             on_conflict=self.on_conflict,
+            require_validators=self.require_validators,
         )
         self._committed = True
         return affected
