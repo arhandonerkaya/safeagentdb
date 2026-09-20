@@ -75,6 +75,7 @@ class ShadowDB:
         self._original_snapshot: dict[str, list[dict[str, Any]]] = {}
         self._clone_stats: dict[str, int] = {}
         self._row_keys: dict[str, list[str]] = {}
+        self._unsupported: list[str] = []
         self._committed = False
 
     # ---- Context manager ----
@@ -87,6 +88,10 @@ class ShadowDB:
             self._sandbox_metadata = clone_schema_to_sandbox(
                 self._prod_metadata, self.sandbox_engine
             )
+            self._unsupported = list(
+                self._sandbox_metadata.info.get("unsupported_constraints", [])
+            )
+
             # Fail fast, before any data is copied, if rows cannot be identified.
             self._row_keys = self._resolve_row_keys()
 
@@ -147,6 +152,7 @@ class ShadowDB:
             self._original_snapshot,
             current,
             self._row_keys,
+            unsupported_constraints=self._unsupported,
         )
 
     def commit_to_production(self) -> int:
@@ -199,6 +205,16 @@ class ShadowDB:
     def dialect(self) -> str:
         """The production database dialect name (e.g. 'postgresql', 'mysql', 'sqlite')."""
         return self.prod_engine.dialect.name
+
+    @property
+    def unsupported_constraints(self) -> list[str]:
+        """Schema elements that could not be reproduced in the SQLite sandbox.
+
+        Each entry is a human-readable description. Anything listed here is NOT
+        enforced inside the sandbox, so a violation of it will only be caught by
+        production at commit time.
+        """
+        return list(self._unsupported)
 
     @property
     def row_keys(self) -> dict[str, list[str]]:

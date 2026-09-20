@@ -180,38 +180,36 @@ def _register_event_validator():
 
 
 class TestClaim1SchemaFidelity:
-    # ---- Non-SQLite (postgres-typed) metadata: the claim holds ----
+    """Fixed in 0.2.0: the clone starts from Table.to_metadata() for every
+    dialect, so constraints, unique indexes and defaults survive; only the parts
+    SQLite genuinely cannot express are rewritten, and those are recorded."""
 
-    def test_observed_pg_metadata_loses_unique_check_fk_and_default(self):
-        """The clone keeps only the primary key. Everything else is dropped."""
+    def test_pg_metadata_keeps_unique_check_fk_and_default(self):
         meta = _build_metadata(postgres_typed=True)
         assert _detect_dialect(meta) == "postgresql"
-
-        # The source really does carry all four things.
-        assert "UniqueConstraint" in _constraint_kinds(meta.tables["users"])
-        assert "CheckConstraint" in _constraint_kinds(meta.tables["users"])
-        assert "ForeignKeyConstraint" in _constraint_kinds(meta.tables["tasks"])
-        assert meta.tables["users"].c.plan.server_default is not None
 
         sandbox = create_sandbox_engine()
         try:
             sb_meta = clone_schema_to_sandbox(meta, sandbox)
 
-            assert _constraint_kinds(sb_meta.tables["users"]) == {"PrimaryKeyConstraint"}
-            assert _constraint_kinds(sb_meta.tables["tasks"]) == {"PrimaryKeyConstraint"}
-            assert sb_meta.tables["users"].c.plan.server_default is None
-            assert sb_meta.tables["tasks"].c.owner_id.foreign_keys == set()
+            assert "UniqueConstraint" in _constraint_kinds(sb_meta.tables["users"])
+            assert "CheckConstraint" in _constraint_kinds(sb_meta.tables["users"])
+            assert "ForeignKeyConstraint" in _constraint_kinds(sb_meta.tables["tasks"])
+            assert sb_meta.tables["users"].c.plan.server_default is not None
+            assert sb_meta.tables["tasks"].c.owner_id.foreign_keys != set()
+
+            # The JSONB column is still mapped to a SQLite-safe type.
+            assert type(sb_meta.tables["users"].c.prefs.type).__name__ == "Text"
 
             ddl = _sandbox_ddl(sandbox)
-            assert "UNIQUE" not in ddl
-            assert "CHECK" not in ddl
-            assert "FOREIGN KEY" not in ddl
-            assert "DEFAULT" not in ddl
+            assert "UNIQUE" in ddl
+            assert "CHECK" in ddl
+            assert "FOREIGN KEY" in ddl
+            assert "DEFAULT" in ddl
         finally:
             sandbox.dispose()
 
-    def test_observed_pg_sandbox_accepts_data_production_would_reject(self):
-        """An agent can do three things in the sandbox that Postgres would refuse."""
+    def test_pg_sandbox_rejects_data_production_would_reject(self):
         meta = _build_metadata(postgres_typed=True)
         sandbox = create_sandbox_engine()
         try:
@@ -232,7 +230,7 @@ class TestClaim1SchemaFidelity:
                     "INSERT INTO users (id,user_id,email,plan,age) "
                     "VALUES (2,42,'a@b.com','pro',1)",
                 )
-                == "ACCEPTED"
+                == "IntegrityError"
             )
 
             # 2. value that violates the CHECK constraint
@@ -242,7 +240,7 @@ class TestClaim1SchemaFidelity:
                     "INSERT INTO users (id,user_id,email,plan,age) "
                     "VALUES (3,42,'c@d.com','pro',-5)",
                 )
-                == "ACCEPTED"
+                == "IntegrityError"
             )
 
             # 3. foreign key pointing at a row that does not exist
@@ -252,47 +250,42 @@ class TestClaim1SchemaFidelity:
                     "INSERT INTO tasks (id,user_id,owner_id,title) "
                     "VALUES (1,42,999,'orphan')",
                 )
-                == "ACCEPTED"
+                == "IntegrityError"
             )
 
             with sandbox.connect() as conn:
-                emails = conn.execute(text("SELECT email FROM users")).fetchall()
-                ages = conn.execute(text("SELECT age FROM users ORDER BY id")).fetchall()
-            assert [e[0] for e in emails].count("a@b.com") == 2
-            assert (-5,) in ages
+                assert conn.execute(text("SELECT COUNT(*) FROM users")).scalar_one() == 1
+                assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 0
         finally:
             sandbox.dispose()
 
-    def test_observed_pg_sandbox_also_rejects_data_production_would_accept(self):
-        """The dropped server default makes the sandbox stricter, not only looser:
-        a NOT NULL column whose default was lost now rejects a legal INSERT."""
+    def test_pg_sandbox_accepts_an_insert_that_relies_on_a_server_default(self):
+        """The server default is carried across, so an INSERT that omits a
+        defaulted NOT NULL column succeeds in the sandbox as it would in
+        production."""
         meta = _build_metadata(postgres_typed=True)
         sandbox = create_sandbox_engine()
         try:
             clone_schema_to_sandbox(meta, sandbox)
-            # In production `plan` would default to 'free'. Here the column is
-            # NOT NULL with no default, so the same statement fails.
             assert (
                 _try_sql(
                     sandbox,
                     "INSERT INTO users (id,user_id,email,age) VALUES (4,42,'e@f.com',1)",
                 )
-                == "IntegrityError"
+                == "ACCEPTED"
             )
+            with sandbox.connect() as conn:
+                plan = conn.execute(text("SELECT plan FROM users WHERE id=4")).scalar_one()
+            assert plan == "free"
         finally:
             sandbox.dispose()
 
-    # ---- SQLite production: the claim does NOT hold ----
-
-    def test_observed_sqlite_production_does_preserve_constraints(self, tmp_path):
-        """For a SQLite production DB, clone_schema_to_sandbox() takes the
-        ``table.to_metadata()`` branch, which DOES carry the constraints over."""
+    def test_sqlite_production_preserves_constraints(self, tmp_path):
+        """The SQLite path never lost constraints; it still does not."""
         engine, _ = _prod_engine(
             tmp_path,
             "constraints.db",
             [
-                # NB: the closing paren must sit on its own line -- see
-                # test_observed_sqlite_check_reflection_can_crash_sandbox_creation.
                 "CREATE TABLE users (\n"
                 " id INTEGER PRIMARY KEY,\n"
                 " user_id INTEGER NOT NULL,\n"
@@ -310,8 +303,6 @@ class TestClaim1SchemaFidelity:
             ],
         )
         meta = reflect_tables(engine, ["users", "tasks"])
-        assert _detect_dialect(meta) == "sqlite"
-
         sandbox = create_sandbox_engine()
         try:
             sb_meta = clone_schema_to_sandbox(meta, sandbox)
@@ -319,7 +310,6 @@ class TestClaim1SchemaFidelity:
             assert "UniqueConstraint" in _constraint_kinds(sb_meta.tables["users"])
             assert "CheckConstraint" in _constraint_kinds(sb_meta.tables["users"])
             assert "ForeignKeyConstraint" in _constraint_kinds(sb_meta.tables["tasks"])
-            assert sb_meta.tables["users"].c.plan.server_default is not None
 
             ddl = _sandbox_ddl(sandbox)
             assert "UNIQUE (email)" in ddl
@@ -328,7 +318,6 @@ class TestClaim1SchemaFidelity:
             assert "DEFAULT 'free'" in ddl
             assert "CREATE UNIQUE INDEX ux_users_email" in ddl
 
-            # ...and they are actually enforced.
             with sandbox.connect() as conn:
                 conn.execute(
                     text(
@@ -351,7 +340,6 @@ class TestClaim1SchemaFidelity:
                 )
                 == "IntegrityError"
             )
-            # The server default survives too.
             with sandbox.connect() as conn:
                 conn.execute(
                     text("INSERT INTO users (id,user_id,email) VALUES (4,42,'e@f.com')")
@@ -362,19 +350,19 @@ class TestClaim1SchemaFidelity:
         finally:
             sandbox.dispose()
 
-    def test_observed_sandbox_never_enforces_foreign_keys(self, tmp_path):
-        """Even on the faithful SQLite path the FK is decorative: SQLite ships
-        with ``PRAGMA foreign_keys=OFF`` and nothing in the library turns it on."""
+    def test_sandbox_enforces_foreign_keys(self, tmp_path):
+        """PRAGMA foreign_keys is now switched on for every sandbox connection."""
         engine, _ = _prod_engine(
             tmp_path,
             "fk.db",
             [
                 "CREATE TABLE users (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)",
-                "CREATE TABLE tasks ("
-                " id INTEGER PRIMARY KEY,"
-                " user_id INTEGER NOT NULL,"
-                " owner_id INTEGER NOT NULL REFERENCES users(id),"
-                " title TEXT NOT NULL)",
+                "CREATE TABLE tasks (\n"
+                " id INTEGER PRIMARY KEY,\n"
+                " user_id INTEGER NOT NULL,\n"
+                " owner_id INTEGER NOT NULL REFERENCES users(id),\n"
+                " title TEXT NOT NULL\n"
+                ")",
             ],
         )
         meta = reflect_tables(engine, ["users", "tasks"])
@@ -382,28 +370,54 @@ class TestClaim1SchemaFidelity:
         try:
             clone_schema_to_sandbox(meta, sandbox)
             with sandbox.connect() as conn:
-                assert conn.execute(text("PRAGMA foreign_keys")).scalar_one() == 0
+                assert conn.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
             assert (
                 _try_sql(
                     sandbox,
                     "INSERT INTO tasks (id,user_id,owner_id,title) "
                     "VALUES (1,42,999,'orphan')",
                 )
-                == "ACCEPTED"
+                == "IntegrityError"
             )
         finally:
             sandbox.dispose()
 
-    def test_observed_sqlite_check_reflection_can_crash_sandbox_creation(self, tmp_path):
-        """Sub-finding: on the SQLite path the reflected CHECK expression is
-        re-emitted verbatim. SQLAlchemy's SQLite CHECK reflection is regex-based
-        and swallows the table's closing paren when it sits on the same line, so
-        the sandbox DDL is unbalanced and ShadowDB.__enter__ raises.
+    @pytest.mark.parametrize("postgres_typed", [True, False])
+    def test_fidelity_no_longer_depends_on_one_column_type(self, postgres_typed):
+        """The same logical schema now produces the same sandbox whether or not
+        it happens to use a postgres-specific column type."""
+        meta = _build_metadata(postgres_typed=postgres_typed)
+        sandbox = create_sandbox_engine()
+        try:
+            sb_meta = clone_schema_to_sandbox(meta, sandbox)
+            assert _constraint_kinds(sb_meta.tables["users"]) == {
+                "PrimaryKeyConstraint",
+                "UniqueConstraint",
+                "CheckConstraint",
+            }
+            with sandbox.connect() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO users (id,user_id,email,plan,age) "
+                        "VALUES (1,42,'a@b.com','pro',30)"
+                    )
+                )
+                conn.commit()
+            assert (
+                _try_sql(
+                    sandbox,
+                    "INSERT INTO users (id,user_id,email,plan,age) "
+                    "VALUES (2,42,'a@b.com','pro',1)",
+                )
+                == "IntegrityError"
+            )
+        finally:
+            sandbox.dispose()
 
-        The only difference from the table above is where a newline sits.
-        """
-        from sqlalchemy.exc import OperationalError
-
+    def test_malformed_check_is_recorded_instead_of_crashing(self, tmp_path):
+        """SQLAlchemy's SQLite CHECK reflection swallows the table's closing
+        paren when it sits on the same line. That constraint is now skipped and
+        listed in unsupported_constraints instead of raising OperationalError."""
         engine, _ = _prod_engine(
             tmp_path,
             "check_oneline.db",
@@ -420,75 +434,16 @@ class TestClaim1SchemaFidelity:
         (check,) = [
             c for c in meta.tables["users"].constraints if isinstance(c, CheckConstraint)
         ]
-        # The reflected expression is not balanced.
-        assert check.sqltext.text == "age >= 0)"
+        assert check.sqltext.text == "age >= 0)"  # still unbalanced upstream
 
-        with pytest.raises(OperationalError) as excinfo:
-            with ShadowDB(engine, tables=["users"], tenant_id=42):
-                pass
-        assert "syntax error" in str(excinfo.value)
-
-    # ---- The dividing line is an incidental detail of the schema ----
-
-    @pytest.mark.parametrize(
-        "postgres_typed,expected_constraints,duplicate_email_result",
-        [
-            (True, {"PrimaryKeyConstraint"}, "ACCEPTED"),
-            (
-                False,
-                {"PrimaryKeyConstraint", "UniqueConstraint", "CheckConstraint"},
-                "IntegrityError",
-            ),
-        ],
-    )
-    def test_observed_fidelity_flips_on_one_column_type(
-        self, postgres_typed, expected_constraints, duplicate_email_result
-    ):
-        """Two identical Postgres schemas get different sandboxes purely because
-        one of them happens to use a postgres-specific column type.
-        _detect_dialect() sniffs column type modules, so a Postgres table built
-        from generic types is treated as SQLite and keeps its constraints."""
-        meta = _build_metadata(postgres_typed=postgres_typed)
-        sandbox = create_sandbox_engine()
-        try:
-            sb_meta = clone_schema_to_sandbox(meta, sandbox)
-            assert _constraint_kinds(sb_meta.tables["users"]) == expected_constraints
-            with sandbox.connect() as conn:
-                conn.execute(
-                    text(
-                        "INSERT INTO users (id,user_id,email,plan,age) "
-                        "VALUES (1,42,'a@b.com','pro',30)"
-                    )
-                )
-                conn.commit()
-            assert (
-                _try_sql(
-                    sandbox,
-                    "INSERT INTO users (id,user_id,email,plan,age) "
-                    "VALUES (2,42,'a@b.com','pro',1)",
-                )
-                == duplicate_email_result
-            )
-        finally:
-            sandbox.dispose()
-
-    # ---- What a correct implementation would do ----
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="CLAIM 1 CONFIRMED: _clone_table_for_sqlite() drops UNIQUE, CHECK, "
-        "FK and server defaults for every non-SQLite production database.",
-    )
-    def test_expected_pg_metadata_keeps_table_constraints(self):
-        meta = _build_metadata(postgres_typed=True)
-        sandbox = create_sandbox_engine()
-        try:
-            sb_meta = clone_schema_to_sandbox(meta, sandbox)
-            assert "UniqueConstraint" in _constraint_kinds(sb_meta.tables["users"])
-            assert "CheckConstraint" in _constraint_kinds(sb_meta.tables["users"])
-            assert sb_meta.tables["users"].c.plan.server_default is not None
-        finally:
-            sandbox.dispose()
+        with ShadowDB(engine, tables=["users"], tenant_id=42) as sandbox:
+            assert sandbox.query("SELECT * FROM users") == [
+                {"id": 1, "user_id": 42, "age": 30}
+            ]
+            reported = sandbox.unsupported_constraints
+            assert len(reported) == 1
+            assert "CHECK" in reported[0]
+            assert "users" in reported[0]
 
 
 # ============================================================

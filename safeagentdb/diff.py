@@ -83,6 +83,7 @@ class ChangeSet:
     """Full set of diffs across all tables."""
 
     diffs: list[RowDiff] = field(default_factory=list)
+    unsupported_constraints: list[str] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -135,6 +136,7 @@ class ChangeSet:
                     border_style="dim",
                 )
             )
+            self._render_rich_unsupported(console)
             return
 
         all_valid = self.is_valid
@@ -157,6 +159,7 @@ class ChangeSet:
 
         console.print()
         console.print(banner)
+        self._render_rich_unsupported(console)
 
         stats_text = Text()
         stats_text.append("  ")
@@ -234,11 +237,28 @@ class ChangeSet:
                     )
             console.print()
 
+    def _render_rich_unsupported(self, console: Console) -> None:
+        if not self.unsupported_constraints:
+            return
+        body = "\n".join(f"- {item}" for item in self.unsupported_constraints)
+        console.print(
+            Panel(
+                f"[yellow]{body}[/yellow]\n\n"
+                "[dim]These are NOT enforced in the sandbox. A violation will "
+                "only surface when production rejects the commit.[/dim]",
+                title="[bold yellow]NOT ENFORCED IN SANDBOX[/bold yellow]",
+                border_style="yellow",
+                padding=(0, 2),
+            )
+        )
+
     # ---- Plain-text rendering (non-TTY / logs / CI) ----
 
     def _render_plain(self) -> str:
         if self.is_empty:
-            return "SafeAgentDB: No changes detected."
+            return "\n".join(
+                ["SafeAgentDB: No changes detected."] + self._plain_unsupported_lines()
+            )
 
         all_valid = self.is_valid
         s = self.summary
@@ -295,19 +315,28 @@ class ChangeSet:
         sep = "-+-".join("-" * w for w in widths)
         verdict = "ALL VALIDATIONS PASSED" if all_valid else "VALIDATION FAILURES DETECTED"
 
-        lines = [
-            header,
+        lines = [header]
+        lines.extend(self._plain_unsupported_lines())
+        lines.extend([
             "  " + "  ".join(stats_parts),
             "",
             fmt(headers),
             sep,
-        ]
+        ])
         for row in display_rows:
             lines.append(fmt(row))
         lines.append(sep)
         lines.append(f"  >> {verdict}")
 
         return "\n".join(lines)
+
+    def _plain_unsupported_lines(self) -> list[str]:
+        if not self.unsupported_constraints:
+            return []
+        lines = ["[NOT ENFORCED IN SANDBOX] violations surface only in production:"]
+        lines.extend(f"  - {item}" for item in self.unsupported_constraints)
+        lines.append("")
+        return lines
 
 
 def _build_column_rows(d: RowDiff) -> list[tuple[str, Text, Text]]:
@@ -346,8 +375,9 @@ def compute_diff(
     original_snapshot: dict[str, list[dict[str, Any]]],
     current_snapshot: dict[str, list[dict[str, Any]]],
     pk_columns: dict[str, list[str]],
+    unsupported_constraints: list[str] | None = None,
 ) -> ChangeSet:
-    changeset = ChangeSet()
+    changeset = ChangeSet(unsupported_constraints=list(unsupported_constraints or []))
 
     for table_name in sorted(set(original_snapshot) | set(current_snapshot)):
         pks = pk_columns.get(table_name, ["id"])
