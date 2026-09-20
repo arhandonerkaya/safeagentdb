@@ -38,7 +38,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
-from safeagentdb import SafeModel, SchemaError, ShadowDB, SyncError
+from safeagentdb import ConflictError, SafeModel, SchemaError, ShadowDB, SyncError
 from safeagentdb.engine import (
     _detect_dialect,
     clone_schema_to_sandbox,
@@ -457,15 +457,18 @@ class TestClaim1SchemaFidelity:
 
 
 class TestClaim2LostUpdate:
-    def test_observed_concurrent_write_is_silently_overwritten(self, tmp_path):
+    """Fixed in 0.2.0: every UPDATE/DELETE target is re-read and compared
+    against the clone-time values, only changed columns are written, and the
+    affected count comes from each statement's rowcount."""
+
+    def test_concurrent_write_raises_conflict_error(self, tmp_path):
         engine, url = _prod_engine(tmp_path, "lost.db", TASKS_DDL)
         _register_task_validator()
 
         with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
-            # The agent touches one column.
             sandbox.execute("UPDATE tasks SET status = 'done' WHERE id = 1")
 
-            # Meanwhile another process edits a DIFFERENT column of the same row.
+            # Another process edits a DIFFERENT column of the same row.
             other = create_engine(url)
             with other.begin() as conn:
                 conn.execute(
@@ -474,34 +477,76 @@ class TestClaim2LostUpdate:
                         "WHERE id = 1"
                     )
                 )
-            with other.connect() as conn:
-                assert (
-                    conn.execute(text("SELECT title FROM tasks WHERE id=1")).scalar_one()
-                    == "Ship v2 [renamed by human]"
-                )
 
+            with pytest.raises(ConflictError) as excinfo:
+                sandbox.commit_to_production()
+
+        error = excinfo.value
+        assert error.table == "tasks"
+        assert error.row_key == {"id": 1}
+        assert error.columns == ["title"]
+        assert isinstance(error, SyncError)
+
+        # The whole changeset rolled back: the human's rename survives and the
+        # agent's status change was not applied.
+        with engine.connect() as conn:
+            title, status = conn.execute(
+                text("SELECT title, status FROM tasks WHERE id=1")
+            ).one()
+        assert title == "Ship v2 [renamed by human]"
+        assert status == "todo"
+
+    def test_update_writes_only_changed_columns(self, tmp_path):
+        """A column the agent never touched is not part of the UPDATE, so a
+        concurrent edit to a different column of a different row is untouched
+        and the write is minimal."""
+        engine, _ = _prod_engine(tmp_path, "minimal.db", TASKS_DDL)
+        _register_task_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE tasks SET status = 'done' WHERE id = 1")
             changeset = sandbox.diff()
             (diff,) = changeset.diffs
-            # The diff carries the whole row as it looked at clone time, and it
-            # reports only `status` as changed -- the agent never touched title.
             assert diff.changed_columns() == ["status"]
-            assert diff.new["title"] == "Ship v2"
-            assert diff.old["title"] == "Ship v2"
-
-            # No warning, no conflict error.
             assert sandbox.commit_to_production() == 1
 
         with engine.connect() as conn:
             title, status = conn.execute(
                 text("SELECT title, status FROM tasks WHERE id=1")
             ).one()
-        # The human's rename is gone, reverted to the clone-time value.
         assert title == "Ship v2"
         assert status == "done"
 
-    def test_observed_commit_count_overstates_rows_written(self, tmp_path):
-        """apply_changeset() does ``affected += 1`` per diff without looking at
-        rowcount, so a statement that matched nothing still counts."""
+    def test_on_conflict_ignore_skips_the_drifted_row(self, tmp_path):
+        engine, url = _prod_engine(
+            tmp_path,
+            "ignore.db",
+            TASKS_DDL + ["INSERT INTO tasks VALUES (2, 42, 'Write docs', 'todo')"],
+        )
+        _register_task_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, on_conflict="ignore"
+        ) as sandbox:
+            sandbox.execute("UPDATE tasks SET status = 'done' WHERE id IN (1, 2)")
+
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("UPDATE tasks SET title = 'renamed' WHERE id = 1"))
+
+            # Row 1 drifted and is skipped; row 2 still applies.
+            assert sandbox.commit_to_production() == 1
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT id, title, status FROM tasks ORDER BY id")
+            ).fetchall()
+        assert rows == [
+            (1, "renamed", "todo"),
+            (2, "Write docs", "done"),
+        ]
+
+    def test_vanished_row_raises_conflict_error(self, tmp_path):
         engine, url = _prod_engine(tmp_path, "vanished.db", TASKS_DDL)
         _register_task_validator()
 
@@ -512,39 +557,36 @@ class TestClaim2LostUpdate:
             with other.begin() as conn:
                 conn.execute(text("DELETE FROM tasks WHERE id = 1"))
 
-            # Reports one row affected; zero rows were actually written.
-            assert sandbox.commit_to_production() == 1
+            with pytest.raises(ConflictError, match="deleted in production"):
+                sandbox.commit_to_production()
 
         with engine.connect() as conn:
             assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 0
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="CLAIM 2 CONFIRMED: no optimistic-concurrency check -- the commit "
-        "overwrites every column from the clone-time snapshot.",
-    )
-    def test_expected_concurrent_write_is_detected_or_preserved(self, tmp_path):
-        engine, url = _prod_engine(tmp_path, "lost_expected.db", TASKS_DDL)
+    def test_commit_count_is_the_real_rowcount(self, tmp_path):
+        engine, _ = _prod_engine(
+            tmp_path,
+            "count.db",
+            TASKS_DDL
+            + [
+                "INSERT INTO tasks VALUES (2, 42, 'Write docs', 'todo')",
+                "INSERT INTO tasks VALUES (3, 42, 'Fix bug', 'todo')",
+            ],
+        )
         _register_task_validator()
 
         with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
             sandbox.execute("UPDATE tasks SET status = 'done' WHERE id = 1")
-            other = create_engine(url)
-            with other.begin() as conn:
-                conn.execute(
-                    text(
-                        "UPDATE tasks SET title = 'Ship v2 [renamed by human]' "
-                        "WHERE id = 1"
-                    )
-                )
-            try:
-                sandbox.commit_to_production()
-            except SyncError:
-                return  # raising a conflict error is an acceptable outcome too
+            sandbox.execute("DELETE FROM tasks WHERE id = 2")
+            sandbox.execute(
+                "INSERT INTO tasks (id, user_id, title, status) "
+                "VALUES (4, 42, 'New task', 'todo')"
+            )
+            assert sandbox.commit_to_production() == 3
 
         with engine.connect() as conn:
-            title = conn.execute(text("SELECT title FROM tasks WHERE id=1")).scalar_one()
-        assert title == "Ship v2 [renamed by human]"
+            ids = [r[0] for r in conn.execute(text("SELECT id FROM tasks ORDER BY id"))]
+        assert ids == [1, 3, 4]
 
 
 # ============================================================

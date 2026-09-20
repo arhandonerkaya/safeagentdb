@@ -24,7 +24,9 @@ from safeagentdb.engine import (
     reflect_tables,
 )
 from safeagentdb.errors import SchemaError, SyncError
-from safeagentdb.sync import apply_changeset
+from safeagentdb.sync import OnConflict, apply_changeset
+
+_VALID_ON_CONFLICT = ("abort", "ignore")
 
 
 class ShadowDB:
@@ -47,6 +49,10 @@ class ShadowDB:
             ``{"events": ["tenant_id", "event_uuid"]}``. Required for tables
             that have no primary key. The columns must exist and must be unique
             across the cloned rows, or SchemaError is raised.
+        on_conflict: What to do when a production row drifted between clone and
+            commit. ``"abort"`` (default) raises ConflictError and rolls the
+            whole changeset back; ``"ignore"`` skips the drifted row and applies
+            the rest.
 
     Raises:
         SchemaError: If a cloned table has no primary key and no usable
@@ -61,12 +67,19 @@ class ShadowDB:
         tenant_column: str = "user_id",
         *,
         row_key: dict[str, list[str]] | None = None,
+        on_conflict: OnConflict = "abort",
     ) -> None:
+        if on_conflict not in _VALID_ON_CONFLICT:
+            raise ValueError(
+                f"on_conflict must be one of {_VALID_ON_CONFLICT!r}, got {on_conflict!r}."
+            )
+
         self.prod_engine = prod_engine
         self.table_names = list(tables)
         self.tenant_id = tenant_id
         self.tenant_column = tenant_column
         self.row_key = {k: list(v) for k, v in (row_key or {}).items()}
+        self.on_conflict: OnConflict = on_conflict
 
         self.sandbox_engine: Engine | None = None
         self.session: Session | None = None
@@ -163,11 +176,17 @@ class ShadowDB:
         2. Pydantic validation on every INSERT/UPDATE row
         3. Tenant ID guard on every row's data
         4. Row key + tenant ID in the WHERE clause of every UPDATE/DELETE
-        5. Single atomic transaction (all-or-nothing)
+        5. Optimistic concurrency check against the clone-time values
+        6. Single atomic transaction (all-or-nothing)
 
-        Returns the number of rows affected.
+        Only the columns the agent actually changed are written.
+
+        Returns the number of rows actually written, summed from each
+        statement's rowcount.
 
         Raises:
+            ConflictError: If production drifted since the clone and
+                ``on_conflict="abort"``.
             SyncError: On tenant breach or a missing row key.
             pydantic.ValidationError: If a row fails schema validation.
         """
@@ -185,6 +204,7 @@ class ShadowDB:
             self.tenant_column,
             self.tenant_id,
             row_keys=self._row_keys,
+            on_conflict=self.on_conflict,
         )
         self._committed = True
         return affected
