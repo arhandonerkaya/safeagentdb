@@ -16,7 +16,8 @@ recorded rather than dropped silently -- see ``unsupported_constraints``.
 from __future__ import annotations
 
 import re
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy import (
     CheckConstraint,

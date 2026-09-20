@@ -16,7 +16,6 @@ from pydantic import BaseModel, ConfigDict
 
 from safeagentdb.errors import MissingValidatorError, MissingValidatorWarning
 
-
 # Global registry: table_name -> SafeModel subclass
 _model_registry: dict[str, type[SafeModel]] = {}
 

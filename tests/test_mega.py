@@ -26,7 +26,6 @@ Sections:
   S. Engine internals -- dialect detection & type mapping
 """
 
-import sys
 from typing import Literal
 
 import pytest
@@ -41,16 +40,14 @@ from safeagentdb import (
     ShadowDB,
     SyncError,
 )
-from safeagentdb.models import _model_registry, get_validator, validate_row
 from safeagentdb.engine import (
     _detect_dialect,
     _sqlite_safe_type,
-    clone_rows,
     clone_schema_to_sandbox,
     create_sandbox_engine,
     reflect_tables,
 )
-
+from safeagentdb.models import _model_registry, get_validator, validate_row
 
 # ============================================================
 # Fixtures

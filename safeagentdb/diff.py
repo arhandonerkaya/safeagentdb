@@ -23,7 +23,6 @@ from rich.text import Text
 
 from safeagentdb.models import get_validator, missing_validator_message
 
-
 _OP_STYLES = {
     "INSERT": "bold green",
     "UPDATE": "bold yellow",
@@ -400,7 +399,7 @@ def compute_diff(
                     table=table_name,
                     diff_type=DiffType.DELETE,
                     require_validator=require_validators,
-                    pk=dict(zip(pks, pk_key)),
+                    pk=dict(zip(pks, pk_key, strict=False)),
                     old=orig_rows[pk_key],
                 )
             )
@@ -411,7 +410,7 @@ def compute_diff(
                     table=table_name,
                     diff_type=DiffType.INSERT,
                     require_validator=require_validators,
-                    pk=dict(zip(pks, pk_key)),
+                    pk=dict(zip(pks, pk_key, strict=False)),
                     new=curr_rows[pk_key],
                 )
             )
@@ -423,7 +422,7 @@ def compute_diff(
                         table=table_name,
                         diff_type=DiffType.UPDATE,
                     require_validator=require_validators,
-                        pk=dict(zip(pks, pk_key)),
+                        pk=dict(zip(pks, pk_key, strict=False)),
                         old=orig_rows[pk_key],
                         new=curr_rows[pk_key],
                     )

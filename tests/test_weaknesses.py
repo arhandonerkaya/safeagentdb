@@ -60,7 +60,6 @@ from safeagentdb.engine import (
 )
 from safeagentdb.models import _model_registry
 
-
 # ============================================================
 # Fixtures & helpers
 # ============================================================
@@ -444,9 +443,9 @@ class TestClaim1SchemaFidelity:
         )
 
         meta = reflect_tables(engine, ["users"])
-        (check,) = [
+        (check,) = (
             c for c in meta.tables["users"].constraints if isinstance(c, CheckConstraint)
-        ]
+        )
         assert check.sqltext.text == "age >= 0)"  # still unbalanced upstream
 
         with ShadowDB(engine, tables=["users"], tenant_id=42) as sandbox:

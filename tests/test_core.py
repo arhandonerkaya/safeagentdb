@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from rich.console import Console
 from sqlalchemy import create_engine, text
 
-from safeagentdb import ShadowDB, SafeModel, ChangeSet, SyncError
+from safeagentdb import SafeModel, ShadowDB, SyncError
 
 console = Console()
 PASS = 0
@@ -235,13 +235,14 @@ console.print()
 # ---- TEST 6: Import surface ----
 console.print("[bold cyan]Test 6: Public API Imports[/bold cyan]")
 
-from safeagentdb import ShadowDB, SafeModel, ChangeSet, RowDiff, DiffType, SyncError
-check("ShadowDB importable", ShadowDB is not None)
-check("SafeModel importable", SafeModel is not None)
-check("ChangeSet importable", ChangeSet is not None)
-check("RowDiff importable", RowDiff is not None)
-check("DiffType importable", DiffType is not None)
-check("SyncError importable", SyncError is not None)
+import safeagentdb
+
+for _name in (
+    "ShadowDB", "SafeModel", "ChangeSet", "RowDiff", "DiffType",
+    "SyncError", "ConflictError", "SchemaError", "SafeAgentDBError",
+    "MissingValidatorError", "MissingValidatorWarning",
+):
+    check(f"{_name} importable", getattr(safeagentdb, _name, None) is not None)
 
 console.print()
 
