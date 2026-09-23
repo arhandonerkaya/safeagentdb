@@ -10,7 +10,6 @@
   <a href="https://github.com/arhandonerkaya/safeagentdb/blob/main/LICENSE"><img src="https://img.shields.io/github/license/arhandonerkaya/safeagentdb?color=green" alt="License"></a>
   <a href="https://pypi.org/project/safeagentdb/"><img src="https://img.shields.io/pypi/dm/safeagentdb?color=orange" alt="Downloads"></a>
   <a href="https://github.com/arhandonerkaya/safeagentdb/actions/workflows/ci.yml"><img src="https://github.com/arhandonerkaya/safeagentdb/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/arhandonerkaya/safeagentdb/tree/main/tests"><img src="https://img.shields.io/badge/tests-139%20passing-brightgreen" alt="Tests"></a>
 </p>
 
 ---
