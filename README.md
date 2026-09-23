@@ -66,14 +66,15 @@ Gate 4: ROW KEY + TENANT WHERE CLAUSE
   Every UPDATE/DELETE statement carries WHERE <row key> AND tenant_id = ?
   A statement that would match rows by tenant alone is refused, not run.
 
-Gate 5: OPTIMISTIC CONCURRENCY CHECK
-  Each target row is re-read and compared against the values captured at
-  clone time. If another process changed it, you get a ConflictError
-  naming the drifted columns -- not a silent overwrite.
+Gate 5: COMPARE AND SWAP
+  The clone-time values are part of the WHERE clause, so checking and
+  writing are a single statement with no window between them. If another
+  process changed the row first, the statement matches nothing and you
+  get a ConflictError naming the drifted columns -- not a silent overwrite.
 
 Gate 6: ATOMIC SYNC
-  The entire changeset executes in ONE transaction, writing only the
-  columns the agent actually changed.
+  The entire changeset executes in ONE transaction, in a deterministic
+  row order, writing only the columns the agent actually changed.
 ```
 
 See [Guarantees and limits](#guarantees-and-limits) for what these gates
@@ -204,9 +205,10 @@ ShadowDB(
     tenant_id: Any,                 # The tenant/user ID to scope all operations to
     tenant_column: str = "user_id", # Column name used for tenant filtering
     *,
-    row_key: dict[str, list[str]] | None = None,  # Explicit row key per table
-    on_conflict: "abort" | "ignore" = "abort",    # What to do on production drift
-    require_validators: bool = True,              # Missing SafeModel: error or warning
+    row_key: dict[str, list[str]] | None = None,   # Explicit row key per table
+    reference_tables: Sequence[str] | None = None, # Shared lookup tables, cloned in full
+    on_conflict: "abort" | "ignore" = "abort",     # What to do on production drift
+    require_validators: bool = True,               # Missing SafeModel: error or warning
 )
 ```
 
@@ -215,13 +217,46 @@ ShadowDB(
 | Option | Default | What it does |
 |--------|---------|--------------|
 | `row_key` | `None` | Explicit row-identifying columns per table, e.g. `{"events": ["tenant_id", "event_uuid"]}`. Required for a table with no primary key, and usable to override one. The columns must exist and must be unique across the cloned rows, or `SchemaError` is raised. |
-| `on_conflict` | `"abort"` | `"abort"` raises `ConflictError` when a production row changed between clone and commit, rolling the whole changeset back. `"ignore"` skips the drifted row and applies the rest. |
+| `reference_tables` | `None` | Tables to clone **in full**, ignoring the tenant filter. Use it for shared lookup tables (statuses, currencies, plans) so that foreign keys pointing at them are enforced in the sandbox. See [Reference tables](#reference-tables). |
+| `on_conflict` | `"abort"` | `"abort"` raises `ConflictError` when a production row changed between clone and commit, rolling the whole changeset back. `"ignore"` **applies the changeset in part**: it skips the drifted row, applies the rest, records each skip in `skipped_conflicts` and raises a `ConflictWarning` per skipped row. |
 | `require_validators` | `True` | `True`: a table with no registered `SafeModel` is a failed row in `diff()` and a `MissingValidatorError` at commit. `False`: a warning in both places, and the row is written unvalidated. |
 
 > **Tables must have an identifiable row.** A table with no primary key and no
 > `row_key` raises `SchemaError` at `__enter__`. Without a key, SafeAgentDB
 > cannot tell two rows apart, and any `UPDATE` it built would match every row
 > the tenant owns.
+
+#### Reference tables
+
+The clone is tenant-scoped, so a shared lookup table with no tenant column
+clones **zero rows**. A foreign key pointing at it could never be satisfied, so
+SafeAgentDB drops that constraint in the sandbox and says so in
+`unsupported_constraints`:
+
+```
+tasks: FOREIGN KEY (status_id) -> statuses not enforced -- the parent table
+cloned 0 rows, so every reference would look dangling. If statuses holds no
+tenant data, pass reference_tables=['statuses'] to clone it in full.
+```
+
+Listing the table restores the constraint:
+
+```python
+with ShadowDB(
+    prod_engine,
+    tables=["tasks"],
+    tenant_id=42,
+    reference_tables=["statuses"],       # cloned in full, tenant filter ignored
+) as sandbox:
+    ...
+```
+
+Two things to know before you list a table:
+
+- **Every row becomes visible to the agent.** Only list tables whose whole
+  contents any tenant may see. A table holding tenant data must never be listed.
+- **They are read-only.** Reference tables are excluded from the changeset, and
+  modifying one raises `SyncError` from `diff()` rather than failing later.
 
 **Context Manager Lifecycle:**
 
@@ -238,7 +273,7 @@ ShadowDB(
 | `execute` | `(sql: str, params: dict \| None) -> CursorResult` | Execute raw SQL inside the sandbox. Wraps the string in `text()` automatically so AI agents do not need to import it. Returns a standard SQLAlchemy `CursorResult`. |
 | `query` | `(sql: str, params: dict \| None) -> list[dict]` | Execute a SELECT and return results as a list of plain dictionaries. Convenience method for AI agents that work with JSON-like data. |
 | `diff` | `() -> ChangeSet` | Flushes pending changes, snapshots the current sandbox state, and computes a row-level diff against the original clone. Returns a `ChangeSet` object. |
-| `commit_to_production` | `() -> int` | Runs all 6 safety gates and syncs approved changes to production in one atomic transaction, writing only the columns the agent changed. Returns the number of rows **actually written**, summed from each statement's rowcount. Raises `ConflictError` on production drift, `SyncError` on tenant breach or a missing row key, `MissingValidatorError` when a table has no `SafeModel`, `pydantic.ValidationError` on schema violations. Can only be called once per sandbox (double-commit raises `SyncError`). |
+| `commit_to_production` | `() -> int` | Runs all 6 safety gates and syncs approved changes to production in one atomic transaction, writing only the columns the agent changed. Returns the number of rows **actually written**, summed from each statement's rowcount. Raises `ConflictError` on production drift, `GeneratedValueError` when a row needs a value only production can generate, `IntegrityViolationError` when production rejects a row the sandbox accepted, `SyncError` on tenant breach or a missing row key, `MissingValidatorError` when a table has no `SafeModel`, `pydantic.ValidationError` on schema violations. Can only be called once per sandbox (double-commit raises `SyncError`). |
 
 **Properties:**
 
@@ -248,6 +283,9 @@ ShadowDB(
 | `tables` | `list[str]` | Table names available in this sandbox. |
 | `dialect` | `str` | Production database dialect name (`'postgresql'`, `'mysql'`, `'sqlite'`). |
 | `row_keys` | `dict[str, list[str]]` | The row-identifying columns in use for each cloned table. |
+| `reference_table_names` | `list[str]` | Tables cloned in full and treated as read-only. |
+| `generated_columns` | `dict[str, list[str]]` | Columns whose production-side generated default the sandbox could not reproduce. An INSERT needing one cannot be synced. |
+| `skipped_conflicts` | `list[SkippedConflict]` | Rows the last commit left unapplied under `on_conflict="ignore"`. Empty otherwise. |
 | `unsupported_constraints` | `list[str]` | Schema elements that could not be reproduced in the sandbox, and are therefore **not enforced** there. See below. |
 | `session` | `Session` | Raw SQLAlchemy `Session` for ORM-style operations if needed. |
 
@@ -332,19 +370,28 @@ session can be wrapped in a single `except`.
 
 ```
 SafeAgentDBError
-|-- SchemaError            production schema cannot be sandboxed safely
-|-- SyncError              a changeset was rejected or could not be applied
-|   +-- ConflictError      production drifted between clone and commit
-+-- MissingValidatorError  no SafeModel registered and one is required
+|-- SchemaError                 production schema cannot be sandboxed safely
+|-- SyncError                   a changeset was rejected or could not be applied
+|   |-- ConflictError           production drifted between clone and commit
+|   |-- GeneratedValueError     a row needs a value only production can generate
+|   +-- IntegrityViolationError production rejected a row the sandbox accepted
++-- MissingValidatorError       no SafeModel registered and one is required
 ```
+
+Every database error raised while applying a changeset is wrapped, so a single
+`except SafeAgentDBError` really does catch everything above. The driver's own
+exception is kept as `__cause__`.
 
 | Exception | Raised when |
 |-----------|-------------|
 | `SchemaError` | A cloned table has no primary key and no usable `row_key`; a `row_key` names missing columns or is not unique in the cloned rows; the production schema cannot be reproduced in SQLite. |
 | `SyncError` | Tenant isolation is breached, an `UPDATE`/`DELETE` has no row-identifying key, a row key disagrees with the declared one, a table is missing from production metadata, or the sandbox is committed twice. |
-| `ConflictError` | A production row changed or was deleted between clone and commit, or a row key matches more than one row. Carries `.table`, `.row_key` and `.columns` (the drifted column names). A subclass of `SyncError`. |
+| `ConflictError` | A production row changed or was deleted between clone and commit, or a row key matches more than one row. Carries `.table`, `.row_key` and `.columns` (the drifted column names). |
+| `GeneratedValueError` | A new row needs a value only production can generate -- a `serial`/identity primary key, a `gen_random_uuid()` default. The sandbox has no access to the sequence, so it cannot produce the value production would. Carries `.table` and `.columns`. |
+| `IntegrityViolationError` | Production rejected a row the sandbox accepted, most often a `UNIQUE` collision with a row belonging to another tenant. Carries `.table` and `.row_key`, and the driver's `IntegrityError` as `__cause__`. |
 | `MissingValidatorError` | A table has no registered `SafeModel` and `require_validators` is `True`. Also subclasses `KeyError`, so 0.1.x handlers keep working. |
 | `MissingValidatorWarning` | Not an error: warned when `require_validators=False` and a row is written unvalidated. |
+| `ConflictWarning` | Not an error: warned once per row skipped under `on_conflict="ignore"`. |
 
 **Handling a conflict:**
 
@@ -355,9 +402,22 @@ try:
     sandbox.commit_to_production()
 except ConflictError as exc:
     print(f"{exc.table} row {exc.row_key} drifted on {exc.columns}")
-    # Nothing was written. Re-clone and let the agent try again,
-    # or use ShadowDB(..., on_conflict="ignore") to skip drifted rows.
+    # Nothing was written. Re-clone and let the agent try again.
 ```
+
+**Partially applying instead**, with `on_conflict="ignore"`:
+
+```python
+with ShadowDB(engine, tables=["tasks"], tenant_id=42, on_conflict="ignore") as sandbox:
+    ...
+    written = sandbox.commit_to_production()   # fewer than the changeset held
+
+    for skip in sandbox.skipped_conflicts:     # never silent
+        print(f"skipped {skip.table} {skip.row_key}: {skip.columns} drifted")
+```
+
+Each skipped row also raises a `ConflictWarning`, so a partial apply is visible
+even when nobody inspects the result.
 
 ### `DiffType`
 
@@ -488,7 +548,16 @@ honest version of what that means.
 - **Unidentifiable rows**: a table with no primary key and no `row_key` is
   refused rather than guessed at.
 - **Production drift**: a row changed by another process between clone and
-  commit is a `ConflictError`, not a silent overwrite.
+  commit is a `ConflictError`, not a silent overwrite. The clone-time values are
+  carried in the `WHERE` clause of the `UPDATE`/`DELETE` itself, so the check and
+  the write are one statement. **This holds at any isolation level**, including
+  PostgreSQL `READ COMMITTED` and MySQL `REPEATABLE READ`, and takes no row
+  locks. An `UPDATE` guards the columns the agent changed, so an unrelated
+  concurrent edit to a different column of the same row is allowed to coexist; a
+  `DELETE` guards the whole row.
+- **Values only production can generate**: an INSERT that depends on a sequence,
+  identity column or default function the sandbox could not reproduce is refused
+  with `GeneratedValueError` rather than written with an invented key.
 
 ### What the sandbox cannot catch
 
@@ -507,13 +576,20 @@ honest version of what that means.
 - **Dialect semantics.** SQLite has dynamic typing, different collation and
   case-sensitivity rules, and no fixed-width integer overflow. A value SQLite
   accepts may be rejected or stored differently by PostgreSQL or MySQL.
-- **Concurrency beyond the rows in the changeset.** The optimistic check covers
-  the rows being written. A row the agent merely read is not checked, so a
-  decision based on stale data can still be applied. How much isolation the
-  check itself has is decided by your database's transaction isolation level.
-- **Value comparison across driver round-trips.** Drift detection compares
-  Python values with `!=`. A type that does not round-trip identically through
-  your driver can register as a spurious conflict.
+- **Concurrency beyond the rows being written.** The compare-and-swap guard
+  covers the rows in the changeset. A row the agent merely *read* is not
+  guarded, so a decision based on stale data can still be applied. Nor is a row
+  inserted by someone else in the meantime: uniqueness against it surfaces as
+  `IntegrityViolationError` at commit, not as a conflict.
+- **Columns whose equality is unreliable.** `Float`/`REAL`/`DOUBLE`, `JSON`,
+  `JSONB`, `ARRAY`, `HSTORE`, `TSVECTOR`, `MONEY` and binary columns are
+  **excluded from the guard**: their values do not survive a driver round-trip
+  reliably enough to gate a write on, and comparing them would reject correct
+  changesets. A concurrent edit confined to such a column is not detected.
+- **Unguarded columns on an UPDATE.** By design only the changed columns are
+  guarded, so a concurrent edit to a column the agent did not touch is allowed
+  through. That is the point -- it keeps unrelated work from colliding -- but it
+  does mean the row as a whole is not frozen between clone and commit.
 - **Scale.** The entire tenant scope is copied into memory. This is designed for
   one tenant's working set, not for a full-table migration.
 
@@ -560,19 +636,27 @@ sandbox.commit_to_production()
   |     |-- 7. Assert the row key is present and correct --> SyncError
   |     |      (an UPDATE/DELETE with no key is refused, never executed)
   |     |
-  |     |-- 8. SELECT the live row by row key + tenant   --> ConflictError
-  |     |      and compare every column against the clone-time values
-  |     |
-  |     '-- 9. Build the SQLAlchemy Core statement:
+  |     '-- 8. Build one compare-and-swap statement:
   |           |-- UPDATE: update(table)
-  |           |             .where(row key AND tenant_id)
+  |           |             .where(row key AND tenant_id
+  |           |                    AND each changed column = its clone value)
   |           |             .values(only the changed columns)
-  |           '-- DELETE: delete(table).where(row key AND tenant_id)
-  |           '-- rowcount == 0 --> ConflictError (the row vanished)
+  |           |-- DELETE: delete(table)
+  |           |             .where(row key AND tenant_id
+  |           |                    AND every guardable column = its clone value)
+  |           |-- rowcount == 1 --> applied
+  |           |-- rowcount == 0 --> re-read to explain --> ConflictError
+  |           '-- rowcount > 1  --> the key is not unique --> ConflictError
   |
-  '-- 10. All statements execute inside engine.begin()   --> Single transaction
-          '-- Any failure --> full rollback, zero writes
+  '-- 9. All statements execute inside engine.begin(),   --> Single transaction
+  |      ordered by table, row key, operation
+  '-- Any failure --> full rollback, zero writes
 ```
+
+A `NULL` clone-time value becomes `col IS NULL` rather than `col = NULL`, which
+never matches. Because the guard value is a Python value rather than a bind
+parameter, that branch is exact on every dialect and needs no
+`IS NOT DISTINCT FROM` or `<=>` handling.
 
 No raw SQL strings are generated. Every statement uses SQLAlchemy Core constructs (`insert()`, `update()`, `delete()`), making the sync engine dialect-agnostic and SQL-injection-proof.
 
@@ -588,14 +672,15 @@ safeagentdb/
 |-- sandbox.py      ShadowDB context manager with execute(), query(), diff(), commit_to_production()
 |-- models.py       SafeModel base class + auto-registration validator registry
 |-- diff.py         Row-level diff engine + Rich dashboard renderer + plain-text fallback
-|-- sync.py         Atomic production sync: tenant guards, row-key guard, concurrency check
+|-- sync.py         Atomic production sync: tenant guards, row-key guard, compare-and-swap
 '-- py.typed        PEP 561 type checker marker
 
 tests/
 |-- test_core.py        End-to-end release check (script style)
 |-- test_mega.py        Exhaustive coverage of the public API
 |-- test_weaknesses.py  Regression guards for the four findings in docs/AUDIT.md
-'-- test_hardening.py   The machinery added in 0.2.0
+|-- test_hardening.py   The machinery added in 0.2.0
+'-- test_audit_followups.py  Five issues found reviewing that work
 
 docs/
 '-- AUDIT.md        The weakness audit those regression guards came from

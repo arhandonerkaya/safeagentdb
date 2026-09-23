@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 A safety release. Every item under **Fixed** is a case where 0.1.x could lose or
 corrupt production data while reporting success. The four findings are written
 up in [docs/AUDIT.md](docs/AUDIT.md) and each has a regression test in
-`tests/test_weaknesses.py`.
+`tests/test_weaknesses.py`. Five further issues found while reviewing that work
+are fixed here too, pinned by `tests/test_audit_followups.py`.
 
 If you are on 0.1.x, read **Breaking changes** before upgrading.
 
@@ -25,15 +26,32 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
            row_key={"events": ["tenant_id", "event_uuid"]})
   ```
 
-- **A table with no registered `SafeModel` is now an error by default.**
-  `RowDiff.validate()` returns `(False, ...)` for it and `commit_to_production()`
-  raises `MissingValidatorError`. In 0.1.x the diff passed it and the commit
-  raised `KeyError`. Pass `require_validators=False` for the old lenient
-  behaviour, which now warns consistently on both sides.
+- **A table with no registered `SafeModel` now makes `diff()` report the
+  changeset as invalid.** `changeset.is_valid` flips from `True` to `False` and
+  the dashboard shows `[BLOCKED]` where 0.1.x showed `[SAFE]`, so any code
+  branching on `if changeset.is_valid:` takes the other path. This is the part
+  that changes control flow silently -- check it before upgrading.
+
+  The commit side is *not* newly broken: 0.1.x already raised `KeyError` there,
+  and `commit_to_production()` now raises `MissingValidatorError`, which
+  subclasses `KeyError`, so existing handlers keep working. Pass
+  `require_validators=False` for the old lenient behaviour, which now warns
+  consistently on both sides instead of passing on one and raising on the other.
 
 - **`commit_to_production()` can now raise `ConflictError`** when a production
   row changed between clone and commit. Previously the change was overwritten
-  without a word. Pass `on_conflict="ignore"` to skip drifted rows instead.
+  without a word. Pass `on_conflict="ignore"` to skip drifted rows instead --
+  which applies the changeset in part and records every skip.
+
+- **An INSERT that needs a value only production can generate is refused** with
+  `GeneratedValueError`. This blocks agent-side inserts into tables with a
+  `serial`/identity primary key, which previously wrote a key the sequence had
+  never issued.
+
+- **A foreign key whose parent table clones zero rows is no longer enforced** in
+  the sandbox, and is listed in `unsupported_constraints`. Pass
+  `reference_tables=[...]` to clone shared lookup tables in full and get the
+  constraint back. Those tables are read-only.
 
 - **The return value of `commit_to_production()` changed meaning.** It is now the
   real number of rows written, summed from each statement's rowcount, rather
@@ -51,13 +69,22 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
   `MissingValidatorError` subclasses `KeyError`, so existing `except KeyError`
   handlers keep working.
 
-- `safeagentdb.__all__` grew: `SafeAgentDBError`, `SchemaError`,
-  `ConflictError`, `MissingValidatorError`, `MissingValidatorWarning`.
+- `safeagentdb.__all__` grew: `SafeAgentDBError`, `SchemaError`, `SyncError`,
+  `ConflictError`, `GeneratedValueError`, `IntegrityViolationError`,
+  `MissingValidatorError`, `MissingValidatorWarning`, `ConflictWarning` and
+  `SkippedConflict`.
 
 ### Added
 
 - `row_key` option: an explicit row-identifying key per table. Its columns must
   exist and must be unique across the cloned rows, or `SchemaError` is raised.
+- `reference_tables` option: clone the named tables in full, ignoring the tenant
+  filter, so foreign keys pointing at shared lookup tables stay enforced. Their
+  rows are visible to the agent and they are read-only.
+- `ShadowDB.reference_table_names`, `ShadowDB.generated_columns` and
+  `ShadowDB.skipped_conflicts`.
+- `GeneratedValueError`, `IntegrityViolationError`, `SkippedConflict` and
+  `ConflictWarning`.
 - `on_conflict` option: `"abort"` (default) or `"ignore"`.
 - `require_validators` option: `True` (default) or `False`.
 - `ShadowDB.row_keys` — the row-identifying columns in use per table.
@@ -65,14 +92,17 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
   reproduced in the sandbox and are therefore not enforced there. Rendered in
   both the Rich and plain diff output under a `NOT ENFORCED IN SANDBOX` heading.
 - `safeagentdb.errors` module with a `SafeAgentDBError` base class:
-  `SchemaError`, `SyncError`, `ConflictError` (a `SyncError`),
-  `MissingValidatorError`, and the `MissingValidatorWarning` warning category.
+  `SchemaError`, `SyncError`, its subclasses `ConflictError`,
+  `GeneratedValueError` and `IntegrityViolationError`, `MissingValidatorError`,
+  the `SkippedConflict` record, and the `MissingValidatorWarning` and
+  `ConflictWarning` warning categories.
 - `ConflictError` carries `.table`, `.row_key` and `.columns`.
 - Hard guard in `sync.apply_changeset`: an `UPDATE`/`DELETE` with an empty key,
   unknown key columns, or a key that disagrees with the declared `row_key`
   raises `SyncError` instead of executing.
 - GitHub Actions CI running pytest on Python 3.10, 3.11 and 3.12, plus ruff.
-- `tests/test_weaknesses.py` and `tests/test_hardening.py` (139 tests total).
+- `tests/test_weaknesses.py`, `tests/test_hardening.py` and
+  `tests/test_audit_followups.py` (173 tests total).
 
 ### Fixed
 
@@ -93,9 +123,21 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
   stripped, `now()` becomes `CURRENT_TIMESTAMP`, `true`/`false` become `1`/`0`.
   A default with no SQLite equivalent (`nextval(...)`, `gen_random_uuid()`) is
   removed and recorded in `unsupported_constraints`.
-- **Concurrent production writes were silently lost.** Each `UPDATE`/`DELETE`
-  target is now re-read inside the commit transaction and compared against the
-  clone-time values.
+- **Concurrent production writes were silently lost.** The clone-time values are
+  now carried in the `WHERE` clause of the `UPDATE`/`DELETE` itself, so checking
+  and writing are one atomic statement with no window between them, at any
+  isolation level and without taking row locks. An `UPDATE` guards the columns
+  the agent changed, so unrelated concurrent edits coexist; a `DELETE` guards
+  the whole row. `NULL` guards use `IS NULL`. Columns whose equality does not
+  survive a driver round-trip -- float, JSON, array, binary -- are excluded.
+  Statements run in a deterministic row order so two changesets cannot deadlock
+  against each other.
+- **Database errors escaped the exception hierarchy.** An `IntegrityError` from
+  production -- a `UNIQUE` collision with another tenant's row, say -- is now
+  wrapped in `IntegrityViolationError` with the original as `__cause__`, so a
+  single `except SafeAgentDBError` catches everything the README claims.
+- **`on_conflict="ignore"` applied changesets in silence.** Every skipped row is
+  now recorded in `ShadowDB.skipped_conflicts` and warned about.
 - **`RowDiff.validate()` and `sync.validate_row()` disagreed** about a table
   with no validator, so a changeset could show `[SAFE]` and then abort the
   commit. Both now share one policy and one message.
