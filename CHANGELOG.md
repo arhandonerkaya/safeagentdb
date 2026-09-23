@@ -149,10 +149,12 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
   with no validator, so a changeset could show `[SAFE]` and then abort the
   commit. Both now share one policy and one message.
 - **A `CHECK` constraint on a SQLite production table could crash sandbox
-  creation** with a raw `OperationalError`. SQLAlchemy's SQLite reflection
-  returns an unbalanced expression when the table's closing paren sits on the
-  same line as the `CHECK`. Such a constraint is now skipped and recorded;
-  any other DDL failure raises `SchemaError`.
+  creation** with a raw `OperationalError`. SQLAlchemy 2.0.35 and earlier
+  reflect an unbalanced expression when the table's closing paren sits on the
+  same line as the `CHECK`; later versions do not. Such a constraint is now
+  skipped and recorded whatever produced it, and any other DDL failure raises
+  `SchemaError`. SafeAgentDB behaves the same on either SQLAlchemy, so no
+  minimum beyond the existing `sqlalchemy>=2.0` is needed.
 - **A foreign key pointing at a table outside the cloned set** made
   `MetaData.sorted_tables` raise `NoReferencedTableError`. Such keys are now
   removed and recorded.

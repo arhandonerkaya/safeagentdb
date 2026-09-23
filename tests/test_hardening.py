@@ -179,6 +179,37 @@ class TestRowKeyResolution:
         assert shadow.session is None
 
 
+LOOKUP_DDL = [
+    # A shared lookup table with no tenant column: it clones zero rows, so the
+    # foreign key pointing at it cannot be enforced and is always reported.
+    "CREATE TABLE statuses (\n id INTEGER PRIMARY KEY,\n label TEXT NOT NULL\n)",
+    "CREATE TABLE tasks (\n"
+    " id INTEGER PRIMARY KEY,\n"
+    " user_id INTEGER NOT NULL,\n"
+    " status_id INTEGER NOT NULL REFERENCES statuses(id),\n"
+    " title TEXT NOT NULL\n"
+    ")",
+    "INSERT INTO statuses VALUES (1, 'todo'), (2, 'done')",
+    "INSERT INTO tasks VALUES (10, 42, 1, 'existing')",
+]
+
+
+def _register_lookup_validators():
+    class StatusValidator(SafeModel):
+        __table_name__ = "statuses"
+        id: int
+        label: str
+
+    class LookupTaskValidator(SafeModel):
+        __table_name__ = "tasks"
+        id: int
+        user_id: int
+        status_id: int
+        title: str
+
+    return StatusValidator, LookupTaskValidator
+
+
 # ============================================================
 # Schema translation
 # ============================================================
@@ -383,18 +414,53 @@ class TestUnsupportedConstraintReport:
             assert "NOT ENFORCED" not in sandbox.diff()._render_plain()
 
     def test_report_appears_in_the_plain_diff_output(self, tmp_path):
+        """A foreign key whose parent clones no rows always produces an entry,
+        on every SQLAlchemy version."""
+        engine, _ = _prod_engine(tmp_path, "reported.db", LOOKUP_DDL)
+        _register_lookup_validators()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            assert sandbox.unsupported_constraints
+
+            sandbox.execute("UPDATE tasks SET title='renamed' WHERE id=10")
+            plain = sandbox.diff()._render_plain()
+            assert "[NOT ENFORCED IN SANDBOX]" in plain
+            assert "FOREIGN KEY" in plain
+            assert "statuses" in plain
+
+    def test_report_appears_even_with_no_changes(self, tmp_path):
+        engine, _ = _prod_engine(tmp_path, "reported_empty.db", LOOKUP_DDL)
+        _register_lookup_validators()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            changeset = sandbox.diff()
+            assert changeset.is_empty
+            plain = changeset._render_plain()
+            assert "No changes detected" in plain
+            assert "[NOT ENFORCED IN SANDBOX]" in plain
+
+    def test_a_dialect_type_mapping_is_reported_end_to_end(self, tmp_path):
+        """The other always-present source of an entry: a column type SQLite
+        cannot hold as-is."""
+        from sqlalchemy import DefaultClause
+
+        import safeagentdb.sandbox as sandbox_module
+        from safeagentdb.engine import reflect_tables as real_reflect
+
         engine, _ = _prod_engine(
             tmp_path,
-            "reported.db",
+            "reported_type.db",
             [
-                # one-line CHECK: reflection returns an unbalanced expression
-                "CREATE TABLE tasks ("
-                " id INTEGER PRIMARY KEY,"
-                " user_id INTEGER NOT NULL,"
-                " title TEXT NOT NULL,"
-                " status TEXT NOT NULL,"
-                " priority INTEGER CHECK (priority >= 0))",
-                "INSERT INTO tasks VALUES (1, 42, 'Ship v2', 'todo', 1)",
+                "CREATE TABLE tasks (\n"
+                " id INTEGER PRIMARY KEY,\n"
+                " user_id INTEGER NOT NULL,\n"
+                " title TEXT NOT NULL,\n"
+                " prefs TEXT,\n"
+                " code TEXT\n"
+                ")",
+                # prefs stays NULL: a populated column would be decoded as JSON
+                # on the way out, which is not what this test is about.
+                "INSERT INTO tasks (id, user_id, title) VALUES (1, 42, 'Ship v2')",
             ],
         )
 
@@ -403,42 +469,26 @@ class TestUnsupportedConstraintReport:
             id: int
             user_id: int
             title: str
-            status: str
-            priority: int
+            prefs: str | None
+            code: str | None
 
-        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
-            assert sandbox.unsupported_constraints
+        def patched(source_engine, table_names):
+            meta = real_reflect(source_engine, table_names)
+            meta.tables["tasks"].c.prefs.type = JSONB()
+            meta.tables["tasks"].c.code.server_default = DefaultClause(
+                text("gen_random_uuid()")
+            )
+            return meta
 
-            sandbox.execute("UPDATE tasks SET status='done' WHERE id=1")
-            plain = sandbox.diff()._render_plain()
-            assert "[NOT ENFORCED IN SANDBOX]" in plain
-            assert "CHECK" in plain
-
-    def test_report_appears_even_with_no_changes(self, tmp_path):
-        engine, _ = _prod_engine(
-            tmp_path,
-            "reported_empty.db",
-            [
-                "CREATE TABLE tasks ("
-                " id INTEGER PRIMARY KEY,"
-                " user_id INTEGER NOT NULL,"
-                " priority INTEGER CHECK (priority >= 0))",
-                "INSERT INTO tasks VALUES (1, 42, 1)",
-            ],
-        )
-
-        class TaskValidator(SafeModel):
-            __table_name__ = "tasks"
-            id: int
-            user_id: int
-            priority: int
-
-        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
-            changeset = sandbox.diff()
-            assert changeset.is_empty
-            plain = changeset._render_plain()
-            assert "No changes detected" in plain
-            assert "[NOT ENFORCED IN SANDBOX]" in plain
+        mp = pytest.MonkeyPatch()
+        mp.setattr(sandbox_module, "reflect_tables", patched)
+        try:
+            with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+                reported = sandbox.unsupported_constraints
+                assert any("JSONB" in item for item in reported)
+                assert any("gen_random_uuid" in item for item in reported)
+        finally:
+            mp.undo()
 
     def test_unsupported_constraints_property_returns_a_copy(self, tmp_path):
         engine, _ = _prod_engine(tmp_path, "copy2.db", TASKS_DDL)

@@ -427,10 +427,72 @@ class TestClaim1SchemaFidelity:
         finally:
             sandbox.dispose()
 
-    def test_malformed_check_is_recorded_instead_of_crashing(self, tmp_path):
-        """SQLAlchemy's SQLite CHECK reflection swallows the table's closing
-        paren when it sits on the same line. That constraint is now skipped and
-        listed in unsupported_constraints instead of raising OperationalError."""
+    def test_a_malformed_check_is_skipped_and_recorded(self):
+        """A CHECK whose expression is unbalanced cannot be re-emitted as valid
+        DDL, so it is dropped and reported rather than crashing the clone.
+
+        The constraint is built directly rather than reflected: SQLAlchemy's
+        SQLite reflection used to produce exactly this shape, and a test that
+        waited for it would silently stop covering this code once upstream fixed
+        it. See test_a_one_line_check_can_always_be_sandboxed for the end-to-end
+        path on whichever version is installed.
+        """
+        meta = MetaData()
+        Table(
+            "users",
+            meta,
+            Column("id", Integer, primary_key=True),
+            Column("user_id", Integer, nullable=False),
+            Column("age", Integer),
+            Column("score", Integer),
+            CheckConstraint("age >= 0)", name="ck_users_age"),  # unbalanced
+            CheckConstraint("score >= 0", name="ck_users_score"),  # fine
+        )
+
+        sandbox = create_sandbox_engine()
+        try:
+            sb_meta = clone_schema_to_sandbox(meta, sandbox)
+
+            surviving = {
+                c.name
+                for c in sb_meta.tables["users"].constraints
+                if isinstance(c, CheckConstraint)
+            }
+            assert surviving == {"ck_users_score"}  # only the malformed one went
+
+            reported = sb_meta.info["unsupported_constraints"]
+            assert len(reported) == 1
+            assert "users" in reported[0]
+            assert "CHECK" in reported[0]
+            assert "age >= 0)" in reported[0]
+
+            # The table was still created, and the sound CHECK still bites.
+            with sandbox.connect() as conn:
+                conn.execute(
+                    text("INSERT INTO users (id, user_id, age, score) "
+                         "VALUES (1, 42, -5, 1)")
+                )
+                conn.commit()
+            assert (
+                _try_sql(
+                    sandbox,
+                    "INSERT INTO users (id, user_id, age, score) VALUES (2, 42, 1, -1)",
+                )
+                == "IntegrityError"
+            )
+        finally:
+            sandbox.dispose()
+
+    def test_a_one_line_check_can_always_be_sandboxed(self, tmp_path):
+        """Whatever the installed SQLAlchemy reflects for a one-line CHECK, the
+        sandbox opens and the rows are readable.
+
+        SQLAlchemy 2.0.35 and earlier swallow the table's closing paren here and
+        hand back ``age >= 0)``; later versions reflect it correctly. Both are
+        handled, so this asserts the outcome rather than the upstream defect.
+        """
+        from safeagentdb.engine import _is_balanced
+
         engine, _ = _prod_engine(
             tmp_path,
             "check_oneline.db",
@@ -447,17 +509,29 @@ class TestClaim1SchemaFidelity:
         (check,) = (
             c for c in meta.tables["users"].constraints if isinstance(c, CheckConstraint)
         )
-        assert check.sqltext.text == "age >= 0)"  # still unbalanced upstream
+        reflected_cleanly = _is_balanced(check.sqltext.text)
 
         with ShadowDB(engine, tables=["users"], tenant_id=42) as sandbox:
             assert sandbox.query("SELECT * FROM users") == [
                 {"id": 1, "user_id": 42, "age": 30}
             ]
             reported = sandbox.unsupported_constraints
-            assert len(reported) == 1
-            assert "CHECK" in reported[0]
-            assert "users" in reported[0]
 
+            if reflected_cleanly:
+                # The constraint came across intact, so it must be enforced.
+                assert reported == []
+                assert (
+                    _try_sql(
+                        sandbox.sandbox_engine,
+                        "INSERT INTO users (id, user_id, age) VALUES (2, 42, -5)",
+                    )
+                    == "IntegrityError"
+                )
+            else:
+                # It could not be reproduced, so it must be reported.
+                assert len(reported) == 1
+                assert "CHECK" in reported[0]
+                assert "users" in reported[0]
 
 # ============================================================
 # CLAIM 2 -- Lost update

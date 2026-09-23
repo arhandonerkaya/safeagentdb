@@ -140,9 +140,13 @@ def _sqlite_safe_server_default(sql_text: str) -> tuple[str | None, str | None]:
 def _is_balanced(expression: str) -> bool:
     """True when parentheses and quotes in a SQL fragment are balanced.
 
-    SQLAlchemy reflects SQLite CHECK constraints with a regex that swallows the
-    table's closing paren when it sits on the same line, yielding text like
-    ``age >= 0)``. Re-emitting that produces invalid DDL, so it is caught here.
+    A reflected CHECK expression is re-emitted verbatim, so an unbalanced one
+    would produce invalid DDL. SQLAlchemy 2.0.35 and earlier reflect SQLite
+    CHECK constraints with a regex that swallows the table's closing paren when
+    it sits on the same line, handing back text like ``age >= 0)``; later
+    versions do not. This guard costs nothing when the expression is sound, so
+    it stays either way -- reflection is not the only thing that can hand us an
+    expression SQLite will not take.
     """
     depth = 0
     in_string = False
