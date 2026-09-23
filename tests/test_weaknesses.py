@@ -44,6 +44,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from safeagentdb import (
     ConflictError,
+    ConflictWarning,
     MissingValidatorError,
     MissingValidatorWarning,
     SafeAgentDBError,
@@ -571,8 +572,11 @@ class TestClaim2LostUpdate:
                     text("UPDATE tasks SET status = 'in_progress' WHERE id = 1")
                 )
 
-            # Row 1 drifted and is skipped; row 2 still applies.
-            assert sandbox.commit_to_production() == 1
+            # Row 1 drifted and is skipped; row 2 still applies, and the skip
+            # is warned about rather than passing in silence.
+            with pytest.warns(ConflictWarning):
+                assert sandbox.commit_to_production() == 1
+            assert [s.row_key for s in sandbox.skipped_conflicts] == [{"id": 1}]
 
         with engine.connect() as conn:
             rows = conn.execute(

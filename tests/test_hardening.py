@@ -30,6 +30,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from safeagentdb import (
     ConflictError,
+    ConflictWarning,
     MissingValidatorWarning,
     SafeModel,
     SchemaError,
@@ -496,7 +497,9 @@ class TestConflictOptions:
             with other.begin() as conn:
                 conn.execute(text("DELETE FROM tasks WHERE id=1"))
 
-            assert sandbox.commit_to_production() == 1
+            with pytest.warns(ConflictWarning):
+                assert sandbox.commit_to_production() == 1
+            assert [s.row_key for s in sandbox.skipped_conflicts] == [{"id": 1}]
 
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT id, status FROM tasks")).fetchall()
