@@ -24,8 +24,14 @@ from safeagentdb.engine import (
     fetch_rows,
     load_rows,
     reflect_tables,
+    seed_provisional_keys,
 )
-from safeagentdb.errors import SchemaError, SkippedConflict, SyncError
+from safeagentdb.errors import (
+    AssignedKey,
+    SchemaError,
+    SkippedConflict,
+    SyncError,
+)
 from safeagentdb.sync import OnConflict, apply_changeset
 
 _VALID_ON_CONFLICT = ("abort", "ignore")
@@ -107,6 +113,8 @@ class ShadowDB:
         self._unsupported: list[str] = []
         self._generated_columns: dict[str, list[str]] = {}
         self._skipped_conflicts: list[SkippedConflict] = []
+        self._assigned_keys: list[AssignedKey] = []
+        self._provisional_keys: dict[str, list[str]] = {}
         self._committed = False
 
     # ---- Context manager ----
@@ -146,6 +154,9 @@ class ShadowDB:
 
             self._clone_stats = load_rows(
                 self.sandbox_engine, self._sandbox_metadata, fetched
+            )
+            self._provisional_keys = seed_provisional_keys(
+                self.sandbox_engine, self._sandbox_metadata
             )
 
             self._original_snapshot = self._take_snapshot()
@@ -216,6 +227,7 @@ class ShadowDB:
             unsupported_constraints=self._unsupported,
             require_validators=self.require_validators,
             generated_columns=self._generated_columns,
+            provisional_key_columns=self._provisional_keys,
         )
 
     def commit_to_production(self) -> int:
@@ -256,6 +268,7 @@ class ShadowDB:
             return 0
 
         self._skipped_conflicts = []
+        self._assigned_keys = []
         affected = apply_changeset(
             self.prod_engine,
             self._prod_metadata,
@@ -266,6 +279,7 @@ class ShadowDB:
             on_conflict=self.on_conflict,
             require_validators=self.require_validators,
             skipped=self._skipped_conflicts,
+            assigned=self._assigned_keys,
         )
         self._committed = True
         return affected
@@ -286,6 +300,22 @@ class ShadowDB:
     def dialect(self) -> str:
         """The production database dialect name (e.g. 'postgresql', 'mysql', 'sqlite')."""
         return self.prod_engine.dialect.name
+
+    @property
+    def assigned_keys(self) -> list[AssignedKey]:
+        """Keys production assigned to rows the sandbox held provisionally.
+
+        A ``serial`` or identity column has no SQLite equivalent, so the sandbox
+        fills it with a placeholder and leaves the column out of the INSERT at
+        commit time. Each entry pairs the placeholder the diff showed with the
+        real key production chose.
+        """
+        return list(self._assigned_keys)
+
+    @property
+    def provisional_key_columns(self) -> dict[str, list[str]]:
+        """Key columns the sandbox fills provisionally, per table."""
+        return {k: list(v) for k, v in self._provisional_keys.items()}
 
     @property
     def skipped_conflicts(self) -> list[SkippedConflict]:

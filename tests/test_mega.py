@@ -153,15 +153,26 @@ class TestImports:
     def test_syncerror_importable(self):
         assert SyncError is not None
 
-    def test_all_exports(self):
+    def test_all_exports_resolve(self):
+        """Every name in __all__ must actually exist, and nothing public should
+        be missing from it. Beats a hardcoded list that goes stale."""
         import safeagentdb
-        assert set(safeagentdb.__all__) == {
-            "ShadowDB", "SafeModel", "RowDiff", "DiffType", "ChangeSet",
-            "SafeAgentDBError", "SchemaError", "SyncError", "ConflictError",
-            "GeneratedValueError", "IntegrityViolationError",
-            "MissingValidatorError", "MissingValidatorWarning",
-            "ConflictWarning", "SkippedConflict",
+
+        missing = [n for n in safeagentdb.__all__ if not hasattr(safeagentdb, n)]
+        assert missing == []
+
+        public = {
+            name
+            for name in vars(safeagentdb)
+            if not name.startswith("_")
+            and not isinstance(getattr(safeagentdb, name), type(safeagentdb))
         }
+        assert public == set(safeagentdb.__all__)
+
+    def test_all_is_sorted_and_unique(self):
+        import safeagentdb
+
+        assert safeagentdb.__all__ == sorted(set(safeagentdb.__all__))
 
 
 # ============================================================

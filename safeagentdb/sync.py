@@ -40,6 +40,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from safeagentdb.diff import ChangeSet, DiffType, RowDiff
 from safeagentdb.errors import (
+    AssignedKey,
     ConflictError,
     ConflictWarning,
     GeneratedValueError,
@@ -63,6 +64,7 @@ def apply_changeset(
     on_conflict: OnConflict = "abort",
     require_validators: bool = True,
     skipped: list[SkippedConflict] | None = None,
+    assigned: list[AssignedKey] | None = None,
 ) -> int:
     """Apply an approved changeset to the production database atomically.
 
@@ -83,6 +85,8 @@ def apply_changeset(
         skipped: A list to append one SkippedConflict to per row skipped under
             ``on_conflict="ignore"``. Without it a partial apply leaves no
             record of what was left out.
+        assigned: A list to append one AssignedKey to per row whose provisional
+            key production replaced with a real one.
 
     Returns the number of rows actually written, summed from each statement's
     rowcount.
@@ -143,9 +147,27 @@ def apply_changeset(
                     columns=blocked,
                 )
 
+            dangling = diff.provisional_reference_columns()
+            if dangling:
+                raise GeneratedValueError(
+                    diff.provisional_reference_message(dangling),
+                    table=diff.table,
+                    columns=dangling,
+                )
+
             # ---- Gate 3: Execute with tenant-scoped WHERE ----
             if diff.diff_type == DiffType.INSERT:
-                result = _execute(conn, insert(table).values(diff.new), diff, diff.pk)
+                # A key the sandbox only held provisionally is left out, so the
+                # production sequence assigns the real one.
+                pending = diff.pending_key_columns()
+                values = {
+                    col: value
+                    for col, value in (diff.new or {}).items()
+                    if col not in pending
+                }
+                result = _execute(conn, insert(table).values(values), diff, diff.pk)
+                if pending:
+                    _record_assignment(result, table, diff, pending, assigned)
                 affected += max(result.rowcount, 0)
                 continue
 
@@ -201,6 +223,45 @@ def apply_changeset(
             affected += result.rowcount
 
     return affected
+
+
+def _record_assignment(
+    result: CursorResult,
+    table: Table,
+    diff: RowDiff,
+    pending: list[str],
+    assigned: list[AssignedKey] | None,
+) -> None:
+    """Read back the key production chose, so the caller learns the real id.
+
+    SQLAlchemy sources this from RETURNING where the dialect supports it and
+    from the driver's lastrowid otherwise, so it works on PostgreSQL, MySQL and
+    SQLite alike.
+    """
+    if assigned is None:
+        return
+
+    try:
+        returned = result.inserted_primary_key
+    except Exception:  # pragma: no cover -- driver without key retrieval
+        returned = None
+
+    real: dict[str, Any] = {}
+    if returned is not None:
+        pk_names = [col.name for col in table.primary_key.columns]
+        real = {
+            name: value
+            for name, value in zip(pk_names, returned, strict=False)
+            if name in pending
+        }
+
+    assigned.append(
+        AssignedKey(
+            table=diff.table,
+            provisional={col: (diff.new or {}).get(col) for col in pending},
+            assigned=real,
+        )
+    )
 
 
 def _record_skip(

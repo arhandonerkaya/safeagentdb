@@ -137,6 +137,26 @@ class SkippedConflict:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class AssignedKey:
+    """A key production generated for a row the sandbox held provisionally.
+
+    The sandbox has no access to the production sequence, so it fills a
+    ``serial``/identity key with a placeholder. At commit the column is left out
+    of the INSERT, production assigns the real value, and it is reported here
+    and on ``ShadowDB.assigned_keys``.
+
+    Attributes:
+        table: Name of the table the row was inserted into.
+        provisional: The placeholder key the sandbox used.
+        assigned: The key production actually assigned.
+    """
+
+    table: str
+    provisional: dict[str, Any] = field(default_factory=dict)
+    assigned: dict[str, Any] = field(default_factory=dict)
+
+
 class ConflictWarning(UserWarning):
     """Warned once per row skipped under ``on_conflict="ignore"``."""
 
@@ -147,6 +167,7 @@ class MissingValidatorWarning(UserWarning):
 
 
 __all__ = [
+    "AssignedKey",
     "ConflictError",
     "ConflictWarning",
     "GeneratedValueError",

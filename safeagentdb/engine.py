@@ -23,12 +23,14 @@ from sqlalchemy import (
     CheckConstraint,
     DefaultClause,
     ForeignKeyConstraint,
+    Integer,
     MetaData,
     String,
     Table,
     Text,
     create_engine,
     event,
+    func,
     insert,
     select,
     text,
@@ -38,6 +40,12 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.types import TypeEngine
 
 from safeagentdb.errors import SchemaError
+
+# Keys the sandbox assigns for the agent start here, far above anything a real
+# sequence will have issued. A key at or above this line is therefore known to
+# be the sandbox's own placeholder rather than a value the agent supplied, which
+# is what lets production assign the real one at commit time.
+PROVISIONAL_KEY_BASE = 1 << 52
 
 # ---- Type mapping for cross-dialect sandbox cloning ----
 
@@ -258,6 +266,79 @@ def _remove_foreign_key(table: Table, constraint: ForeignKeyConstraint) -> None:
             col.foreign_keys.discard(element)
 
 
+def _enable_provisional_key(table: Table, generated: list[str]) -> str | None:
+    """Let the sandbox stand in for a production sequence on this table.
+
+    Returns the key column the sandbox will fill provisionally, or None when the
+    table does not qualify. Qualifying means the lost default belongs to a single
+    integer primary key column -- exactly the ``serial``/identity shape.
+
+    SQLite is switched to AUTOINCREMENT for the table so its counter persists in
+    ``sqlite_sequence``, which ``seed_provisional_keys`` then moves above
+    PROVISIONAL_KEY_BASE.
+    """
+    if len(generated) != 1:
+        return None
+
+    column_name = generated[0]
+    pk_columns = [col.name for col in table.primary_key.columns]
+    if pk_columns != [column_name]:
+        return None
+
+    column = table.c[column_name]
+    if not isinstance(column.type, Integer):
+        return None
+
+    # SQLite only accepts AUTOINCREMENT on a column declared INTEGER; a BIGINT
+    # would be rejected. SQLite integers are 64-bit either way, so nothing is
+    # lost by narrowing the sandbox declaration.
+    column.type = Integer()
+    table.dialect_kwargs["sqlite_autoincrement"] = True
+    return column_name
+
+
+def seed_provisional_keys(
+    sandbox_engine: Engine, sandbox_metadata: MetaData
+) -> dict[str, list[str]]:
+    """Move each provisional-key counter above PROVISIONAL_KEY_BASE.
+
+    Called after the cloned rows are loaded, because loading real production ids
+    advances the counter to their maximum. Returns the tables and columns that
+    ended up usable; a table whose cloned rows already reach the sentinel is
+    dropped, since its keys could no longer be told apart.
+    """
+    candidates: dict[str, list[str]] = dict(
+        sandbox_metadata.info.get("provisional_key_columns", {})
+    )
+    if not candidates:
+        return {}
+
+    usable: dict[str, list[str]] = {}
+    with sandbox_engine.connect() as conn:
+        for table_name, columns in candidates.items():
+            table = sandbox_metadata.tables[table_name]
+            column = table.c[columns[0]]
+
+            highest = conn.execute(select(func.max(column))).scalar()
+            if highest is not None and highest >= PROVISIONAL_KEY_BASE:
+                continue
+
+            updated = conn.execute(
+                text("UPDATE sqlite_sequence SET seq=:base WHERE name=:name"),
+                {"base": PROVISIONAL_KEY_BASE, "name": table.name},
+            ).rowcount
+            if not updated:
+                conn.execute(
+                    text("INSERT INTO sqlite_sequence(name, seq) VALUES (:name, :base)"),
+                    {"name": table.name, "base": PROVISIONAL_KEY_BASE},
+                )
+            usable[table_name] = list(columns)
+        conn.commit()
+
+    sandbox_metadata.info["provisional_key_columns"] = usable
+    return usable
+
+
 def _drop_malformed_checks(table: Table, unsupported: list[str]) -> None:
     for constraint in list(table.constraints):
         if not isinstance(constraint, CheckConstraint):
@@ -366,6 +447,7 @@ def clone_schema_to_sandbox(
     sandbox_metadata = MetaData()
     unsupported: list[str] = []
     generated: dict[str, list[str]] = {}
+    provisional: dict[str, list[str]] = {}
     empty = set(empty_tables or ())
 
     # .tables rather than .sorted_tables: sorting resolves foreign keys, which
@@ -378,6 +460,9 @@ def clone_schema_to_sandbox(
         dropped = _adapt_server_defaults(sandbox_table, unsupported)
         if dropped:
             generated[sandbox_table.name] = dropped
+            delegated = _enable_provisional_key(sandbox_table, dropped)
+            if delegated:
+                provisional[sandbox_table.name] = [delegated]
         _drop_unenforceable_foreign_keys(
             sandbox_table, known_tables, empty, unsupported
         )
@@ -387,6 +472,7 @@ def clone_schema_to_sandbox(
 
     sandbox_metadata.info["unsupported_constraints"] = unsupported
     sandbox_metadata.info["generated_columns"] = generated
+    sandbox_metadata.info["provisional_key_columns"] = provisional
     return sandbox_metadata
 
 
