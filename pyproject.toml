@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "safeagentdb"
-version = "0.1.2"
+version = "0.2.0"
 description = "Shadow-Sandbox DB Layer -- let AI agents modify your database safely with tenant isolation, Pydantic validation, and atomic sync."
 readme = "README.md"
 license = "MIT"
@@ -41,9 +41,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/sippinonstraightchlorine/safeagentdb"
-Repository = "https://github.com/sippinonstraightchlorine/safeagentdb"
-Issues = "https://github.com/sippinonstraightchlorine/safeagentdb/issues"
+Homepage = "https://github.com/arhandonerkaya/safeagentdb"
+Repository = "https://github.com/arhandonerkaya/safeagentdb"
+Issues = "https://github.com/arhandonerkaya/safeagentdb/issues"
 
 [project.optional-dependencies]
 pg = ["psycopg2-binary>=2.9"]
@@ -52,3 +52,22 @@ dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["safeagentdb"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Script-style files that deliberately import partway through, to show the
+# public import surface at the point it is exercised.
+"examples/hello_world.py" = ["E402"]
+"tests/test_core.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "requires_db: needs a real database server; set DATABASE_URL to run (CI uses PostgreSQL)",
+]

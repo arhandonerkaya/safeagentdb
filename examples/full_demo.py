@@ -8,7 +8,7 @@ from typing import Literal
 from rich.console import Console
 from sqlalchemy import create_engine, text
 
-from safeagentdb import ShadowDB, SafeModel
+from safeagentdb import SafeModel, ShadowDB
 
 console = Console()
 

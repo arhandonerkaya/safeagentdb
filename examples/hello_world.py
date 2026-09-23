@@ -13,8 +13,7 @@ from typing import Literal
 
 from sqlalchemy import create_engine, text
 
-from safeagentdb import ShadowDB, SafeModel
-
+from safeagentdb import SafeModel, ShadowDB
 
 # -- Step 1: Define a Pydantic validator for the "tasks" table --
 
@@ -52,6 +51,7 @@ with prod_engine.begin() as conn:
 # -- Step 3: Use ShadowDB to sandbox AI operations for user_id=42 --
 
 from rich.console import Console
+
 console = Console()
 
 console.rule("[bold]SafeAgentDB - Hello World[/bold]")
