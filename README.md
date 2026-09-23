@@ -186,14 +186,9 @@ with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
 
 The `[BLOCKED]` banner appears:
 
-```
-+------------------------------------ BLOCKED ------------------------------------+
-|  [BLOCKED] SAFETY ALERT -- INVALID DATA DETECTED                                |
-+---------------------------------------------------------------------------------+
-  ~1 update
-
-  > tasks pk=1: Input should be 'todo', 'in_progress' or 'done'
-```
+<p align="center">
+  <img src="https://raw.githubusercontent.com/arhandonerkaya/safeagentdb/main/docs/assets/scenario-2-blocked.png" width="800" alt="SafeAgentDB - Blocked: Invalid Data Detected">
+</p>
 
 ---
 
@@ -433,10 +428,6 @@ sandbox.commit_to_production()
 sandbox.execute("UPDATE tasks SET user_id = 777 WHERE id = 1")
 sandbox.commit_to_production()
 # --> SyncError: "Tenant breach blocked on UPDATE: row has user_id=777, expected 42."
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/arhandonerkaya/safeagentdb/main/docs/assets/scenario-2-blocked.png" width="800" alt="SafeAgentDB - Blocked: Invalid Data Detected">
-</p>
 
 # Scenario 3: Even if AI could somehow craft a rogue row,
 # every UPDATE/DELETE uses: WHERE pk = ? AND user_id = 42
