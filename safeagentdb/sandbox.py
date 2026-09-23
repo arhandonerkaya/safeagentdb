@@ -238,6 +238,8 @@ class ShadowDB:
                 ``on_conflict="abort"``.
             GeneratedValueError: If a new row needs a value only production can
                 generate, such as a serial or identity primary key.
+            IntegrityViolationError: If production rejects a row the sandbox
+                accepted, such as a UNIQUE collision with another tenant's row.
             SyncError: On tenant breach or a missing row key.
             MissingValidatorError: If a table has no SafeModel and
                 ``require_validators`` is True.

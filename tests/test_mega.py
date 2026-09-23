@@ -158,7 +158,8 @@ class TestImports:
         assert set(safeagentdb.__all__) == {
             "ShadowDB", "SafeModel", "RowDiff", "DiffType", "ChangeSet",
             "SafeAgentDBError", "SchemaError", "SyncError", "ConflictError",
-            "GeneratedValueError", "MissingValidatorError", "MissingValidatorWarning",
+            "GeneratedValueError", "IntegrityViolationError",
+            "MissingValidatorError", "MissingValidatorWarning",
         }
 
 

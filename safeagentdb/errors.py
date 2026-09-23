@@ -56,6 +56,32 @@ class ConflictError(SyncError):
         self.columns = list(columns or [])
 
 
+class IntegrityViolationError(SyncError):
+    """Raised when the production database rejects a row the sandbox accepted.
+
+    The sandbox is a tenant-scoped SQLite copy, so it cannot see every rule
+    production enforces -- most often a UNIQUE constraint whose colliding row
+    belongs to another tenant, or a primary key that exists outside the clone.
+    The whole changeset is rolled back. The driver's own exception is kept as
+    ``__cause__``.
+
+    Attributes:
+        table: Name of the table the statement targeted.
+        row_key: The row-identifying key of the offending row.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        table: str | None = None,
+        row_key: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.table = table
+        self.row_key = dict(row_key or {})
+
+
 class GeneratedValueError(SyncError):
     """Raised when a row depends on a value only production can generate.
 
@@ -96,6 +122,7 @@ class MissingValidatorWarning(UserWarning):
 __all__ = [
     "ConflictError",
     "GeneratedValueError",
+    "IntegrityViolationError",
     "MissingValidatorError",
     "MissingValidatorWarning",
     "SafeAgentDBError",

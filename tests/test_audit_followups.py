@@ -21,7 +21,14 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
-from safeagentdb import GeneratedValueError, SafeModel, ShadowDB, SyncError
+from safeagentdb import (
+    GeneratedValueError,
+    IntegrityViolationError,
+    SafeAgentDBError,
+    SafeModel,
+    ShadowDB,
+    SyncError,
+)
 from safeagentdb.models import _model_registry
 
 
@@ -505,3 +512,105 @@ class TestGeneratedColumns:
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT id, public_ref FROM tasks ORDER BY id")).fetchall()
         assert rows == [(1, "ref-1"), (3, "ref-3")]
+
+
+# ============================================================
+# 3. Database errors stay inside the SafeAgentDBError hierarchy
+# ============================================================
+
+
+UNIQUE_DDL = [
+    "CREATE TABLE users (\n"
+    " id INTEGER PRIMARY KEY,\n"
+    " user_id INTEGER NOT NULL,\n"
+    " email TEXT NOT NULL UNIQUE\n"
+    ")",
+    "INSERT INTO users VALUES (1, 42, 'mine@example.com')",
+    "INSERT INTO users VALUES (2, 99, 'taken@example.com')",
+]
+
+
+def _register_user_validator():
+    class UserValidator(SafeModel):
+        __table_name__ = "users"
+        id: int
+        user_id: int
+        email: str
+
+    return UserValidator
+
+
+class TestDatabaseErrorsAreWrapped:
+    def test_cross_tenant_unique_collision(self, tmp_path):
+        """taken@example.com belongs to tenant 99 and was never cloned, so the
+        sandbox cannot see the collision. Production does."""
+        engine, _ = _prod(tmp_path, "unique_cross.db", UNIQUE_DDL)
+        _register_user_validator()
+
+        with ShadowDB(engine, tables=["users"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE users SET email='taken@example.com' WHERE id=1")
+            assert sandbox.diff().is_valid is True  # the sandbox cannot know
+
+            with pytest.raises(IntegrityViolationError) as excinfo:
+                sandbox.commit_to_production()
+
+        error = excinfo.value
+        assert isinstance(error, SafeAgentDBError)
+        assert isinstance(error, SyncError)
+        assert error.table == "users"
+        assert error.row_key == {"id": 1}
+        assert isinstance(error.__cause__, IntegrityError)
+        assert "only this tenant's rows" in str(error)
+
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT id, email FROM users ORDER BY id")).fetchall()
+        assert rows == [(1, "mine@example.com"), (2, "taken@example.com")]
+
+    def test_primary_key_collision_with_another_tenants_row(self, tmp_path):
+        """The Q2 collision, on a table with no generated default, so it really
+        does reach the database."""
+        engine, _ = _prod(
+            tmp_path,
+            "pk_collide.db",
+            [
+                "CREATE TABLE tasks (\n"
+                " id INTEGER PRIMARY KEY,\n"
+                " user_id INTEGER NOT NULL,\n"
+                " title TEXT NOT NULL\n"
+                ")",
+                "INSERT INTO tasks VALUES (1, 42, 'mine')",
+                "INSERT INTO tasks VALUES (4, 99, 'theirs')",
+            ],
+        )
+        _register_task_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            # id 4 is invisible here: it belongs to tenant 99.
+            sandbox.execute("INSERT INTO tasks (id, user_id, title) VALUES (4, 42, 'clash')")
+            assert sandbox.diff().is_valid is True
+
+            with pytest.raises(IntegrityViolationError) as excinfo:
+                sandbox.commit_to_production()
+
+        assert excinfo.value.table == "tasks"
+        assert excinfo.value.row_key == {"id": 4}
+        assert isinstance(excinfo.value.__cause__, IntegrityError)
+
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT id, user_id FROM tasks ORDER BY id")).fetchall()
+        assert rows == [(1, 42), (4, 99)]
+
+    def test_a_single_except_catches_every_documented_failure(self, tmp_path):
+        """The handler the README tells people to write must actually work."""
+        engine, _ = _prod(tmp_path, "one_except.db", UNIQUE_DDL)
+        _register_user_validator()
+
+        with ShadowDB(engine, tables=["users"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE users SET email='taken@example.com' WHERE id=1")
+            try:
+                sandbox.commit_to_production()
+                caught = None
+            except SafeAgentDBError as exc:
+                caught = exc
+
+        assert isinstance(caught, IntegrityViolationError)

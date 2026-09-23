@@ -20,10 +20,16 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from sqlalchemy import MetaData, Table, delete, insert, select, update
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Connection, CursorResult, Engine
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from safeagentdb.diff import ChangeSet, DiffType, RowDiff
-from safeagentdb.errors import ConflictError, GeneratedValueError, SyncError
+from safeagentdb.errors import (
+    ConflictError,
+    GeneratedValueError,
+    IntegrityViolationError,
+    SyncError,
+)
 from safeagentdb.models import validate_row
 
 OnConflict = Literal["abort", "ignore"]
@@ -63,6 +69,8 @@ def apply_changeset(
     Raises:
         ConflictError: If a row drifted or vanished and ``on_conflict="abort"``.
         GeneratedValueError: If a row needs a value only production can generate.
+        IntegrityViolationError: If production rejects a row the sandbox accepted,
+            such as a UNIQUE collision with another tenant's row.
         SyncError: On tenant breach, a missing row key, or an unknown table.
         MissingValidatorError: If a table has no registered SafeModel.
         pydantic.ValidationError: If any row fails schema validation.
@@ -116,7 +124,7 @@ def apply_changeset(
 
             # ---- Gate 3: Execute with tenant-scoped WHERE ----
             if diff.diff_type == DiffType.INSERT:
-                result = conn.execute(insert(table).values(diff.new))
+                result = _execute(conn, insert(table).values(diff.new), diff, diff.pk)
                 affected += max(result.rowcount, 0)
                 continue
 
@@ -149,7 +157,7 @@ def apply_changeset(
                     continue
                 stmt = stmt.values(values)
 
-            result = conn.execute(stmt)
+            result = _execute(conn, stmt, diff, key)
 
             if result.rowcount == 0:
                 if on_conflict == "ignore":
@@ -165,6 +173,41 @@ def apply_changeset(
             affected += result.rowcount
 
     return affected
+
+
+def _execute(
+    conn: Connection,
+    stmt: Any,
+    diff: RowDiff,
+    row_key: dict[str, Any],
+) -> CursorResult:
+    """Run one statement, turning driver errors into SafeAgentDBError.
+
+    Without this, an IntegrityError from production escapes the documented
+    exception hierarchy, so the `except SafeAgentDBError` the README tells
+    people to write would miss it.
+    """
+    try:
+        return conn.execute(stmt)
+    except IntegrityError as exc:
+        raise IntegrityViolationError(
+            f"Production rejected the {diff.diff_type.value} on '{diff.table}' "
+            f"for row {row_key!r}: {_driver_message(exc)}. The sandbox could not "
+            f"catch this because it holds only this tenant's rows. The whole "
+            f"changeset was rolled back.",
+            table=diff.table,
+            row_key=row_key,
+        ) from exc
+    except DBAPIError as exc:
+        raise SyncError(
+            f"The database rejected the {diff.diff_type.value} on '{diff.table}' "
+            f"for row {row_key!r}: {_driver_message(exc)}. The whole changeset "
+            f"was rolled back."
+        ) from exc
+
+
+def _driver_message(exc: DBAPIError) -> str:
+    return str(exc.orig) if exc.orig is not None else str(exc)
 
 
 def _detect_conflict(
