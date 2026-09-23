@@ -7,16 +7,16 @@
 <p align="center">
   <a href="https://pypi.org/project/safeagentdb/"><img src="https://img.shields.io/pypi/v/safeagentdb?color=blue&label=PyPI" alt="PyPI"></a>
   <a href="https://pypi.org/project/safeagentdb/"><img src="https://img.shields.io/pypi/pyversions/safeagentdb" alt="Python"></a>
-  <a href="https://github.com/sippinonstraightchlorine/safeagentdb/blob/main/LICENSE"><img src="https://img.shields.io/github/license/sippinonstraightchlorine/safeagentdb?color=green" alt="License"></a>
+  <a href="https://github.com/arhandonerkaya/safeagentdb/blob/main/LICENSE"><img src="https://img.shields.io/github/license/arhandonerkaya/safeagentdb?color=green" alt="License"></a>
   <a href="https://pypi.org/project/safeagentdb/"><img src="https://img.shields.io/pypi/dm/safeagentdb?color=orange" alt="Downloads"></a>
-  <a href="https://github.com/sippinonstraightchlorine/safeagentdb/actions/workflows/ci.yml"><img src="https://github.com/sippinonstraightchlorine/safeagentdb/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/sippinonstraightchlorine/safeagentdb/tree/main/tests"><img src="https://img.shields.io/badge/tests-139%20passing-brightgreen" alt="Tests"></a>
+  <a href="https://github.com/arhandonerkaya/safeagentdb/actions/workflows/ci.yml"><img src="https://github.com/arhandonerkaya/safeagentdb/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/arhandonerkaya/safeagentdb/tree/main/tests"><img src="https://img.shields.io/badge/tests-139%20passing-brightgreen" alt="Tests"></a>
 </p>
 
 ---
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/sippinonstraightchlorine/safeagentdb/main/docs/assets/scenario-1-pass.png" width="800" alt="SafeAgentDB - Safe AI Changes Verified">
+  <img src="https://raw.githubusercontent.com/arhandonerkaya/safeagentdb/main/docs/assets/scenario-1-pass.png" width="800" alt="SafeAgentDB - Safe AI Changes Verified">
 </p>
 
 ---
@@ -435,7 +435,7 @@ sandbox.commit_to_production()
 # --> SyncError: "Tenant breach blocked on UPDATE: row has user_id=777, expected 42."
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/sippinonstraightchlorine/safeagentdb/main/docs/assets/scenario-2-blocked.png" width="800" alt="SafeAgentDB - Blocked: Invalid Data Detected">
+  <img src="https://raw.githubusercontent.com/arhandonerkaya/safeagentdb/main/docs/assets/scenario-2-blocked.png" width="800" alt="SafeAgentDB - Blocked: Invalid Data Detected">
 </p>
 
 # Scenario 3: Even if AI could somehow craft a rogue row,
@@ -446,7 +446,7 @@ sandbox.commit_to_production()
 When an AI agent tries to access another tenant's data, the sandbox simply contains no rows for them -- the diff shows nothing changed:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/sippinonstraightchlorine/safeagentdb/main/docs/assets/scenario-3-approved.png" width="800" alt="SafeAgentDB - Tenant Isolation: No Changes Detected">
+  <img src="https://raw.githubusercontent.com/arhandonerkaya/safeagentdb/main/docs/assets/scenario-3-approved.png" width="800" alt="SafeAgentDB - Tenant Isolation: No Changes Detected">
 </p>
 
 ### Using the Raw SQLAlchemy Session

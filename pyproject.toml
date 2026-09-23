@@ -41,9 +41,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/sippinonstraightchlorine/safeagentdb"
-Repository = "https://github.com/sippinonstraightchlorine/safeagentdb"
-Issues = "https://github.com/sippinonstraightchlorine/safeagentdb/issues"
+Homepage = "https://github.com/arhandonerkaya/safeagentdb"
+Repository = "https://github.com/arhandonerkaya/safeagentdb"
+Issues = "https://github.com/arhandonerkaya/safeagentdb/issues"
 
 [project.optional-dependencies]
 pg = ["psycopg2-binary>=2.9"]
