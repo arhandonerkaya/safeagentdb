@@ -23,7 +23,7 @@ from sqlalchemy import MetaData, Table, delete, insert, select, update
 from sqlalchemy.engine import Connection, Engine
 
 from safeagentdb.diff import ChangeSet, DiffType, RowDiff
-from safeagentdb.errors import ConflictError, SyncError
+from safeagentdb.errors import ConflictError, GeneratedValueError, SyncError
 from safeagentdb.models import validate_row
 
 OnConflict = Literal["abort", "ignore"]
@@ -62,6 +62,7 @@ def apply_changeset(
 
     Raises:
         ConflictError: If a row drifted or vanished and ``on_conflict="abort"``.
+        GeneratedValueError: If a row needs a value only production can generate.
         SyncError: On tenant breach, a missing row key, or an unknown table.
         MissingValidatorError: If a table has no registered SafeModel.
         pydantic.ValidationError: If any row fails schema validation.
@@ -103,6 +104,15 @@ def apply_changeset(
                         f"Tenant breach blocked on DELETE: row in '{diff.table}' "
                         f"belongs to {tenant_column}={diff.old.get(tenant_column)!r}."
                     )
+
+            # ---- Gate 2b: refuse values only production can generate ----
+            blocked = diff.blocked_generated_columns()
+            if blocked:
+                raise GeneratedValueError(
+                    diff.generated_value_message(blocked),
+                    table=diff.table,
+                    columns=blocked,
+                )
 
             # ---- Gate 3: Execute with tenant-scoped WHERE ----
             if diff.diff_type == DiffType.INSERT:

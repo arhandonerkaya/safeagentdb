@@ -1,6 +1,7 @@
 from safeagentdb.diff import ChangeSet, DiffType, RowDiff
 from safeagentdb.errors import (
     ConflictError,
+    GeneratedValueError,
     MissingValidatorError,
     MissingValidatorWarning,
     SafeAgentDBError,
@@ -14,6 +15,7 @@ __all__ = [
     "ChangeSet",
     "ConflictError",
     "DiffType",
+    "GeneratedValueError",
     "MissingValidatorError",
     "MissingValidatorWarning",
     "RowDiff",

@@ -105,6 +105,7 @@ class ShadowDB:
         self._clone_stats: dict[str, int] = {}
         self._row_keys: dict[str, list[str]] = {}
         self._unsupported: list[str] = []
+        self._generated_columns: dict[str, list[str]] = {}
         self._committed = False
 
     # ---- Context manager ----
@@ -134,6 +135,9 @@ class ShadowDB:
             )
             self._unsupported = list(
                 self._sandbox_metadata.info.get("unsupported_constraints", [])
+            )
+            self._generated_columns = dict(
+                self._sandbox_metadata.info.get("generated_columns", {})
             )
 
             # Fail fast, before any data is copied, if rows cannot be identified.
@@ -210,6 +214,7 @@ class ShadowDB:
             self._row_keys,
             unsupported_constraints=self._unsupported,
             require_validators=self.require_validators,
+            generated_columns=self._generated_columns,
         )
 
     def commit_to_production(self) -> int:
@@ -231,6 +236,8 @@ class ShadowDB:
         Raises:
             ConflictError: If production drifted since the clone and
                 ``on_conflict="abort"``.
+            GeneratedValueError: If a new row needs a value only production can
+                generate, such as a serial or identity primary key.
             SyncError: On tenant breach or a missing row key.
             MissingValidatorError: If a table has no SafeModel and
                 ``require_validators`` is True.
@@ -272,6 +279,15 @@ class ShadowDB:
     def dialect(self) -> str:
         """The production database dialect name (e.g. 'postgresql', 'mysql', 'sqlite')."""
         return self.prod_engine.dialect.name
+
+    @property
+    def generated_columns(self) -> dict[str, list[str]]:
+        """Columns whose production-side generated default the sandbox lost.
+
+        An INSERT that needs one of these cannot be synced: the sandbox has no
+        access to the production sequence or default function.
+        """
+        return {k: list(v) for k, v in self._generated_columns.items()}
 
     @property
     def reference_table_names(self) -> list[str]:

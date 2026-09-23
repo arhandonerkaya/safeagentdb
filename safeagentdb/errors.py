@@ -56,6 +56,30 @@ class ConflictError(SyncError):
         self.columns = list(columns or [])
 
 
+class GeneratedValueError(SyncError):
+    """Raised when a row depends on a value only production can generate.
+
+    The sandbox is SQLite and has no access to the production sequence,
+    identity or default function, so it cannot produce the value the
+    production database would have produced.
+
+    Attributes:
+        table: Name of the table the row belongs to.
+        columns: The columns production generates.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        table: str | None = None,
+        columns: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.table = table
+        self.columns = list(columns or [])
+
+
 class MissingValidatorError(SafeAgentDBError, KeyError):
     """Raised when no SafeModel is registered for a table and one is required.
 
@@ -71,6 +95,7 @@ class MissingValidatorWarning(UserWarning):
 
 __all__ = [
     "ConflictError",
+    "GeneratedValueError",
     "MissingValidatorError",
     "MissingValidatorWarning",
     "SafeAgentDBError",
