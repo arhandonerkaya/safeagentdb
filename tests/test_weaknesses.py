@@ -473,14 +473,46 @@ class TestClaim2LostUpdate:
     against the clone-time values, only changed columns are written, and the
     affected count comes from each statement's rowcount."""
 
-    def test_concurrent_write_raises_conflict_error(self, tmp_path):
+    def test_concurrent_write_to_the_same_column_raises_conflict_error(self, tmp_path):
         engine, url = _prod_engine(tmp_path, "lost.db", TASKS_DDL)
         _register_task_validator()
 
         with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
             sandbox.execute("UPDATE tasks SET status = 'done' WHERE id = 1")
 
-            # Another process edits a DIFFERENT column of the same row.
+            # Another process edits the SAME column of the same row.
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(
+                    text("UPDATE tasks SET status = 'in_progress' WHERE id = 1")
+                )
+
+            with pytest.raises(ConflictError) as excinfo:
+                sandbox.commit_to_production()
+
+        error = excinfo.value
+        assert error.table == "tasks"
+        assert error.row_key == {"id": 1}
+        assert error.columns == ["status"]
+        assert isinstance(error, SyncError)
+
+        # Nothing was written: the other process's value survives.
+        with engine.connect() as conn:
+            status = conn.execute(
+                text("SELECT status FROM tasks WHERE id=1")
+            ).scalar_one()
+        assert status == "in_progress"
+
+    def test_concurrent_write_to_another_column_coexists(self, tmp_path):
+        """The original claim-2 scenario. The human's rename is no longer lost --
+        and because only the changed column is guarded, the agent's unrelated
+        change is not rejected either. Both survive."""
+        engine, url = _prod_engine(tmp_path, "coexist.db", TASKS_DDL)
+        _register_task_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE tasks SET status = 'done' WHERE id = 1")
+
             other = create_engine(url)
             with other.begin() as conn:
                 conn.execute(
@@ -490,23 +522,14 @@ class TestClaim2LostUpdate:
                     )
                 )
 
-            with pytest.raises(ConflictError) as excinfo:
-                sandbox.commit_to_production()
+            assert sandbox.commit_to_production() == 1
 
-        error = excinfo.value
-        assert error.table == "tasks"
-        assert error.row_key == {"id": 1}
-        assert error.columns == ["title"]
-        assert isinstance(error, SyncError)
-
-        # The whole changeset rolled back: the human's rename survives and the
-        # agent's status change was not applied.
         with engine.connect() as conn:
             title, status = conn.execute(
                 text("SELECT title, status FROM tasks WHERE id=1")
             ).one()
-        assert title == "Ship v2 [renamed by human]"
-        assert status == "todo"
+        assert title == "Ship v2 [renamed by human]"  # not reverted
+        assert status == "done"  # and the agent's change landed
 
     def test_update_writes_only_changed_columns(self, tmp_path):
         """A column the agent never touched is not part of the UPDATE, so a
@@ -544,7 +567,9 @@ class TestClaim2LostUpdate:
 
             other = create_engine(url)
             with other.begin() as conn:
-                conn.execute(text("UPDATE tasks SET title = 'renamed' WHERE id = 1"))
+                conn.execute(
+                    text("UPDATE tasks SET status = 'in_progress' WHERE id = 1")
+                )
 
             # Row 1 drifted and is skipped; row 2 still applies.
             assert sandbox.commit_to_production() == 1
@@ -554,7 +579,7 @@ class TestClaim2LostUpdate:
                 text("SELECT id, title, status FROM tasks ORDER BY id")
             ).fetchall()
         assert rows == [
-            (1, "renamed", "todo"),
+            (1, "Ship v2", "in_progress"),
             (2, "Write docs", "done"),
         ]
 

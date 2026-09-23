@@ -7,9 +7,12 @@ Safety guarantees:
 3. Tenant ID is re-checked on every row to prevent scope escape
 4. Tenant ID is enforced in the WHERE clause of every UPDATE/DELETE
 5. No UPDATE or DELETE is ever executed without a row-identifying predicate
-6. Every UPDATE/DELETE target is re-read and compared against the values
-   captured at clone time, so a concurrent write is never silently lost
+6. Every UPDATE/DELETE carries its clone-time values in the WHERE clause, so
+   the check and the write are one atomic statement with no window between
+   them, whatever the isolation level
 7. Only the columns the agent actually changed are written
+8. Statements run in a deterministic order, so two concurrent changesets
+   cannot deadlock by touching the same rows in opposite orders
 
 Uses only SQLAlchemy Core constructs -- no raw SQL, no dialect-specific
 hacks. Works identically on PostgreSQL, MySQL, and SQLite.
@@ -19,7 +22,18 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from sqlalchemy import MetaData, Table, delete, insert, select, update
+from sqlalchemy import (
+    JSON,
+    Column,
+    Float,
+    LargeBinary,
+    MetaData,
+    Table,
+    delete,
+    insert,
+    select,
+    update,
+)
 from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
@@ -81,7 +95,7 @@ def apply_changeset(
     affected = 0
 
     with engine.begin() as conn:
-        for diff in changeset.diffs:
+        for diff in sorted(changeset.diffs, key=_statement_order):
             table = metadata.tables.get(diff.table)
             if table is None:
                 raise SyncError(f"Table '{diff.table}' not found in production metadata.")
@@ -131,19 +145,17 @@ def apply_changeset(
             # ---- Gate 4: never touch rows without identifying them ----
             key = _require_row_key(diff, table, tenant_column, tenant_id, row_keys)
 
-            # ---- Gate 5: optimistic concurrency check ----
-            conflict = _detect_conflict(
-                conn, table, diff, key, tenant_column, tenant_id
-            )
-            if conflict is not None:
-                if on_conflict == "ignore":
-                    continue
-                raise conflict
+            # ---- Gate 5: compare and swap ----
+            # The clone-time values go into the WHERE clause, so the check and
+            # the write are one statement. Nothing can slip in between them.
+            guarded = _guard_columns(diff, table, key)
 
             stmt = update(table) if diff.diff_type == DiffType.UPDATE else delete(table)
             for key_col, key_val in key.items():
-                stmt = stmt.where(table.c[key_col] == key_val)
+                stmt = stmt.where(_matches(table.c[key_col], key_val))
             stmt = stmt.where(table.c[tenant_column] == tenant_id)
+            for col in guarded:
+                stmt = stmt.where(_matches(table.c[col], (diff.old or {})[col]))
 
             if diff.diff_type == DiffType.UPDATE:
                 # Only the columns the agent actually touched, so a column it
@@ -160,12 +172,20 @@ def apply_changeset(
             result = _execute(conn, stmt, diff, key)
 
             if result.rowcount == 0:
+                # The guard did not match. Re-read -- no lock needed, the write
+                # already did not happen -- only to say why.
+                conflict = _diagnose_conflict(
+                    conn, table, diff, key, tenant_column, tenant_id, guarded
+                )
                 if on_conflict == "ignore":
                     continue
+                raise conflict
+
+            if result.rowcount > 1:
                 raise ConflictError(
-                    f"{diff.diff_type.value} on '{diff.table}' matched no rows: "
-                    f"the row {key!r} for {tenant_column}={tenant_id!r} no longer "
-                    f"exists in production.",
+                    f"{diff.diff_type.value} on '{diff.table}' matched "
+                    f"{result.rowcount} rows for key {key!r}, so that key does not "
+                    f"identify a row in production. The changeset was rolled back.",
                     table=diff.table,
                     row_key=key,
                 )
@@ -173,6 +193,80 @@ def apply_changeset(
             affected += result.rowcount
 
     return affected
+
+
+def _statement_order(diff: RowDiff) -> tuple:
+    """Total order over a changeset: table, then row key, then operation.
+
+    Two concurrent changesets touching the same rows therefore take them in the
+    same order and cannot deadlock against each other.
+    """
+    return (
+        diff.table,
+        tuple(sorted((k, repr(v)) for k, v in (diff.pk or {}).items())),
+        diff.diff_type.value,
+    )
+
+
+# Types whose equality does not survive a driver round-trip reliably enough to
+# gate a write on. Guarding a float on exact equality would reject correct
+# changesets; guarding a JSON blob would compare formatting, not meaning.
+_UNGUARDABLE_TYPES = (Float, LargeBinary, JSON)
+_UNGUARDABLE_TYPE_NAMES = frozenset(
+    {
+        "ARRAY",
+        "BLOB",
+        "BYTEA",
+        "HSTORE",
+        "JSON",
+        "JSONB",
+        "MONEY",
+        "TSVECTOR",
+    }
+)
+
+
+def _is_guardable(column: Column) -> bool:
+    if isinstance(column.type, _UNGUARDABLE_TYPES):
+        return False
+    return type(column.type).__name__.upper() not in _UNGUARDABLE_TYPE_NAMES
+
+
+def _guard_columns(diff: RowDiff, table: Table, key: dict[str, Any]) -> list[str]:
+    """Columns whose clone-time value is asserted in the WHERE clause.
+
+    For an UPDATE only the columns the agent changed are guarded, so an
+    unrelated concurrent edit to a different column of the same row is allowed
+    to coexist. For a DELETE there are no changed columns, so the whole row is
+    guarded: removing a row somebody else just edited is itself a lost update.
+    """
+    old = diff.old or {}
+    if diff.diff_type == DiffType.UPDATE:
+        candidates = diff.changed_columns()
+    else:
+        candidates = list(old)
+
+    return [
+        col
+        for col in candidates
+        if col in old
+        and col not in key
+        and col in table.c
+        and _is_guardable(table.c[col])
+    ]
+
+
+def _matches(column: Column, value: Any):
+    """An equality predicate that is correct for NULL.
+
+    ``column = NULL`` is never true, so a NULL clone-time value has to become
+    ``column IS NULL``. Because the clone-time value is a Python value we hold,
+    not an unknown bind parameter, this plain branch is exact everywhere and
+    needs no IS NOT DISTINCT FROM / <=> dialect handling.
+    """
+    if value is None:
+        return column.is_(None)
+    return column == value
 
 
 def _execute(
@@ -210,22 +304,23 @@ def _driver_message(exc: DBAPIError) -> str:
     return str(exc.orig) if exc.orig is not None else str(exc)
 
 
-def _detect_conflict(
+def _diagnose_conflict(
     conn: Connection,
     table: Table,
     diff: RowDiff,
     key: dict[str, Any],
     tenant_column: str,
     tenant_id: Any,
-) -> ConflictError | None:
-    """Compare the live production row against the values captured at clone time.
+    guarded: list[str],
+) -> ConflictError:
+    """Explain why a guarded statement matched nothing.
 
-    Returns a ConflictError describing the drift, or None when the row still
-    looks exactly as it did when the sandbox was created.
+    Only ever called after the write has already failed to match, so this read
+    needs no lock: it cannot change the outcome, only describe it.
     """
     stmt = select(table)
     for key_col, key_val in key.items():
-        stmt = stmt.where(table.c[key_col] == key_val)
+        stmt = stmt.where(_matches(table.c[key_col], key_val))
     stmt = stmt.where(table.c[tenant_column] == tenant_id)
 
     rows = conn.execute(stmt.limit(2)).fetchall()
@@ -250,22 +345,29 @@ def _detect_conflict(
     original = diff.old or {}
     drifted = sorted(
         col
-        for col, cloned_value in original.items()
-        if col in current and current[col] != cloned_value
+        for col in guarded
+        if col in current and current[col] != original.get(col)
     )
 
-    if drifted:
+    if not drifted:
+        # The row is back to its cloned values, or changed again between the
+        # write and this read. Either way the write did not happen.
         return ConflictError(
             f"Row {key!r} in '{diff.table}' changed in production after the "
-            f"sandbox was created; column(s) {drifted!r} no longer hold the "
-            f"cloned values. Re-clone and re-apply, or pass "
-            f'on_conflict="ignore" to skip drifted rows.',
+            f"sandbox was created, so the {diff.diff_type.value} matched nothing.",
             table=diff.table,
             row_key=key,
-            columns=drifted,
         )
 
-    return None
+    return ConflictError(
+        f"Row {key!r} in '{diff.table}' changed in production after the "
+        f"sandbox was created; column(s) {drifted!r} no longer hold the "
+        f"cloned values. Re-clone and re-apply, or pass "
+        f'on_conflict="ignore" to skip drifted rows.',
+        table=diff.table,
+        row_key=key,
+        columns=drifted,
+    )
 
 
 def _require_row_key(

@@ -22,6 +22,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 from safeagentdb import (
+    ConflictError,
     GeneratedValueError,
     IntegrityViolationError,
     SafeAgentDBError,
@@ -614,3 +615,323 @@ class TestDatabaseErrorsAreWrapped:
                 caught = exc
 
         assert isinstance(caught, IntegrityViolationError)
+
+
+# ============================================================
+# 4. Compare-and-swap conflict detection
+# ============================================================
+
+
+NULLABLE_DDL = [
+    "CREATE TABLE tasks (\n"
+    " id INTEGER PRIMARY KEY,\n"
+    " user_id INTEGER NOT NULL,\n"
+    " title TEXT NOT NULL,\n"
+    " status TEXT NOT NULL,\n"
+    " assignee TEXT,\n"
+    " score REAL\n"
+    ")",
+    "INSERT INTO tasks VALUES (1, 42, 'a', 'todo', NULL, 1.5)",
+    "INSERT INTO tasks VALUES (2, 42, 'b', 'todo', 'alice', 2.5)",
+]
+
+
+def _register_nullable_validator():
+    class TaskValidator(SafeModel):
+        __table_name__ = "tasks"
+        id: int
+        user_id: int
+        title: str
+        status: str
+        assignee: str | None
+        score: float | None
+
+    return TaskValidator
+
+
+def _guard_table():
+    from sqlalchemy import Column, Float, Integer, MetaData, String, Table
+
+    meta = MetaData()
+    return Table(
+        "tasks",
+        meta,
+        Column("id", Integer, primary_key=True),
+        Column("user_id", Integer),
+        Column("title", String),
+        Column("status", String),
+        Column("assignee", String),
+        Column("score", Float),
+    )
+
+
+class TestCompareAndSwap:
+    def test_the_guard_is_part_of_the_write(self):
+        """The clone-time value goes into the WHERE clause, so there is no
+        window between checking and writing."""
+        from sqlalchemy import update
+
+        from safeagentdb.diff import DiffType, RowDiff
+        from safeagentdb.sync import _guard_columns, _matches
+
+        table = _guard_table()
+        old = {
+            "id": 1,
+            "user_id": 42,
+            "title": "a",
+            "status": "todo",
+            "assignee": None,
+            "score": 1.5,
+        }
+        diff = RowDiff(
+            table="tasks",
+            diff_type=DiffType.UPDATE,
+            pk={"id": 1},
+            old=old,
+            new={**old, "status": "done"},
+        )
+
+        guarded = _guard_columns(diff, table, {"id": 1})
+        assert guarded == ["status"]  # only what the agent changed
+
+        stmt = update(table).where(_matches(table.c.id, 1))
+        for col in guarded:
+            stmt = stmt.where(_matches(table.c[col], old[col]))
+        compiled = str(stmt.values(status="done").compile())
+        assert "WHERE" in compiled
+        assert compiled.count("status") >= 2  # both SET and WHERE
+
+    def test_a_delete_guards_the_whole_row(self):
+        from safeagentdb.diff import DiffType, RowDiff
+        from safeagentdb.sync import _guard_columns
+
+        table = _guard_table()
+        old = {
+            "id": 1,
+            "user_id": 42,
+            "title": "a",
+            "status": "todo",
+            "assignee": None,
+            "score": 1.5,
+        }
+        diff = RowDiff(table="tasks", diff_type=DiffType.DELETE, pk={"id": 1}, old=old)
+
+        guarded = _guard_columns(diff, table, {"id": 1})
+        assert "status" in guarded
+        assert "assignee" in guarded
+        assert "title" in guarded
+        assert "score" not in guarded  # float: unreliable equality
+        assert "id" not in guarded  # already the row key
+
+    def test_concurrent_update_to_the_guarded_column_conflicts(self, tmp_path):
+        engine, url = _prod(tmp_path, "cas_update.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE tasks SET status='done' WHERE id=1")
+
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("UPDATE tasks SET status='blocked' WHERE id=1"))
+
+            with pytest.raises(ConflictError) as excinfo:
+                sandbox.commit_to_production()
+            assert excinfo.value.columns == ["status"]
+
+        with engine.connect() as conn:
+            assert (
+                conn.execute(text("SELECT status FROM tasks WHERE id=1")).scalar_one()
+                == "blocked"
+            )
+
+    def test_concurrent_delete_conflicts(self, tmp_path):
+        engine, url = _prod(tmp_path, "cas_delete.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE tasks SET status='done' WHERE id=1")
+
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("DELETE FROM tasks WHERE id=1"))
+
+            with pytest.raises(ConflictError, match="deleted in production"):
+                sandbox.commit_to_production()
+
+    def test_agent_delete_of_a_drifted_row_conflicts(self, tmp_path):
+        """A DELETE guards every comparable column, so removing a row somebody
+        else just edited is a conflict, not a silent loss."""
+        engine, url = _prod(tmp_path, "cas_del_drift.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("DELETE FROM tasks WHERE id=2")
+
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("UPDATE tasks SET title='edited by human' WHERE id=2"))
+
+            with pytest.raises(ConflictError) as excinfo:
+                sandbox.commit_to_production()
+            assert excinfo.value.columns == ["title"]
+
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 2
+
+    def test_a_column_that_was_null_at_clone_time(self, tmp_path):
+        """'col = NULL' never matches, so a NULL guard must become 'col IS NULL'."""
+        engine, _ = _prod(tmp_path, "cas_null_clone.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        # assignee is NULL on row 1 at clone time and stays NULL: must apply.
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE tasks SET assignee='bob' WHERE id=1")
+            assert sandbox.commit_to_production() == 1
+
+        with engine.connect() as conn:
+            assert (
+                conn.execute(text("SELECT assignee FROM tasks WHERE id=1")).scalar_one()
+                == "bob"
+            )
+
+        # Now the same column drifts away from NULL between clone and commit.
+        engine2, url2 = _prod(tmp_path, "cas_null_drift.db", NULLABLE_DDL)
+        with ShadowDB(engine2, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE tasks SET assignee='bob' WHERE id=1")
+
+            other = create_engine(url2)
+            with other.begin() as conn:
+                conn.execute(text("UPDATE tasks SET assignee='carol' WHERE id=1"))
+
+            with pytest.raises(ConflictError) as excinfo:
+                sandbox.commit_to_production()
+            assert excinfo.value.columns == ["assignee"]
+
+        with engine2.connect() as conn:
+            assert (
+                conn.execute(text("SELECT assignee FROM tasks WHERE id=1")).scalar_one()
+                == "carol"
+            )
+
+    def test_a_column_that_becomes_null(self, tmp_path):
+        """Clone-time value is non-NULL; production sets it to NULL. The guard
+        'col = value' is NULL against a NULL column, so it must not match."""
+        engine, url = _prod(tmp_path, "cas_becomes_null.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE tasks SET assignee='dave' WHERE id=2")
+
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("UPDATE tasks SET assignee=NULL WHERE id=2"))
+
+            with pytest.raises(ConflictError) as excinfo:
+                sandbox.commit_to_production()
+            assert excinfo.value.columns == ["assignee"]
+
+        with engine.connect() as conn:
+            assert (
+                conn.execute(text("SELECT assignee FROM tasks WHERE id=2")).scalar_one()
+                is None
+            )
+
+    def test_the_agent_can_set_a_column_to_null(self, tmp_path):
+        engine, _ = _prod(tmp_path, "cas_set_null.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE tasks SET assignee=NULL WHERE id=2")
+            assert sandbox.commit_to_production() == 1
+
+        with engine.connect() as conn:
+            assert (
+                conn.execute(text("SELECT assignee FROM tasks WHERE id=2")).scalar_one()
+                is None
+            )
+
+    def test_a_float_column_is_not_guarded(self, tmp_path):
+        """Float equality does not survive round-trips reliably, so guarding on
+        it would reject correct changesets. It is excluded by design."""
+        from safeagentdb.sync import _is_guardable
+
+        table = _guard_table()
+        assert _is_guardable(table.c.id) is True
+        assert _is_guardable(table.c.title) is True
+        assert _is_guardable(table.c.score) is False
+
+        engine, url = _prod(tmp_path, "cas_float.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("DELETE FROM tasks WHERE id=2")
+
+            # A concurrent change to the unguarded float does not block it.
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("UPDATE tasks SET score=99.9 WHERE id=2"))
+
+            assert sandbox.commit_to_production() == 1
+
+    def test_statements_run_in_a_deterministic_order(self):
+        """Two changesets touching the same rows take them in the same order."""
+        from safeagentdb.diff import DiffType, RowDiff
+        from safeagentdb.sync import _statement_order
+
+        diffs = [
+            RowDiff(table="tasks", diff_type=DiffType.UPDATE, pk={"id": 3}),
+            RowDiff(table="users", diff_type=DiffType.UPDATE, pk={"id": 1}),
+            RowDiff(table="tasks", diff_type=DiffType.UPDATE, pk={"id": 1}),
+            RowDiff(table="tasks", diff_type=DiffType.DELETE, pk={"id": 2}),
+        ]
+        ordered = [(d.table, d.pk["id"]) for d in sorted(diffs, key=_statement_order)]
+        assert ordered == [("tasks", 1), ("tasks", 2), ("tasks", 3), ("users", 1)]
+
+        # The reverse input gives the same order.
+        reversed_order = [
+            (d.table, d.pk["id"])
+            for d in sorted(list(reversed(diffs)), key=_statement_order)
+        ]
+        assert reversed_order == ordered
+
+    def test_a_row_key_matching_several_production_rows_conflicts(self, tmp_path):
+        engine, url = _prod(
+            tmp_path,
+            "cas_multi.db",
+            [
+                "CREATE TABLE events (\n"
+                " user_id INTEGER NOT NULL,\n"
+                " kind TEXT NOT NULL,\n"
+                " payload TEXT NOT NULL\n"
+                ")",
+                "INSERT INTO events VALUES (42, 'login', 'a')",
+            ],
+        )
+
+        class EventValidator(SafeModel):
+            __table_name__ = "events"
+            user_id: int
+            kind: str
+            payload: str
+
+        with ShadowDB(
+            engine,
+            tables=["events"],
+            tenant_id=42,
+            row_key={"events": ["user_id", "kind"]},
+        ) as sandbox:
+            sandbox.execute("UPDATE events SET payload='edited' WHERE kind='login'")
+
+            # A duplicate with the same key appears in production.
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("INSERT INTO events VALUES (42, 'login', 'a')"))
+
+            with pytest.raises(ConflictError, match="does not identify a row"):
+                sandbox.commit_to_production()
+
+        with engine.connect() as conn:
+            payloads = [
+                r[0] for r in conn.execute(text("SELECT payload FROM events")).fetchall()
+            ]
+        assert payloads == ["a", "a"]
