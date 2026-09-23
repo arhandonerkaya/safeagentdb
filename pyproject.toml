@@ -68,3 +68,6 @@ select = ["E", "F", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "requires_db: needs a real database server; set DATABASE_URL to run (CI uses PostgreSQL)",
+]

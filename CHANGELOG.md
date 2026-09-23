@@ -43,10 +43,12 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
   without a word. Pass `on_conflict="ignore"` to skip drifted rows instead --
   which applies the changeset in part and records every skip.
 
-- **An INSERT that needs a value only production can generate is refused** with
-  `GeneratedValueError`. This blocks agent-side inserts into tables with a
-  `serial`/identity primary key, which previously wrote a key the sequence had
-  never issued.
+- **A `serial`/identity key is now assigned by production, not by the sandbox.**
+  The column is left out of the `INSERT` and the real key is read back into
+  `ShadowDB.assigned_keys`; the diff shows `(assigned by production)` instead of
+  a placeholder. Supplying the key by hand is refused with
+  `GeneratedValueError`, as is a new row referencing another new row's
+  placeholder. 0.1.x wrote a key the sequence had never issued.
 
 - **A foreign key whose parent table clones zero rows is no longer enforced** in
   the sandbox, and is listed in `unsupported_constraints`. Pass
@@ -71,8 +73,8 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
 
 - `safeagentdb.__all__` grew: `SafeAgentDBError`, `SchemaError`, `SyncError`,
   `ConflictError`, `GeneratedValueError`, `IntegrityViolationError`,
-  `MissingValidatorError`, `MissingValidatorWarning`, `ConflictWarning` and
-  `SkippedConflict`.
+  `MissingValidatorError`, `MissingValidatorWarning`, `ConflictWarning`,
+  `SkippedConflict` and `AssignedKey`.
 
 ### Added
 
@@ -83,8 +85,12 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
   rows are visible to the agent and they are read-only.
 - `ShadowDB.reference_table_names`, `ShadowDB.generated_columns` and
   `ShadowDB.skipped_conflicts`.
-- `GeneratedValueError`, `IntegrityViolationError`, `SkippedConflict` and
-  `ConflictWarning`.
+- `GeneratedValueError`, `IntegrityViolationError`, `SkippedConflict`,
+  `AssignedKey` and `ConflictWarning`.
+- `ShadowDB.assigned_keys` and `ShadowDB.provisional_key_columns`.
+- A `requires_db` pytest marker and `tests/test_server_backed.py`, run by CI
+  against a PostgreSQL 16 service container and skipped when `DATABASE_URL` is
+  unset.
 - `on_conflict` option: `"abort"` (default) or `"ignore"`.
 - `require_validators` option: `True` (default) or `False`.
 - `ShadowDB.row_keys` — the row-identifying columns in use per table.
@@ -101,8 +107,9 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
   unknown key columns, or a key that disagrees with the declared `row_key`
   raises `SyncError` instead of executing.
 - GitHub Actions CI running pytest on Python 3.10, 3.11 and 3.12, plus ruff.
-- `tests/test_weaknesses.py`, `tests/test_hardening.py` and
-  `tests/test_audit_followups.py` (173 tests total).
+- `tests/test_weaknesses.py`, `tests/test_hardening.py`,
+  `tests/test_audit_followups.py` and `tests/test_server_backed.py`
+  (188 tests total; the 12 server-backed ones need `DATABASE_URL`).
 
 ### Fixed
 

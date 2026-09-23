@@ -226,6 +226,43 @@ ShadowDB(
 > cannot tell two rows apart, and any `UPDATE` it built would match every row
 > the tenant owns.
 
+#### Generated keys
+
+A `serial` or identity primary key is filled by a sequence that lives in
+production. SQLite has no equivalent, so the sandbox fills the column with a
+**placeholder** and the diff says so rather than showing an id that will not
+survive:
+
+```
+ + | tasks | INSERT | pending | id      | -- | (assigned by production)
+   |       |        |         | user_id | -- | 42
+   |       |        |         | title   | -- | Ship v3
+```
+
+At commit the column is left out of the `INSERT`, production's sequence assigns
+the real key, and it is read back and reported:
+
+```python
+with ShadowDB(prod_engine, tables=["tasks"], tenant_id=42) as sandbox:
+    sandbox.execute("INSERT INTO tasks (user_id, title) VALUES (42, 'Ship v3')")
+    sandbox.commit_to_production()
+
+    for key in sandbox.assigned_keys:
+        print(key.table, key.provisional, "->", key.assigned)
+        # tasks {'id': 4503599627370497} -> {'id': 901}
+```
+
+Two things are still refused, with `GeneratedValueError`:
+
+- **The agent supplying the key itself.** That bypasses the sequence, so a later
+  ordinary insert can collide with it.
+- **A new row referencing another new row's placeholder.** The parent's real key
+  is only known once it is written, and SafeAgentDB will not guess it. Insert the
+  parent through the application first, then let the agent reference its real key.
+
+A generated **non-key** column (a `gen_random_uuid()` default, say) is refused
+only when the agent leaves it empty; supplying a value is fine.
+
 #### Reference tables
 
 The clone is tenant-scoped, so a shared lookup table with no tenant column
@@ -284,7 +321,9 @@ Two things to know before you list a table:
 | `dialect` | `str` | Production database dialect name (`'postgresql'`, `'mysql'`, `'sqlite'`). |
 | `row_keys` | `dict[str, list[str]]` | The row-identifying columns in use for each cloned table. |
 | `reference_table_names` | `list[str]` | Tables cloned in full and treated as read-only. |
-| `generated_columns` | `dict[str, list[str]]` | Columns whose production-side generated default the sandbox could not reproduce. An INSERT needing one cannot be synced. |
+| `generated_columns` | `dict[str, list[str]]` | Columns whose production-side generated default the sandbox could not reproduce. |
+| `provisional_key_columns` | `dict[str, list[str]]` | Key columns the sandbox fills with a placeholder for production to replace. See [Generated keys](#generated-keys). |
+| `assigned_keys` | `list[AssignedKey]` | For the last commit, the real keys production assigned to rows that held a placeholder. |
 | `skipped_conflicts` | `list[SkippedConflict]` | Rows the last commit left unapplied under `on_conflict="ignore"`. Empty otherwise. |
 | `unsupported_constraints` | `list[str]` | Schema elements that could not be reproduced in the sandbox, and are therefore **not enforced** there. See below. |
 | `session` | `Session` | Raw SQLAlchemy `Session` for ORM-style operations if needed. |
@@ -387,7 +426,7 @@ exception is kept as `__cause__`.
 | `SchemaError` | A cloned table has no primary key and no usable `row_key`; a `row_key` names missing columns or is not unique in the cloned rows; the production schema cannot be reproduced in SQLite. |
 | `SyncError` | Tenant isolation is breached, an `UPDATE`/`DELETE` has no row-identifying key, a row key disagrees with the declared one, a table is missing from production metadata, or the sandbox is committed twice. |
 | `ConflictError` | A production row changed or was deleted between clone and commit, or a row key matches more than one row. Carries `.table`, `.row_key` and `.columns` (the drifted column names). |
-| `GeneratedValueError` | A new row needs a value only production can generate -- a `serial`/identity primary key, a `gen_random_uuid()` default. The sandbox has no access to the sequence, so it cannot produce the value production would. Carries `.table` and `.columns`. |
+| `GeneratedValueError` | A new row supplies a key production is meant to assign, needs a generated value the sandbox could not hold for it, or references another new row's placeholder key. Carries `.table` and `.columns`. See [Generated keys](#generated-keys). |
 | `IntegrityViolationError` | Production rejected a row the sandbox accepted, most often a `UNIQUE` collision with a row belonging to another tenant. Carries `.table` and `.row_key`, and the driver's `IntegrityError` as `__cause__`. |
 | `MissingValidatorError` | A table has no registered `SafeModel` and `require_validators` is `True`. Also subclasses `KeyError`, so 0.1.x handlers keep working. |
 | `MissingValidatorWarning` | Not an error: warned when `require_validators=False` and a row is written unvalidated. |
@@ -555,9 +594,10 @@ honest version of what that means.
   locks. An `UPDATE` guards the columns the agent changed, so an unrelated
   concurrent edit to a different column of the same row is allowed to coexist; a
   `DELETE` guards the whole row.
-- **Values only production can generate**: an INSERT that depends on a sequence,
-  identity column or default function the sandbox could not reproduce is refused
-  with `GeneratedValueError` rather than written with an invented key.
+- **Values only production can generate**: a `serial`/identity key is left for
+  production's sequence to assign and reported back, never invented by the
+  sandbox. Supplying one by hand, or pointing at a placeholder that does not
+  exist yet, is refused with `GeneratedValueError`.
 
 ### What the sandbox cannot catch
 
@@ -592,6 +632,26 @@ honest version of what that means.
   does mean the row as a whole is not frozen between clone and commit.
 - **Scale.** The entire tenant scope is copied into memory. This is designed for
   one tenant's working set, not for a full-table migration.
+
+- **A new row referencing another new row.** Refused rather than resolved. If
+  your agent needs to build a parent and its children in one go, create the
+  parent through the application first.
+
+### Verified against a real server
+
+The sandbox is SQLite, so most of the suite uses SQLite as the stand-in
+production database. The claims that only a real server can settle --
+compare-and-swap against a genuinely concurrent transaction, sequences assigning
+keys, foreign keys, tenant isolation -- are covered by `tests/test_server_backed.py`,
+which CI runs against a **PostgreSQL 16** service container. They are skipped
+locally unless you set `DATABASE_URL`:
+
+```bash
+DATABASE_URL=postgresql+psycopg2://user:pass@localhost/db python -m pytest -m requires_db
+```
+
+MySQL is not covered. Nothing in the library is MySQL-specific, but that is an
+untested claim rather than a verified one.
 
 ### Operational notes
 

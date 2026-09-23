@@ -62,6 +62,66 @@ jobs:
               print(f"- failed: {failed}")
           PY
 
+  postgres:
+    name: pytest (PostgreSQL 16)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: safeagentdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/safeagentdb
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,pg]"
+
+      - name: Run the server-backed tests
+        run: python -m pytest -q -m requires_db --junitxml=junit.xml
+
+      # A mis-set DATABASE_URL would skip every test and leave the job green,
+      # which would be worse than no job at all.
+      - name: Fail if nothing actually ran
+        if: always()
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("junit.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          total = int(suite.get("tests", 0))
+          skipped = int(suite.get("skipped", 0))
+          ran = total - skipped
+
+          print(f"server-backed tests run against PostgreSQL: {ran}/{total}")
+          if ran == 0:
+              sys.exit("No server-backed test ran -- DATABASE_URL is not reaching them.")
+          if skipped:
+              sys.exit(f"{skipped} server-backed test(s) skipped; expected none.")
+          PY
+
   lint:
     name: ruff
     runs-on: ubuntu-latest
