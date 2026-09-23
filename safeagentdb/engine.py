@@ -177,7 +177,9 @@ def _adapt_column_types(table: Table, unsupported: list[str]) -> None:
         )
 
 
-def _adapt_server_defaults(table: Table, unsupported: list[str]) -> None:
+def _adapt_server_defaults(table: Table, unsupported: list[str]) -> list[str]:
+    """Translate server defaults, returning the columns whose default was lost."""
+    dropped: list[str] = []
     for col in table.columns:
         default = col.server_default
         if default is None:
@@ -196,34 +198,56 @@ def _adapt_server_defaults(table: Table, unsupported: list[str]) -> None:
         translated, reason = _sqlite_safe_server_default(original)
         if translated is None:
             col.server_default = None
+            dropped.append(col.name)
             unsupported.append(f"{table.name}.{col.name}: {reason}")
         else:
             col.server_default = DefaultClause(text(translated))
 
+    return dropped
 
-def _drop_external_foreign_keys(
-    table: Table, known_tables: set[str], unsupported: list[str]
+
+def _drop_unenforceable_foreign_keys(
+    table: Table,
+    known_tables: set[str],
+    empty_tables: set[str],
+    unsupported: list[str],
 ) -> None:
-    """Remove FKs whose target was not cloned.
+    """Remove foreign keys the sandbox cannot honestly enforce.
 
-    Keeping them would make the sandbox reject every insert into the child
-    table once foreign_keys enforcement is on, and would break table sorting.
+    Two cases, both of which would otherwise reject correct work:
+
+    * the parent table was never cloned, so nothing could ever match;
+    * the parent table cloned zero rows, because it carries no tenant column
+      and was not listed in ``reference_tables``. Every reference from the
+      child then looks dangling even though production has the parent row.
     """
     for constraint in list(table.constraints):
         if not isinstance(constraint, ForeignKeyConstraint):
             continue
 
-        targets = {
-            fk.target_fullname.rsplit(".", 1)[0] for fk in constraint.elements
-        }
-        if targets <= known_tables:
+        targets = {fk.target_fullname.rsplit(".", 1)[0] for fk in constraint.elements}
+        columns = sorted(col.name for col in constraint.columns)
+
+        missing = targets - known_tables
+        if missing:
+            _remove_foreign_key(table, constraint)
+            unsupported.append(
+                f"{table.name}: FOREIGN KEY ({', '.join(columns)}) -> "
+                f"{', '.join(sorted(missing))} not enforced -- the parent table "
+                f"is not part of the sandbox"
+            )
             continue
 
-        _remove_foreign_key(table, constraint)
-        unsupported.append(
-            f"{table.name}: FOREIGN KEY -> {sorted(targets)} not enforced "
-            f"(target table is not part of the sandbox)"
-        )
+        empty = targets & empty_tables
+        if empty:
+            _remove_foreign_key(table, constraint)
+            unsupported.append(
+                f"{table.name}: FOREIGN KEY ({', '.join(columns)}) -> "
+                f"{', '.join(sorted(empty))} not enforced -- the parent table "
+                f"cloned 0 rows, so every reference would look dangling. If "
+                f"{', '.join(sorted(empty))} holds no tenant data, pass "
+                f"reference_tables={sorted(empty)!r} to clone it in full."
+            )
 
 
 def _remove_foreign_key(table: Table, constraint: ForeignKeyConstraint) -> None:
@@ -319,6 +343,8 @@ def reflect_tables(
 def clone_schema_to_sandbox(
     source_metadata: MetaData,
     sandbox_engine: Engine,
+    *,
+    empty_tables: Sequence[str] | None = None,
 ) -> MetaData:
     """Recreate reflected table schemas in the sandbox engine.
 
@@ -328,12 +354,19 @@ def clone_schema_to_sandbox(
 
     Anything that had to be given up is recorded in
     ``metadata.info["unsupported_constraints"]`` and surfaced by
-    ``ShadowDB.unsupported_constraints``.
+    ``ShadowDB.unsupported_constraints``. Columns whose production default could
+    not be reproduced are recorded in ``metadata.info["generated_columns"]``.
+
+    Args:
+        empty_tables: Tables that will hold no rows in the sandbox. Foreign keys
+            pointing at them are dropped, since nothing could ever satisfy them.
 
     Returns a new MetaData bound to the sandbox.
     """
     sandbox_metadata = MetaData()
     unsupported: list[str] = []
+    generated: dict[str, list[str]] = {}
+    empty = set(empty_tables or ())
 
     # .tables rather than .sorted_tables: sorting resolves foreign keys, which
     # raises if a target table was not reflected. Sorting happens after the
@@ -342,61 +375,83 @@ def clone_schema_to_sandbox(
     for table in source_metadata.tables.values():
         sandbox_table = table.to_metadata(sandbox_metadata)
         _adapt_column_types(sandbox_table, unsupported)
-        _adapt_server_defaults(sandbox_table, unsupported)
-        _drop_external_foreign_keys(sandbox_table, known_tables, unsupported)
+        dropped = _adapt_server_defaults(sandbox_table, unsupported)
+        if dropped:
+            generated[sandbox_table.name] = dropped
+        _drop_unenforceable_foreign_keys(
+            sandbox_table, known_tables, empty, unsupported
+        )
         _drop_malformed_checks(sandbox_table, unsupported)
 
     _create_tables(sandbox_metadata, sandbox_engine, unsupported)
 
     sandbox_metadata.info["unsupported_constraints"] = unsupported
+    sandbox_metadata.info["generated_columns"] = generated
     return sandbox_metadata
 
 
-def clone_rows(
+def fetch_rows(
     source_engine: Engine,
-    sandbox_engine: Engine,
     source_metadata: MetaData,
-    sandbox_metadata: MetaData,
     tenant_column: str,
     tenant_id: Any,
-) -> dict[str, int]:
-    """Copy tenant-scoped rows from production into the sandbox.
+    reference_tables: Sequence[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Read the rows that belong in the sandbox, without writing them yet.
 
-    Foreign key enforcement is suspended for the duration of the copy: a
+    Reading first lets the caller see which tables will be empty before the
+    sandbox schema is created, which decides whether a foreign key pointing at
+    them can be enforced.
+
+    A table listed in ``reference_tables`` is read in full, ignoring the tenant
+    filter. A table with no tenant column that is not listed reads nothing.
+    """
+    references = set(reference_tables or ())
+    fetched: dict[str, list[dict[str, Any]]] = {}
+
+    with source_engine.connect() as src_conn:
+        for table_key, src_table in source_metadata.tables.items():
+            if table_key in references or src_table.name in references:
+                stmt = select(src_table)
+            elif tenant_column in src_table.c:
+                stmt = select(src_table).where(src_table.c[tenant_column] == tenant_id)
+            else:
+                fetched[table_key] = []
+                continue
+
+            fetched[table_key] = [
+                row._asdict() for row in src_conn.execute(stmt).fetchall()
+            ]
+
+    return fetched
+
+
+def load_rows(
+    sandbox_engine: Engine,
+    sandbox_metadata: MetaData,
+    fetched: dict[str, list[dict[str, Any]]],
+) -> dict[str, int]:
+    """Insert previously fetched rows into the sandbox.
+
+    Foreign key enforcement is suspended for the duration of the load: a
     tenant-scoped clone is a partial view of production, so rows may legitimately
     reference parents that were never copied. Enforcement is restored afterwards,
     so changes the agent makes are checked.
 
-    Returns a dict of {table_name: rows_copied}.
+    Returns a dict of {table_name: rows_loaded}.
     """
     stats: dict[str, int] = {}
 
-    with source_engine.connect() as src_conn, sandbox_engine.connect() as sb_conn:
+    with sandbox_engine.connect() as sb_conn:
         sb_conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
         try:
             # Parents before children, so the load order is valid on its own.
             for sb_table in sandbox_metadata.sorted_tables:
-                table_key = sb_table.key
-                src_table = source_metadata.tables[table_key]
-
-                if tenant_column not in src_table.c:
-                    stats[table_key] = 0
-                    continue
-
-                rows = src_conn.execute(
-                    select(src_table).where(
-                        src_table.c[tenant_column] == tenant_id
-                    )
-                ).fetchall()
-
+                rows = fetched.get(sb_table.key, [])
                 if rows:
-                    sb_conn.execute(
-                        insert(sb_table),
-                        [row._asdict() for row in rows],
-                    )
+                    sb_conn.execute(insert(sb_table), rows)
                     sb_conn.commit()
-
-                stats[table_key] = len(rows)
+                stats[sb_table.key] = len(rows)
         except Exception:
             sb_conn.rollback()
             raise
@@ -406,6 +461,22 @@ def clone_rows(
             sb_conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
     return stats
+
+
+def clone_rows(
+    source_engine: Engine,
+    sandbox_engine: Engine,
+    source_metadata: MetaData,
+    sandbox_metadata: MetaData,
+    tenant_column: str,
+    tenant_id: Any,
+    reference_tables: Sequence[str] | None = None,
+) -> dict[str, int]:
+    """Fetch and load in one step. Returns {table_name: rows_copied}."""
+    fetched = fetch_rows(
+        source_engine, source_metadata, tenant_column, tenant_id, reference_tables
+    )
+    return load_rows(sandbox_engine, sandbox_metadata, fetched)
 
 
 def _detect_dialect(metadata: MetaData) -> str:

@@ -19,9 +19,10 @@ from sqlalchemy.orm import Session
 
 from safeagentdb.diff import ChangeSet, compute_diff
 from safeagentdb.engine import (
-    clone_rows,
     clone_schema_to_sandbox,
     create_sandbox_engine,
+    fetch_rows,
+    load_rows,
     reflect_tables,
 )
 from safeagentdb.errors import SchemaError, SyncError
@@ -50,6 +51,12 @@ class ShadowDB:
             ``{"events": ["tenant_id", "event_uuid"]}``. Required for tables
             that have no primary key. The columns must exist and must be unique
             across the cloned rows, or SchemaError is raised.
+        reference_tables: Tables to clone in full, ignoring the tenant filter.
+            Use this for shared lookup tables (statuses, currencies, plans) that
+            hold no tenant data, so that foreign keys pointing at them can be
+            enforced in the sandbox. Every row of a listed table becomes visible
+            to the agent, so only list tables whose contents any tenant may see.
+            Reference tables are read-only: changing one raises SyncError.
         on_conflict: What to do when a production row drifted between clone and
             commit. ``"abort"`` (default) raises ConflictError and rolls the
             whole changeset back; ``"ignore"`` skips the drifted row and applies
@@ -72,6 +79,7 @@ class ShadowDB:
         tenant_column: str = "user_id",
         *,
         row_key: dict[str, list[str]] | None = None,
+        reference_tables: Sequence[str] | None = None,
         on_conflict: OnConflict = "abort",
         require_validators: bool = True,
     ) -> None:
@@ -85,6 +93,7 @@ class ShadowDB:
         self.tenant_id = tenant_id
         self.tenant_column = tenant_column
         self.row_key = {k: list(v) for k, v in (row_key or {}).items()}
+        self.reference_tables = list(reference_tables or ())
         self.on_conflict: OnConflict = on_conflict
         self.require_validators = require_validators
 
@@ -101,12 +110,27 @@ class ShadowDB:
     # ---- Context manager ----
 
     def __enter__(self) -> ShadowDB:
-        self._prod_metadata = reflect_tables(self.prod_engine, self.table_names)
+        self._prod_metadata = reflect_tables(
+            self.prod_engine, list(self.table_names) + self.reference_tables
+        )
 
         self.sandbox_engine = create_sandbox_engine()
         try:
+            # Read first: which tables end up empty decides which foreign keys
+            # the sandbox can honestly enforce.
+            fetched = fetch_rows(
+                self.prod_engine,
+                self._prod_metadata,
+                self.tenant_column,
+                self.tenant_id,
+                self.reference_tables,
+            )
+            empty_tables = [name for name, rows in fetched.items() if not rows]
+
             self._sandbox_metadata = clone_schema_to_sandbox(
-                self._prod_metadata, self.sandbox_engine
+                self._prod_metadata,
+                self.sandbox_engine,
+                empty_tables=empty_tables,
             )
             self._unsupported = list(
                 self._sandbox_metadata.info.get("unsupported_constraints", [])
@@ -115,13 +139,8 @@ class ShadowDB:
             # Fail fast, before any data is copied, if rows cannot be identified.
             self._row_keys = self._resolve_row_keys()
 
-            self._clone_stats = clone_rows(
-                self.prod_engine,
-                self.sandbox_engine,
-                self._prod_metadata,
-                self._sandbox_metadata,
-                self.tenant_column,
-                self.tenant_id,
+            self._clone_stats = load_rows(
+                self.sandbox_engine, self._sandbox_metadata, fetched
             )
 
             self._original_snapshot = self._take_snapshot()
@@ -164,13 +183,30 @@ class ShadowDB:
     # ---- Review & sync ----
 
     def diff(self) -> ChangeSet:
-        """Compute the diff between original cloned data and current sandbox state."""
+        """Compute the diff between original cloned data and current sandbox state.
+
+        Raises:
+            SyncError: If the agent modified a reference table. Those are shared
+                across tenants and are read-only.
+        """
         self._ensure_open()
         self.session.commit()
         current = self._take_snapshot()
+        self._assert_reference_tables_unchanged(current)
+
+        tenant_tables = {
+            name: rows
+            for name, rows in current.items()
+            if not self._is_reference_table(name)
+        }
+        original = {
+            name: rows
+            for name, rows in self._original_snapshot.items()
+            if not self._is_reference_table(name)
+        }
         return compute_diff(
-            self._original_snapshot,
-            current,
+            original,
+            tenant_tables,
             self._row_keys,
             unsupported_constraints=self._unsupported,
             require_validators=self.require_validators,
@@ -238,6 +274,11 @@ class ShadowDB:
         return self.prod_engine.dialect.name
 
     @property
+    def reference_table_names(self) -> list[str]:
+        """Tables cloned in full and treated as read-only."""
+        return list(self.reference_tables)
+
+    @property
     def unsupported_constraints(self) -> list[str]:
         """Schema elements that could not be reproduced in the SQLite sandbox.
 
@@ -266,6 +307,24 @@ class ShadowDB:
                 snapshot[table_name] = [row._asdict() for row in rows]
         return snapshot
 
+    def _is_reference_table(self, table_name: str) -> bool:
+        return table_name in self.reference_tables
+
+    def _assert_reference_tables_unchanged(
+        self, current: dict[str, list[dict[str, Any]]]
+    ) -> None:
+        for table_name in self.reference_tables:
+            if table_name not in current:
+                continue
+            if current[table_name] != self._original_snapshot.get(table_name):
+                raise SyncError(
+                    f"Table '{table_name}' was listed in reference_tables, which "
+                    f"makes it read-only: it is shared across tenants and its rows "
+                    f"were cloned in full. The sandbox changed it, so nothing can "
+                    f"be committed. Remove it from reference_tables if the agent "
+                    f"is meant to write to it."
+                )
+
     def _resolve_row_keys(self) -> dict[str, list[str]]:
         """Decide how each cloned table's rows are identified.
 
@@ -275,6 +334,9 @@ class ShadowDB:
         resolved: dict[str, list[str]] = {}
 
         for table_name, table in self._sandbox_metadata.tables.items():
+            if self._is_reference_table(table_name):
+                continue
+
             supplied = self.row_key.get(table_name)
             if supplied:
                 missing = [c for c in supplied if c not in table.c]
