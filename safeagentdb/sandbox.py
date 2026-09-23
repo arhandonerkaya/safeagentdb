@@ -25,7 +25,7 @@ from safeagentdb.engine import (
     load_rows,
     reflect_tables,
 )
-from safeagentdb.errors import SchemaError, SyncError
+from safeagentdb.errors import SchemaError, SkippedConflict, SyncError
 from safeagentdb.sync import OnConflict, apply_changeset
 
 _VALID_ON_CONFLICT = ("abort", "ignore")
@@ -106,6 +106,7 @@ class ShadowDB:
         self._row_keys: dict[str, list[str]] = {}
         self._unsupported: list[str] = []
         self._generated_columns: dict[str, list[str]] = {}
+        self._skipped_conflicts: list[SkippedConflict] = []
         self._committed = False
 
     # ---- Context manager ----
@@ -231,7 +232,9 @@ class ShadowDB:
         Only the columns the agent actually changed are written.
 
         Returns the number of rows actually written, summed from each
-        statement's rowcount.
+        statement's rowcount. With ``on_conflict="ignore"`` that can be fewer
+        than the changeset contained -- the changeset is applied in part, and
+        every skipped row is listed in ``skipped_conflicts`` and warned about.
 
         Raises:
             ConflictError: If production drifted since the clone and
@@ -252,6 +255,7 @@ class ShadowDB:
         if changeset.is_empty:
             return 0
 
+        self._skipped_conflicts = []
         affected = apply_changeset(
             self.prod_engine,
             self._prod_metadata,
@@ -261,6 +265,7 @@ class ShadowDB:
             row_keys=self._row_keys,
             on_conflict=self.on_conflict,
             require_validators=self.require_validators,
+            skipped=self._skipped_conflicts,
         )
         self._committed = True
         return affected
@@ -281,6 +286,17 @@ class ShadowDB:
     def dialect(self) -> str:
         """The production database dialect name (e.g. 'postgresql', 'mysql', 'sqlite')."""
         return self.prod_engine.dialect.name
+
+    @property
+    def skipped_conflicts(self) -> list[SkippedConflict]:
+        """Rows the last commit left unapplied under ``on_conflict="ignore"``.
+
+        Empty with the default ``on_conflict="abort"``, which never applies a
+        changeset in part. Each entry carries the table, the row key, the
+        drifted columns and the reason; a ConflictWarning is also emitted per
+        skipped row at commit time.
+        """
+        return list(self._skipped_conflicts)
 
     @property
     def generated_columns(self) -> dict[str, list[str]]:

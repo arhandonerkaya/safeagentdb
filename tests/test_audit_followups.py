@@ -23,11 +23,13 @@ from sqlalchemy.exc import IntegrityError
 
 from safeagentdb import (
     ConflictError,
+    ConflictWarning,
     GeneratedValueError,
     IntegrityViolationError,
     SafeAgentDBError,
     SafeModel,
     ShadowDB,
+    SkippedConflict,
     SyncError,
 )
 from safeagentdb.models import _model_registry
@@ -935,3 +937,141 @@ class TestCompareAndSwap:
                 r[0] for r in conn.execute(text("SELECT payload FROM events")).fetchall()
             ]
         assert payloads == ["a", "a"]
+
+
+# ============================================================
+# 5. on_conflict="ignore" no longer applies in silence
+# ============================================================
+
+
+class TestSkippedConflictsAreReported:
+    def test_skipped_rows_are_recorded_and_warned_about(self, tmp_path):
+        engine, url = _prod(
+            tmp_path,
+            "skip_record.db",
+            NULLABLE_DDL
+            + ["INSERT INTO tasks VALUES (3, 42, 'c', 'todo', NULL, 3.5)"],
+        )
+        _register_nullable_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, on_conflict="ignore"
+        ) as sandbox:
+            sandbox.execute("UPDATE tasks SET status='done' WHERE id IN (1,2,3)")
+
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(
+                    text("UPDATE tasks SET status='blocked' WHERE id IN (1,3)")
+                )
+
+            with pytest.warns(ConflictWarning) as caught:
+                applied = sandbox.commit_to_production()
+
+            # Two of three rows drifted: one applied, two skipped.
+            assert applied == 1
+
+            skipped = sandbox.skipped_conflicts
+            assert len(skipped) == 2
+            assert {s.table for s in skipped} == {"tasks"}
+            assert sorted(s.row_key["id"] for s in skipped) == [1, 3]
+            assert all(s.columns == ("status",) for s in skipped)
+            assert all("changed in production" in s.reason for s in skipped)
+
+            # One warning per skipped row, naming the drift.
+            messages = [
+                str(w.message)
+                for w in caught
+                if issubclass(w.category, ConflictWarning)
+            ]
+            assert len(messages) == 2
+            assert all("Skipped a drifted row" in m for m in messages)
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT id, status FROM tasks ORDER BY id")
+            ).fetchall()
+        assert rows == [(1, "blocked"), (2, "done"), (3, "blocked")]
+
+    def test_a_vanished_row_is_recorded_with_no_columns(self, tmp_path):
+        engine, url = _prod(tmp_path, "skip_gone.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, on_conflict="ignore"
+        ) as sandbox:
+            sandbox.execute("UPDATE tasks SET status='done' WHERE id IN (1,2)")
+
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("DELETE FROM tasks WHERE id=1"))
+
+            with pytest.warns(ConflictWarning):
+                assert sandbox.commit_to_production() == 1
+
+            (skipped,) = sandbox.skipped_conflicts
+            assert skipped.table == "tasks"
+            assert skipped.row_key == {"id": 1}
+            assert skipped.columns == ()
+            assert "deleted in production" in skipped.reason
+
+    def test_abort_never_reports_a_partial_apply(self, tmp_path):
+        """The default aborts, so nothing is ever skipped."""
+        engine, url = _prod(tmp_path, "skip_abort.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE tasks SET status='done' WHERE id IN (1,2)")
+
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("UPDATE tasks SET status='blocked' WHERE id=1"))
+
+            with pytest.raises(ConflictError):
+                sandbox.commit_to_production()
+
+            assert sandbox.skipped_conflicts == []
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT id, status FROM tasks ORDER BY id")
+            ).fetchall()
+        assert rows == [(1, "blocked"), (2, "todo")]
+
+    def test_a_clean_ignore_commit_reports_nothing_skipped(self, tmp_path):
+        engine, _ = _prod(tmp_path, "skip_clean.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, on_conflict="ignore"
+        ) as sandbox:
+            sandbox.execute("UPDATE tasks SET status='done' WHERE id=1")
+            assert sandbox.commit_to_production() == 1
+            assert sandbox.skipped_conflicts == []
+
+    def test_skipped_conflicts_property_returns_a_copy(self, tmp_path):
+        engine, url = _prod(tmp_path, "skip_copy.db", NULLABLE_DDL)
+        _register_nullable_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, on_conflict="ignore"
+        ) as sandbox:
+            sandbox.execute("UPDATE tasks SET status='done' WHERE id=1")
+            other = create_engine(url)
+            with other.begin() as conn:
+                conn.execute(text("UPDATE tasks SET status='blocked' WHERE id=1"))
+
+            with pytest.warns(ConflictWarning):
+                sandbox.commit_to_production()
+
+            sandbox.skipped_conflicts.clear()
+            assert len(sandbox.skipped_conflicts) == 1
+
+    def test_skipped_conflict_is_importable_and_inspectable(self):
+        entry = SkippedConflict(
+            table="tasks", row_key={"id": 1}, columns=("status",), reason="drifted"
+        )
+        assert entry.table == "tasks"
+        assert entry.row_key == {"id": 1}
+        assert entry.columns == ("status",)
+        assert entry.reason == "drifted"

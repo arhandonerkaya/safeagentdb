@@ -160,6 +160,7 @@ class TestImports:
             "SafeAgentDBError", "SchemaError", "SyncError", "ConflictError",
             "GeneratedValueError", "IntegrityViolationError",
             "MissingValidatorError", "MissingValidatorWarning",
+            "ConflictWarning", "SkippedConflict",
         }
 
 

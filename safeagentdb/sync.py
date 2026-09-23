@@ -20,6 +20,7 @@ hacks. Works identically on PostgreSQL, MySQL, and SQLite.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Literal
 
 from sqlalchemy import (
@@ -40,8 +41,10 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from safeagentdb.diff import ChangeSet, DiffType, RowDiff
 from safeagentdb.errors import (
     ConflictError,
+    ConflictWarning,
     GeneratedValueError,
     IntegrityViolationError,
+    SkippedConflict,
     SyncError,
 )
 from safeagentdb.models import validate_row
@@ -59,6 +62,7 @@ def apply_changeset(
     row_keys: dict[str, list[str]] | None = None,
     on_conflict: OnConflict = "abort",
     require_validators: bool = True,
+    skipped: list[SkippedConflict] | None = None,
 ) -> int:
     """Apply an approved changeset to the production database atomically.
 
@@ -76,6 +80,9 @@ def apply_changeset(
         require_validators: When True (default), a table with no registered
             SafeModel raises MissingValidatorError. When False it warns and the
             row is written unvalidated -- matching RowDiff.validate() exactly.
+        skipped: A list to append one SkippedConflict to per row skipped under
+            ``on_conflict="ignore"``. Without it a partial apply leaves no
+            record of what was left out.
 
     Returns the number of rows actually written, summed from each statement's
     rowcount.
@@ -178,6 +185,7 @@ def apply_changeset(
                     conn, table, diff, key, tenant_column, tenant_id, guarded
                 )
                 if on_conflict == "ignore":
+                    _record_skip(conflict, skipped)
                     continue
                 raise conflict
 
@@ -193,6 +201,26 @@ def apply_changeset(
             affected += result.rowcount
 
     return affected
+
+
+def _record_skip(
+    conflict: ConflictError, skipped: list[SkippedConflict] | None
+) -> None:
+    """Never drop a skipped row silently: record it and say so."""
+    entry = SkippedConflict(
+        table=conflict.table or "",
+        row_key=dict(conflict.row_key),
+        columns=tuple(conflict.columns),
+        reason=str(conflict),
+    )
+    if skipped is not None:
+        skipped.append(entry)
+
+    warnings.warn(
+        f"Skipped a drifted row under on_conflict='ignore': {conflict}",
+        ConflictWarning,
+        stacklevel=2,
+    )
 
 
 def _statement_order(diff: RowDiff) -> tuple:

@@ -13,6 +13,7 @@ wrap a whole agent session in a single ``except SafeAgentDBError``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -114,6 +115,32 @@ class MissingValidatorError(SafeAgentDBError, KeyError):
     """
 
 
+@dataclass(frozen=True)
+class SkippedConflict:
+    """One row that ``on_conflict="ignore"`` left unapplied.
+
+    A changeset committed with ``on_conflict="ignore"`` is applied in part, so
+    every skipped row is recorded here and surfaced on
+    ``ShadowDB.skipped_conflicts``.
+
+    Attributes:
+        table: Name of the table the row belongs to.
+        row_key: The row-identifying key of the skipped row.
+        columns: Columns whose production value drifted. Empty when the row was
+            deleted in production, or when the drift could not be pinned down.
+        reason: The conflict message, as ConflictError would have reported it.
+    """
+
+    table: str
+    row_key: dict[str, Any] = field(default_factory=dict)
+    columns: tuple[str, ...] = ()
+    reason: str = ""
+
+
+class ConflictWarning(UserWarning):
+    """Warned once per row skipped under ``on_conflict="ignore"``."""
+
+
 class MissingValidatorWarning(UserWarning):
     """Warned when a row is written without a validator and ``require_validators``
     is False."""
@@ -121,11 +148,13 @@ class MissingValidatorWarning(UserWarning):
 
 __all__ = [
     "ConflictError",
+    "ConflictWarning",
     "GeneratedValueError",
     "IntegrityViolationError",
     "MissingValidatorError",
     "MissingValidatorWarning",
     "SafeAgentDBError",
     "SchemaError",
+    "SkippedConflict",
     "SyncError",
 ]
