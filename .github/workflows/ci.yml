@@ -122,6 +122,70 @@ jobs:
               sys.exit(f"{skipped} server-backed test(s) skipped; expected none.")
           PY
 
+  package:
+    name: build artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build
+        run: python -m pip install --upgrade pip build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      # benchmark/ calls a paid LLM API. It must not reach anyone who installs
+      # the library, and config alone is too easy to undo by accident.
+      - name: Assert the benchmark is not shipped
+        run: |
+          python - <<'PY'
+          import sys
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          problems = []
+
+          for sdist in Path("dist").glob("*.tar.gz"):
+              with tarfile.open(sdist) as archive:
+                  names = archive.getnames()
+              leaked = [n for n in names if "/benchmark/" in n]
+              print(f"{sdist.name}: {len(names)} files, {len(leaked)} under benchmark/")
+              problems += [f"{sdist.name}: {n}" for n in leaked]
+
+          for wheel in Path("dist").glob("*.whl"):
+              with zipfile.ZipFile(wheel) as archive:
+                  names = archive.namelist()
+              leaked = [n for n in names if n.startswith("benchmark/")]
+              print(f"{wheel.name}: {len(names)} files, {len(leaked)} under benchmark/")
+              problems += [f"{wheel.name}: {n}" for n in leaked]
+
+              with zipfile.ZipFile(wheel) as archive:
+                  metadata = next(
+                      archive.read(n).decode()
+                      for n in names
+                      if n.endswith(".dist-info/METADATA")
+                  )
+              for line in metadata.splitlines():
+                  if line.startswith("Provides-Extra:") and "benchmark" in line:
+                      problems.append(f"{wheel.name}: advertises {line!r}")
+                  if line.startswith("Requires-Dist:") and "anthropic" in line:
+                      problems.append(f"{wheel.name}: declares {line!r}")
+
+          if problems:
+              sys.exit(
+                  "the benchmark leaked into a distribution:\n  "
+                  + "\n  ".join(problems)
+              )
+          print("benchmark/ absent from every artifact")
+          PY
+
   lint:
     name: ruff
     runs-on: ubuntu-latest

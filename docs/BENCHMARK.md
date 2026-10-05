@@ -125,7 +125,8 @@ mine. That is a real limitation, not a solved problem; see below.
 ## Reproducing
 
 ```bash
-pip install -e ".[benchmark]"
+pip install -e .
+pip install -r benchmark/requirements.txt
 export ANTHROPIC_API_KEY=...
 python -m benchmark.run --runs 3 --model claude-opus-5-5 --effort medium
 python -m benchmark.report
@@ -200,6 +201,41 @@ Not yet run.
   zero. It means a write broke an invariant *with* the library in the path.
 - **False-positive rate** is the price. Read it with the block rate or neither
   figure means anything.
+
+## Not shipped, and no credential in the output
+
+`benchmark/` is excluded from both distributions, so installing the library
+never puts code that calls a paid API on anyone's machine:
+
+```toml
+[tool.hatch.build.targets.wheel]
+packages = ["safeagentdb"]          # the wheel contains only the package
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/benchmark"]            # hatchling's sdist default is "everything"
+```
+
+There is deliberately no `safeagentdb[benchmark]` extra -- that would install
+`anthropic` for code the user does not have. The benchmark's dependencies live
+in `benchmark/requirements.txt`. The `package` CI job builds both artifacts and
+fails if anything under `benchmark/` appears in either, or if the wheel metadata
+advertises a benchmark extra or an `anthropic` requirement, because the config
+above is easy to undo by accident.
+
+The credential is read from `ANTHROPIC_API_KEY` and nowhere else. The SDK would
+otherwise also accept `ANTHROPIC_AUTH_TOKEN`, an `ant auth login` profile on
+disk, or workload identity federation; `agent.build_client()` reads the variable
+itself and passes it explicitly, so which credential paid for a published run is
+never ambiguous. It is held only by the client -- never in `AgentConfig`, which
+is what gets serialised.
+
+Every error string passes through `agent.redact()` before it is stored or
+printed: the live key is replaced by value, and anything matching
+`sk-ant-[A-Za-z0-9_-]{8,}` is replaced as well, so a key belonging to another
+environment is scrubbed too. Before `run.py` and `report.py` write a file they
+call `agent.assert_no_credential()` on the serialised bytes and exit rather than
+write if a credential survived. `.gitignore` covers `.env`, `.env.*`, `*.env`,
+`.envrc` and `.secrets`.
 
 ## Limitations
 
