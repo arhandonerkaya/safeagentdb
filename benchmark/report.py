@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from benchmark.agent import assert_no_credential
+
 
 @dataclass(frozen=True)
 class Metric:
@@ -340,9 +342,14 @@ def main() -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = Path(args.out or results_dir / f"{stamp}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    serialized = json.dumps(summary, indent=2)
+    assert_no_credential(serialized)
+
+    out.write_text(serialized, encoding="utf-8")
 
     markdown = render_markdown(summary)
+    assert_no_credential(markdown)
     print(markdown)
     if args.markdown:
         Path(args.markdown).write_text(markdown, encoding="utf-8")

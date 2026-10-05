@@ -10,4 +10,14 @@ build/
 *.whl
 *.tar.gz
 junit.xml
+<<<<<<< HEAD
 logs
+=======
+
+# Local credential files -- the benchmark reads ANTHROPIC_API_KEY from the
+# environment, and these are the usual ways people set it.
+.env.*
+*.env
+.envrc
+.secrets
+>>>>>>> fae5f6c (fix(benchmark): read the credential from one place and keep it out of output)
