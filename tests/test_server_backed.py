@@ -368,7 +368,17 @@ class TestForeignKeysOnServer:
             engine, tables=["items"], tenant_id=42, reference_tables=["statuses"]
         ) as sandbox:
             assert sandbox.clone_stats["statuses"] == 2
-            assert sandbox.unsupported_constraints == []
+
+            # The foreign-key entry is what reference_tables is for, so it must
+            # be gone. The SERIAL primary key still reports its dropped sequence
+            # default, and should: PostgreSQL generates that value and SQLite
+            # cannot, which is the whole reason production assigns the key.
+            # Asserting an empty list here is wrong -- it passes on SQLite,
+            # where there is no sequence to lose, and fails on any real server.
+            reported = sandbox.unsupported_constraints
+            assert not any("FOREIGN KEY" in item for item in reported)
+            assert all("nextval" in item for item in reported), reported
+            assert sandbox.provisional_key_columns == {"items": ["id"]}
 
             with pytest.raises(IntegrityError):
                 sandbox.execute(
