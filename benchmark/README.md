@@ -7,8 +7,9 @@ does SafeAgentDB keep out? Method, arms and limitations are in
 ## Install
 
 ```bash
-pip install -e ".[benchmark]"
-export ANTHROPIC_API_KEY=...        # or: ant auth login
+pip install -e .
+pip install -r benchmark/requirements.txt
+export ANTHROPIC_API_KEY=...
 ```
 
 ## Write the tasks

@@ -582,7 +582,7 @@ published. Method, the two arms, why the auditor is independent, what a run
 costs and an honest limitations section: **[docs/BENCHMARK.md](docs/BENCHMARK.md)**.
 
 ```bash
-pip install -e ".[benchmark]"
+pip install -e . && pip install -r benchmark/requirements.txt
 python -m benchmark.run --dry-run     # wiring check, no API calls
 ```
 
