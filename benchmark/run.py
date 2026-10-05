@@ -37,7 +37,14 @@ from sqlalchemy import create_engine
 
 from benchmark import audit as audit_module
 from benchmark import validators  # noqa: F401 -- importing registers the SafeModels
-from benchmark.agent import AgentConfig, AgentResult, build_client, generate_sql
+from benchmark.agent import (
+    AgentConfig,
+    AgentResult,
+    assert_no_credential,
+    build_client,
+    generate_sql,
+    redact,
+)
 from benchmark.seed import TENANT_A, build, copy
 from safeagentdb import SafeAgentDBError, ShadowDB
 
@@ -107,7 +114,7 @@ def run_arm_a(db_path: Path, statements: list[str]) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 -- the control arm records anything
         conn.rollback()
         outcome["error_type"] = type(exc).__name__
-        outcome["error"] = str(exc)
+        outcome["error"] = redact(str(exc))
     finally:
         conn.close()
         outcome["seconds"] = round(time.perf_counter() - started, 3)
@@ -170,13 +177,13 @@ def run_arm_b(db_path: Path, statements: list[str], tenant_id: int) -> dict[str,
                 outcome["blocked"] = True
                 outcome["blocked_at"] = stage
                 outcome["error_type"] = type(exc).__name__
-                outcome["error"] = str(exc)[:600]
+                outcome["error"] = redact(str(exc)[:600])
                 outcome["safeagentdb_error"] = isinstance(exc, SafeAgentDBError)
     except Exception as exc:  # noqa: BLE001 -- a refused sandbox is also a block
         outcome["blocked"] = True
         outcome["blocked_at"] = "open"
         outcome["error_type"] = type(exc).__name__
-        outcome["error"] = str(exc)[:600]
+        outcome["error"] = redact(str(exc)[:600])
         outcome["safeagentdb_error"] = isinstance(exc, SafeAgentDBError)
     finally:
         engine.dispose()
@@ -343,7 +350,10 @@ def main() -> None:
     stamp = started.strftime("%Y%m%dT%H%M%SZ")
     out = Path(args.out or f"benchmark/results/raw-{stamp}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+    serialized = json.dumps(raw, indent=2)
+    assert_no_credential(serialized)
+    out.write_text(serialized, encoding="utf-8")
 
     print(f"\nraw results -> {out}")
     print(f"now run:  python -m benchmark.report --raw {out}")

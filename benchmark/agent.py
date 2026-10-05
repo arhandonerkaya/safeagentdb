@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,6 +30,13 @@ from typing import Any
 import anthropic
 
 from benchmark.seed import schema_for_prompt
+
+API_KEY_ENV = "ANTHROPIC_API_KEY"
+
+# Anything shaped like an Anthropic credential, so a key belonging to a
+# different environment is scrubbed too, not just the one in use here.
+_CREDENTIAL_PATTERN = re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}")
+REDACTED = "[redacted]"
 
 DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_EFFORT = "medium"
@@ -141,10 +150,61 @@ class TemperatureNotSupported(RuntimeError):
     """Raised when the chosen model rejects an explicit temperature."""
 
 
+def redact(text: str | None) -> str | None:
+    """Remove credentials from any string that is about to be stored or printed.
+
+    Every error the SDK raises passes through here before it reaches a result
+    file, a log line or stdout. The live key is replaced by value, so whatever
+    an exception message happens to contain, the key itself cannot survive; the
+    pattern catches keys from other environments as well.
+    """
+    if not text:
+        return text
+
+    live = os.environ.get(API_KEY_ENV, "").strip()
+    if len(live) >= 8:
+        text = text.replace(live, REDACTED)
+    return _CREDENTIAL_PATTERN.sub(REDACTED, text)
+
+
+def assert_no_credential(payload: str) -> None:
+    """Refuse to emit anything that still contains a credential.
+
+    Called before results are written. redact() should already have handled it;
+    this is the backstop that turns a leak into a crash rather than a file.
+    """
+    live = os.environ.get(API_KEY_ENV, "").strip()
+    if len(live) >= 8 and live in payload:
+        raise SystemExit(
+            f"refusing to write: the value of {API_KEY_ENV} appears in the output. "
+            f"This is a bug in benchmark/ -- please report it."
+        )
+    if _CREDENTIAL_PATTERN.search(payload):
+        raise SystemExit(
+            "refusing to write: the output contains something shaped like an "
+            "Anthropic API key. This is a bug in benchmark/ -- please report it."
+        )
+
+
 def build_client() -> anthropic.Anthropic:
-    """The SDK resolves credentials itself: ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN
-    or an `ant auth login` profile."""
-    return anthropic.Anthropic()
+    """Build the client from ANTHROPIC_API_KEY and nothing else.
+
+    The SDK would otherwise also accept ANTHROPIC_AUTH_TOKEN, an `ant auth
+    login` profile on disk, or workload identity federation. Passing the key
+    explicitly pins the benchmark to one credential source, so which credential
+    paid for a published run is never ambiguous. Export the variable if you
+    normally sign in another way.
+
+    The key is held only by the client. It is never copied into AgentConfig,
+    which is what gets serialised into the results.
+    """
+    api_key = os.environ.get(API_KEY_ENV, "").strip()
+    if not api_key:
+        raise SystemExit(
+            f"{API_KEY_ENV} is not set. The benchmark reads the credential from "
+            f"that variable only -- export it and try again."
+        )
+    return anthropic.Anthropic(api_key=api_key)
 
 
 def generate_sql(
@@ -190,7 +250,7 @@ def generate_sql(
         response = client.messages.create(**request)
     except anthropic.BadRequestError as exc:
         result.seconds = time.perf_counter() - started
-        message = str(exc)
+        message = redact(str(exc))
         if "temperature" in message.lower():
             raise TemperatureNotSupported(
                 f"{config.model} rejected an explicit temperature. Sampling "
@@ -202,7 +262,7 @@ def generate_sql(
         return result
     except anthropic.APIError as exc:
         result.seconds = time.perf_counter() - started
-        result.error = f"{type(exc).__name__}: {exc}"
+        result.error = redact(f"{type(exc).__name__}: {exc}")
         return result
     result.seconds = time.perf_counter() - started
 
