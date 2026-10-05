@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from rich.console import Console
 from sqlalchemy import create_engine, text
 
-from safeagentdb import ShadowDB, SafeModel
+from safeagentdb import SafeModel, ShadowDB
 
 console = Console()
 
@@ -49,6 +49,6 @@ with ShadowDB(prod_engine, tables=["tasks"], tenant_id=42) as sandbox:
     try:
         sandbox.commit_to_production()
     except ValidationError as e:
-        console.print(f"\n  [bold red]Sync BLOCKED by Pydantic validation:[/bold red]")
+        console.print("\n  [bold red]Sync BLOCKED by Pydantic validation:[/bold red]")
         console.print(f"  [red]{e}[/red]")
-        console.print(f"\n  [green]Production DB is untouched. Crisis averted.[/green]\n")
+        console.print("\n  [green]Production DB is untouched. Crisis averted.[/green]\n")

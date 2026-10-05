@@ -26,7 +26,6 @@ Sections:
   S. Engine internals -- dialect detection & type mapping
 """
 
-import sys
 from typing import Literal
 
 import pytest
@@ -41,16 +40,14 @@ from safeagentdb import (
     ShadowDB,
     SyncError,
 )
-from safeagentdb.models import _model_registry, get_validator, validate_row
 from safeagentdb.engine import (
     _detect_dialect,
     _sqlite_safe_type,
-    clone_rows,
     clone_schema_to_sandbox,
     create_sandbox_engine,
     reflect_tables,
 )
-
+from safeagentdb.models import _model_registry, get_validator, validate_row
 
 # ============================================================
 # Fixtures
@@ -156,11 +153,26 @@ class TestImports:
     def test_syncerror_importable(self):
         assert SyncError is not None
 
-    def test_all_exports(self):
+    def test_all_exports_resolve(self):
+        """Every name in __all__ must actually exist, and nothing public should
+        be missing from it. Beats a hardcoded list that goes stale."""
         import safeagentdb
-        assert set(safeagentdb.__all__) == {
-            "ShadowDB", "SafeModel", "RowDiff", "DiffType", "ChangeSet", "SyncError",
+
+        missing = [n for n in safeagentdb.__all__ if not hasattr(safeagentdb, n)]
+        assert missing == []
+
+        public = {
+            name
+            for name in vars(safeagentdb)
+            if not name.startswith("_")
+            and not isinstance(getattr(safeagentdb, name), type(safeagentdb))
         }
+        assert public == set(safeagentdb.__all__)
+
+    def test_all_is_sorted_and_unique(self):
+        import safeagentdb
+
+        assert safeagentdb.__all__ == sorted(set(safeagentdb.__all__))
 
 
 # ============================================================
@@ -359,9 +371,16 @@ class TestChangeSet:
         ])
         assert cs.summary == {"INSERT": 1, "UPDATE": 1, "DELETE": 0}
 
-    def test_is_valid_true_no_validators(self):
+    def test_is_valid_false_when_validator_missing_and_required(self):
         cs = ChangeSet(diffs=[
             RowDiff(table="t", diff_type=DiffType.INSERT, pk={"id": 1}, new={"id": 1}),
+        ])
+        assert cs.is_valid is False
+
+    def test_is_valid_true_no_validators_when_not_required(self):
+        cs = ChangeSet(diffs=[
+            RowDiff(table="t", diff_type=DiffType.INSERT, pk={"id": 1}, new={"id": 1},
+                    require_validator=False),
         ])
         assert cs.is_valid is True
 
@@ -431,13 +450,22 @@ class TestRowDiff:
         ok, msg = rd.validate()
         assert ok is True
 
-    def test_validate_no_validator_ok(self):
+    def test_validate_missing_validator_fails_when_required(self):
         rd = RowDiff(
             table="unknown", diff_type=DiffType.INSERT, pk={"id": 1}, new={"id": 1},
         )
         ok, msg = rd.validate()
+        assert ok is False
+        assert "No SafeModel registered" in msg
+
+    def test_validate_missing_validator_warns_when_not_required(self):
+        rd = RowDiff(
+            table="unknown", diff_type=DiffType.INSERT, pk={"id": 1}, new={"id": 1},
+            require_validator=False,
+        )
+        ok, msg = rd.validate()
         assert ok is True
-        assert "No validator" in msg
+        assert "no validator" in msg
 
     def test_validate_catches_bad_data(self):
         _register_task_validator()

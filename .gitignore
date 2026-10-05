@@ -9,3 +9,4 @@ build/
 .venv/
 *.whl
 *.tar.gz
+junit.xml
