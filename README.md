@@ -568,6 +568,24 @@ The production sync **always uses the original production metadata**. The type m
 
 ---
 
+## Benchmark
+
+How many unsafe writes does a real LLM agent actually push to production, and
+how many does SafeAgentDB keep out without blocking legitimate work?
+`benchmark/` runs one agent twice over the same generated SQL -- once straight
+at the database, once through `ShadowDB` -- and scores the result with an
+invariant checker that shares no code with the library, so the measurement
+cannot grade itself.
+
+**No results yet.** The harness is built; the numbers are empty until a run is
+published. Method, the two arms, why the auditor is independent, what a run
+costs and an honest limitations section: **[docs/BENCHMARK.md](docs/BENCHMARK.md)**.
+
+```bash
+pip install -e ".[benchmark]"
+python -m benchmark.run --dry-run     # wiring check, no API calls
+```
+
 ## Guarantees and limits
 
 SafeAgentDB is a safety net, not a proof of correctness. This section is the
