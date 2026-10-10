@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy import CursorResult, MetaData, select, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from safeagentdb.diff import ChangeSet, compute_diff
@@ -30,6 +31,7 @@ from safeagentdb.engine import (
 )
 from safeagentdb.errors import (
     AssignedKey,
+    SafeAgentDBError,
     SchemaError,
     SkippedConflict,
     SyncError,
@@ -114,6 +116,7 @@ class ShadowDB:
         self._row_keys: dict[str, list[str]] = {}
         self._unsupported: list[str] = []
         self._cascade_references: list[CascadeReference] = []
+        self._converted_columns: dict[str, dict[str, str]] = {}
         self._generated_columns: dict[str, list[str]] = {}
         self._skipped_conflicts: list[SkippedConflict] = []
         self._assigned_keys: list[AssignedKey] = []
@@ -161,6 +164,9 @@ class ShadowDB:
             self._generated_columns = dict(
                 self._sandbox_metadata.info.get("generated_columns", {})
             )
+            self._converted_columns = dict(
+                self._sandbox_metadata.info.get("converted_columns", {})
+            )
 
             # Fail fast, before any data is copied, if rows cannot be identified.
             self._row_keys = self._resolve_row_keys()
@@ -174,6 +180,17 @@ class ShadowDB:
 
             self._original_snapshot = self._take_snapshot()
             self._assert_row_keys_unique(self._original_snapshot)
+        except SafeAgentDBError:
+            self.sandbox_engine.dispose()
+            self.sandbox_engine = None
+            raise
+        except SQLAlchemyError as exc:
+            self.sandbox_engine.dispose()
+            self.sandbox_engine = None
+            raise SchemaError(
+                f"The sandbox could not be created from this production schema: "
+                f"{exc.__class__.__name__}: {exc}"
+            ) from exc
         except Exception:
             self.sandbox_engine.dispose()
             self.sandbox_engine = None
@@ -250,6 +267,7 @@ class ShadowDB:
             require_validators=self.require_validators,
             generated_columns=self._generated_columns,
             provisional_key_columns=self._provisional_keys,
+            converted_columns=self._converted_columns,
         )
 
     def commit_to_production(self) -> int:
@@ -306,6 +324,7 @@ class ShadowDB:
             on_conflict=self.on_conflict,
             require_validators=self.require_validators,
             cascade_references=self._cascade_references,
+            converted_columns=self._converted_columns,
             skipped=self._skipped_conflicts,
             assigned=self._assigned_keys,
         )

@@ -15,6 +15,7 @@ recorded rather than dropped silently -- see ``unsupported_constraints``.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -74,6 +75,78 @@ _SQLITE_TYPE_MAP: dict[str, type[TypeEngine]] = {
     "YEAR": String,
     "TINYINT": String,
 }
+
+
+# How a remapped column's values are carried through the sandbox. SQLite can
+# only bind None, int, float, str and bytes, so a dict, list, UUID or IP address
+# from the production driver has to become one of those on the way in and be
+# turned back on the way out.
+JSON_CONVERSION = "json"
+TEXT_CONVERSION = "text"
+
+_JSON_TYPE_NAMES = frozenset({"JSON", "JSONB", "ARRAY", "HSTORE"})
+
+_BINDABLE = (type(None), int, float, str, bytes)
+
+
+def _conversion_for(type_name: str) -> str:
+    """Which conversion a remapped column needs."""
+    return JSON_CONVERSION if type_name in _JSON_TYPE_NAMES else TEXT_CONVERSION
+
+
+def to_sandbox_value(value: Any, conversion: str) -> Any:
+    """Turn a production value into something SQLite will accept.
+
+    Values SQLite can already bind are left alone, so an integer, a string or
+    NULL in a remapped column passes through untouched.
+    """
+    if isinstance(value, _BINDABLE):
+        return value
+    if conversion == JSON_CONVERSION:
+        return json.dumps(value, sort_keys=True, default=str)
+    return str(value)
+
+
+def to_production_value(value: Any, conversion: str) -> Any:
+    """Turn a sandbox value back into the production representation."""
+    if value is None:
+        return None
+    if conversion == JSON_CONVERSION and isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            # Not JSON after all -- hand the string back rather than guess.
+            return value
+    return value
+
+
+def convert_rows_for_sandbox(
+    rows: list[dict[str, Any]], conversions: dict[str, str]
+) -> list[dict[str, Any]]:
+    if not conversions:
+        return rows
+    return [
+        {
+            column: to_sandbox_value(value, conversions[column])
+            if column in conversions
+            else value
+            for column, value in row.items()
+        }
+        for row in rows
+    ]
+
+
+def convert_row_for_production(
+    row: dict[str, Any], conversions: dict[str, str]
+) -> dict[str, Any]:
+    if not conversions:
+        return row
+    return {
+        column: to_production_value(value, conversions[column])
+        if column in conversions
+        else value
+        for column, value in row.items()
+    }
 
 
 def _sqlite_safe_type(col_type: TypeEngine) -> TypeEngine:
@@ -176,7 +249,9 @@ def _is_balanced(expression: str) -> bool:
 # ---- Sandbox table adaptation ----
 
 
-def _adapt_column_types(table: Table, unsupported: list[str]) -> None:
+def _adapt_column_types(table: Table, unsupported: list[str]) -> dict[str, str]:
+    """Remap dialect types, returning {column: conversion} for the ones changed."""
+    conversions: dict[str, str] = {}
     for col in table.columns:
         safe = _sqlite_safe_type(col.type)
         if safe is col.type:
@@ -184,11 +259,13 @@ def _adapt_column_types(table: Table, unsupported: list[str]) -> None:
 
         original_name = type(col.type).__name__.upper()
         col.type = safe
+        conversions[col.name] = _conversion_for(original_name)
         unsupported.append(
             f"{table.name}.{col.name}: {original_name} stored as "
             f"{type(safe).__name__.upper()} in the sandbox; values valid here may "
             f"still be rejected by production"
         )
+    return conversions
 
 
 def _adapt_server_defaults(table: Table, unsupported: list[str]) -> list[str]:
@@ -581,6 +658,7 @@ def clone_schema_to_sandbox(
     unsupported: list[str] = []
     generated: dict[str, list[str]] = {}
     provisional: dict[str, list[str]] = {}
+    converted: dict[str, dict[str, str]] = {}
     empty = set(empty_tables or ())
 
     # .tables rather than .sorted_tables: sorting resolves foreign keys, which
@@ -589,7 +667,9 @@ def clone_schema_to_sandbox(
     known_tables = {table.name for table in source_metadata.tables.values()}
     for table in source_metadata.tables.values():
         sandbox_table = table.to_metadata(sandbox_metadata)
-        _adapt_column_types(sandbox_table, unsupported)
+        conversions = _adapt_column_types(sandbox_table, unsupported)
+        if conversions:
+            converted[sandbox_table.name] = conversions
         dropped = _adapt_server_defaults(sandbox_table, unsupported)
         if dropped:
             generated[sandbox_table.name] = dropped
@@ -606,6 +686,7 @@ def clone_schema_to_sandbox(
     sandbox_metadata.info["unsupported_constraints"] = unsupported
     sandbox_metadata.info["generated_columns"] = generated
     sandbox_metadata.info["provisional_key_columns"] = provisional
+    sandbox_metadata.info["converted_columns"] = converted
     return sandbox_metadata
 
 
@@ -665,10 +746,16 @@ def load_rows(
         sb_conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
         try:
             # Parents before children, so the load order is valid on its own.
+            conversions_by_table = sandbox_metadata.info.get("converted_columns", {})
             for sb_table in sandbox_metadata.sorted_tables:
                 rows = fetched.get(sb_table.key, [])
                 if rows:
-                    sb_conn.execute(insert(sb_table), rows)
+                    sb_conn.execute(
+                        insert(sb_table),
+                        convert_rows_for_sandbox(
+                            rows, conversions_by_table.get(sb_table.name, {})
+                        ),
+                    )
                     sb_conn.commit()
                 stats[sb_table.key] = len(rows)
         except Exception:

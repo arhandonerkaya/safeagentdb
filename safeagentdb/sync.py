@@ -40,7 +40,7 @@ from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from safeagentdb.diff import ChangeSet, DiffType, RowDiff
-from safeagentdb.engine import CascadeReference
+from safeagentdb.engine import CascadeReference, convert_row_for_production
 from safeagentdb.errors import (
     AssignedKey,
     CascadeError,
@@ -68,6 +68,7 @@ def apply_changeset(
     on_conflict: OnConflict = "abort",
     require_validators: bool = True,
     cascade_references: list[CascadeReference] | None = None,
+    converted_columns: dict[str, dict[str, str]] | None = None,
     skipped: list[SkippedConflict] | None = None,
     assigned: list[AssignedKey] | None = None,
 ) -> int:
@@ -90,6 +91,9 @@ def apply_changeset(
         cascade_references: Foreign keys that propagate into the written tables.
             Each DELETE, and each UPDATE touching a referenced column, is
             checked for referencing rows in other tenants before it runs.
+        converted_columns: {table: {column: conversion}} for columns the sandbox
+            had to store in a different representation. Their values are turned
+            back before being written.
         skipped: A list to append one SkippedConflict to per row skipped under
             ``on_conflict="ignore"``. Without it a partial apply leaves no
             record of what was left out.
@@ -135,8 +139,13 @@ def apply_changeset(
                     )
 
                 # ---- Gate 2: Pydantic validation ----
+                # The SafeModel describes production, so a column the sandbox
+                # had to store differently is converted back first. Same helper
+                # RowDiff.validate() uses, so the two cannot disagree.
                 validate_row(
-                    diff.table, row_data, require_validator=require_validators
+                    diff.table,
+                    diff.logical_row(row_data),
+                    require_validator=require_validators,
                 )
 
             elif diff.diff_type == DiffType.DELETE:
@@ -177,6 +186,9 @@ def apply_changeset(
                     for col, value in (diff.new or {}).items()
                     if col not in pending
                 }
+                values = convert_row_for_production(
+                    values, (converted_columns or {}).get(diff.table, {})
+                )
                 result = _execute(conn, insert(table).values(values), diff, diff.pk)
                 if pending:
                     _record_assignment(result, table, diff, pending, assigned)
@@ -194,7 +206,9 @@ def apply_changeset(
             # ---- Gate 5: compare and swap ----
             # The clone-time values go into the WHERE clause, so the check and
             # the write are one statement. Nothing can slip in between them.
-            guarded = _guard_columns(diff, table, key)
+            guarded = _guard_columns(
+                diff, table, key, (converted_columns or {}).get(diff.table, {})
+            )
 
             stmt = update(table) if diff.diff_type == DiffType.UPDATE else delete(table)
             for key_col, key_val in key.items():
@@ -213,6 +227,9 @@ def apply_changeset(
                 }
                 if not values:
                     continue
+                values = convert_row_for_production(
+                    values, (converted_columns or {}).get(diff.table, {})
+                )
                 stmt = stmt.values(values)
 
             result = _execute(conn, stmt, diff, key)
@@ -489,7 +506,12 @@ def _is_guardable(column: Column) -> bool:
     return type(column.type).__name__.upper() not in _UNGUARDABLE_TYPE_NAMES
 
 
-def _guard_columns(diff: RowDiff, table: Table, key: dict[str, Any]) -> list[str]:
+def _guard_columns(
+    diff: RowDiff,
+    table: Table,
+    key: dict[str, Any],
+    converted: dict[str, str] | None = None,
+) -> list[str]:
     """Columns whose clone-time value is asserted in the WHERE clause.
 
     For an UPDATE only the columns the agent changed are guarded, so an
@@ -503,11 +525,13 @@ def _guard_columns(diff: RowDiff, table: Table, key: dict[str, Any]) -> list[str
     else:
         candidates = list(old)
 
+    remapped = set(converted or ())
     return [
         col
         for col in candidates
         if col in old
         and col not in key
+        and col not in remapped
         and col in table.c
         and _is_guardable(table.c[col])
     ]

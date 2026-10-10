@@ -21,7 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from safeagentdb.engine import PROVISIONAL_KEY_BASE
+from safeagentdb.engine import PROVISIONAL_KEY_BASE, to_production_value
 from safeagentdb.errors import SchemaError
 from safeagentdb.models import get_validator, missing_validator_message
 
@@ -58,11 +58,36 @@ class RowDiff:
     require_validator: bool = True
     generated_columns: tuple[str, ...] = ()
     provisional_key_columns: tuple[str, ...] = ()
+    converted_columns: dict[str, str] = field(default_factory=dict)
+
+    def logical_row(self, row: dict[str, Any] | None) -> dict[str, Any]:
+        """A row as production sees it, not as the sandbox had to store it.
+
+        A JSON or ARRAY column cannot be bound by SQLite, so the clone holds a
+        serialised form. Validation and change detection must work on the
+        production representation -- the SafeModel describes production, and a
+        value that only differs in its serialisation has not changed.
+        """
+        if row is None:
+            return {}
+        if not self.converted_columns:
+            return dict(row)
+        return {
+            column: to_production_value(value, self.converted_columns[column])
+            if column in self.converted_columns
+            else value
+            for column, value in row.items()
+        }
 
     def changed_columns(self) -> list[str]:
         if self.diff_type != DiffType.UPDATE or not self.old or not self.new:
             return []
-        return [k for k in self.new if self.old.get(k) != self.new[k]]
+        if not self.converted_columns:
+            return [k for k in self.new if self.old.get(k) != self.new[k]]
+
+        old_logical = self.logical_row(self.old)
+        new_logical = self.logical_row(self.new)
+        return [k for k in new_logical if old_logical.get(k) != new_logical[k]]
 
     def pending_key_columns(self) -> list[str]:
         """Key columns this INSERT leaves for production to fill.
@@ -186,7 +211,7 @@ class RowDiff:
             return True, "WARNING: no validator, row unchecked"
 
         try:
-            validator_cls.model_validate(row_data)
+            validator_cls.model_validate(self.logical_row(row_data))
             return True, "OK"
         except Exception as e:
             first_error = str(e).split("\n")[1] if "\n" in str(e) else str(e)
@@ -564,15 +589,18 @@ def compute_diff(
     require_validators: bool = True,
     generated_columns: dict[str, list[str]] | None = None,
     provisional_key_columns: dict[str, list[str]] | None = None,
+    converted_columns: dict[str, dict[str, str]] | None = None,
 ) -> ChangeSet:
     changeset = ChangeSet(unsupported_constraints=list(unsupported_constraints or []))
     generated = generated_columns or {}
     provisional = provisional_key_columns or {}
+    converted = converted_columns or {}
 
     for table_name in sorted(set(original_snapshot) | set(current_snapshot)):
         pks = pk_columns.get(table_name, ["id"])
         table_generated = tuple(generated.get(table_name, ()))
         table_provisional = tuple(provisional.get(table_name, ()))
+        table_converted = dict(converted.get(table_name, {}))
         orig_rows = _keyed_rows(
             original_snapshot.get(table_name, []), pks, table_name, "cloned"
         )
@@ -586,6 +614,7 @@ def compute_diff(
                     table=table_name,
                     diff_type=DiffType.DELETE,
                     require_validator=require_validators,
+                    converted_columns=table_converted,
                     pk=dict(zip(pks, pk_key, strict=False)),
                     old=orig_rows[pk_key],
                 )
@@ -599,6 +628,7 @@ def compute_diff(
                     require_validator=require_validators,
                     generated_columns=table_generated,
                     provisional_key_columns=table_provisional,
+                    converted_columns=table_converted,
                     pk=dict(zip(pks, pk_key, strict=False)),
                     new=curr_rows[pk_key],
                 )
@@ -610,10 +640,11 @@ def compute_diff(
                     RowDiff(
                         table=table_name,
                         diff_type=DiffType.UPDATE,
-                    require_validator=require_validators,
                         pk=dict(zip(pks, pk_key, strict=False)),
                         old=orig_rows[pk_key],
                         new=curr_rows[pk_key],
+                        require_validator=require_validators,
+                        converted_columns=table_converted,
                     )
                 )
 
