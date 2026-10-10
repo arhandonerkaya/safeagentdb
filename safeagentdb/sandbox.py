@@ -210,6 +210,15 @@ class ShadowDB:
         current = self._take_snapshot()
         self._assert_reference_tables_unchanged(current)
 
+        # A row key that no longer identifies a row makes the whole changeset
+        # unreadable, so it is reported rather than diffed around.
+        blocking = self._row_key_problems(current)
+        if blocking:
+            return ChangeSet(
+                unsupported_constraints=list(self._unsupported),
+                blocking_errors=blocking,
+            )
+
         tenant_tables = {
             name: rows
             for name, rows in current.items()
@@ -264,6 +273,11 @@ class ShadowDB:
             raise SyncError("This sandbox has already been committed. Create a new ShadowDB.")
 
         changeset = self.diff()
+        if changeset.blocking_errors:
+            raise SyncError(
+                "This changeset cannot be committed:\n  - "
+                + "\n  - ".join(changeset.blocking_errors)
+            )
         if changeset.is_empty:
             return 0
 
@@ -370,6 +384,42 @@ class ShadowDB:
                 rows = conn.execute(select(table)).fetchall()
                 snapshot[table_name] = [row._asdict() for row in rows]
         return snapshot
+
+    def _row_key_problems(
+        self, snapshot: dict[str, list[dict[str, Any]]]
+    ) -> list[str]:
+        """Row keys that stopped identifying a row since the clone.
+
+        __enter__ checks this against the cloned rows, but the agent can create
+        a collision afterwards -- inserting a second row that shares a custom
+        row_key, say. Left undetected, the two rows merge into one diff entry
+        and the commit overwrites a production row.
+        """
+        problems: list[str] = []
+        for table_name, columns in self._row_keys.items():
+            if self._is_reference_table(table_name):
+                continue
+            seen: set[tuple] = set()
+            for row in snapshot.get(table_name, []):
+                missing = [c for c in columns if c not in row]
+                if missing:
+                    problems.append(
+                        f"row_key for table '{table_name}' names column(s) "
+                        f"{missing!r} that are not present in the rows."
+                    )
+                    break
+                key = tuple(row[c] for c in columns)
+                if key in seen:
+                    problems.append(
+                        f"row_key {columns!r} is not unique in table "
+                        f"'{table_name}': the value {key!r} appears more than "
+                        f"once in the sandbox, so it cannot identify a row. "
+                        f"Nothing can be committed until the duplicate is "
+                        f"removed or a wider row_key is used."
+                    )
+                    break
+                seen.add(key)
+        return problems
 
     def _is_reference_table(self, table_name: str) -> bool:
         return table_name in self.reference_tables

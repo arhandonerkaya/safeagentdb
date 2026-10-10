@@ -83,6 +83,30 @@ class IntegrityViolationError(SyncError):
         self.row_key = dict(row_key or {})
 
 
+class DuplicateRowKeyError(SyncError):
+    """Raised when a row key does not identify a single row.
+
+    Either two sandbox rows share the key -- so the diff cannot tell which one
+    a change belongs to -- or an INSERT carries a key that production already
+    holds, which would silently become an overwrite.
+
+    Attributes:
+        table: Name of the table the key belongs to.
+        row_key: The key that is not unique.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        table: str | None = None,
+        row_key: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.table = table
+        self.row_key = dict(row_key or {})
+
+
 class GeneratedValueError(SyncError):
     """Raised when a row depends on a value only production can generate.
 
@@ -169,6 +193,7 @@ class MissingValidatorWarning(UserWarning):
 __all__ = [
     "AssignedKey",
     "ConflictError",
+    "DuplicateRowKeyError",
     "ConflictWarning",
     "GeneratedValueError",
     "IntegrityViolationError",

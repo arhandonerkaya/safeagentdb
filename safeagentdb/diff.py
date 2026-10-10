@@ -22,7 +22,10 @@ from rich.table import Table
 from rich.text import Text
 
 from safeagentdb.engine import PROVISIONAL_KEY_BASE
+from safeagentdb.errors import SchemaError
 from safeagentdb.models import get_validator, missing_validator_message
+
+_BLOCKED_HEADER = "[BLOCKED] SAFETY ALERT -- INVALID DATA DETECTED"
 
 _OP_STYLES = {
     "INSERT": "bold green",
@@ -196,6 +199,7 @@ class ChangeSet:
 
     diffs: list[RowDiff] = field(default_factory=list)
     unsupported_constraints: list[str] = field(default_factory=list)
+    blocking_errors: list[str] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -213,6 +217,15 @@ class ChangeSet:
 
     @property
     def is_valid(self) -> bool:
+        """True when nothing SafeAgentDB can check without production objects.
+
+        Covers per-row validation and every blocking error raised by the
+        pre-flight checks. A changeset that is valid here can still be refused
+        at commit by the checks that genuinely need production -- drift and
+        cross-tenant uniqueness -- which is why the banner says so.
+        """
+        if self.blocking_errors:
+            return False
         return all(valid for _, valid, _ in self.validate_all())
 
     def display(self) -> str:
@@ -240,6 +253,20 @@ class ChangeSet:
     # ---- Rich rendering (TTY) ----
 
     def _render_rich(self, console: Console) -> None:
+        if self.blocking_errors and self.is_empty:
+            console.print()
+            console.print(
+                Panel(
+                    f"[bold red]{_BLOCKED_HEADER}[/bold red]",
+                    title="[bold red]BLOCKED[/bold red]",
+                    border_style="red",
+                    padding=(0, 2),
+                )
+            )
+            self._render_rich_blocking(console)
+            self._render_rich_unsupported(console)
+            return
+
         if self.is_empty:
             console.print(
                 Panel(
@@ -271,6 +298,7 @@ class ChangeSet:
 
         console.print()
         console.print(banner)
+        self._render_rich_blocking(console)
         self._render_rich_unsupported(console)
 
         stats_text = Text()
@@ -349,6 +377,19 @@ class ChangeSet:
                     )
             console.print()
 
+    def _render_rich_blocking(self, console: Console) -> None:
+        if not self.blocking_errors:
+            return
+        body = "\n".join(f"- {item}" for item in self.blocking_errors)
+        console.print(
+            Panel(
+                f"[red]{body}[/red]",
+                title="[bold red]BLOCKED BEFORE COMMIT[/bold red]",
+                border_style="red",
+                padding=(0, 2),
+            )
+        )
+
     def _render_rich_unsupported(self, console: Console) -> None:
         if not self.unsupported_constraints:
             return
@@ -367,6 +408,12 @@ class ChangeSet:
     # ---- Plain-text rendering (non-TTY / logs / CI) ----
 
     def _render_plain(self) -> str:
+        if self.blocking_errors and self.is_empty:
+            return "\n".join(
+                [_BLOCKED_HEADER]
+                + self._plain_blocking_lines()
+                + self._plain_unsupported_lines()
+            )
         if self.is_empty:
             return "\n".join(
                 ["SafeAgentDB: No changes detected."] + self._plain_unsupported_lines()
@@ -378,7 +425,7 @@ class ChangeSet:
         if all_valid:
             header = "[SAFE] AI CHANGES VERIFIED -- SAFE TO COMMIT"
         else:
-            header = "[BLOCKED] SAFETY ALERT -- INVALID DATA DETECTED"
+            header = _BLOCKED_HEADER
 
         stats_parts = []
         if s["INSERT"]:
@@ -430,6 +477,7 @@ class ChangeSet:
         verdict = "ALL VALIDATIONS PASSED" if all_valid else "VALIDATION FAILURES DETECTED"
 
         lines = [header]
+        lines.extend(self._plain_blocking_lines())
         lines.extend(self._plain_unsupported_lines())
         lines.extend([
             "  " + "  ".join(stats_parts),
@@ -443,6 +491,14 @@ class ChangeSet:
         lines.append(f"  >> {verdict}")
 
         return "\n".join(lines)
+
+    def _plain_blocking_lines(self) -> list[str]:
+        if not self.blocking_errors:
+            return []
+        lines = ["[BLOCKED BEFORE COMMIT] these must be resolved first:"]
+        lines.extend(f"  - {item}" for item in self.blocking_errors)
+        lines.append("")
+        return lines
 
     def _plain_unsupported_lines(self) -> list[str]:
         if not self.unsupported_constraints:
@@ -517,8 +573,12 @@ def compute_diff(
         pks = pk_columns.get(table_name, ["id"])
         table_generated = tuple(generated.get(table_name, ()))
         table_provisional = tuple(provisional.get(table_name, ()))
-        orig_rows = {_pk_key(r, pks): r for r in original_snapshot.get(table_name, [])}
-        curr_rows = {_pk_key(r, pks): r for r in current_snapshot.get(table_name, [])}
+        orig_rows = _keyed_rows(
+            original_snapshot.get(table_name, []), pks, table_name, "cloned"
+        )
+        curr_rows = _keyed_rows(
+            current_snapshot.get(table_name, []), pks, table_name, "current sandbox"
+        )
 
         for pk_key in sorted(orig_rows.keys() - curr_rows.keys()):
             changeset.diffs.append(
@@ -562,6 +622,29 @@ def compute_diff(
 
 def _pk_key(row: dict[str, Any], pk_cols: list[str]) -> tuple:
     return tuple(row[c] for c in pk_cols)
+
+
+def _keyed_rows(
+    rows: list[dict[str, Any]], key_columns: list[str], table: str, side: str
+) -> dict[tuple, dict[str, Any]]:
+    """Index rows by their row key, refusing to let two rows share one.
+
+    A dict comprehension would quietly keep the last of a colliding pair. That
+    is how a second row sharing a custom row_key turned into an UPDATE that
+    overwrote the first, so this raises instead of choosing a winner.
+    """
+    keyed: dict[tuple, dict[str, Any]] = {}
+    for row in rows:
+        key = _pk_key(row, key_columns)
+        if key in keyed:
+            raise SchemaError(
+                f"Row key {key_columns!r} is not unique in the {side} state of "
+                f"table '{table}': the value {key!r} appears more than once, so "
+                f"it cannot identify a row. Choose columns that uniquely "
+                f"identify a row, or remove the duplicate."
+            )
+        keyed[key] = row
+    return keyed
 
 
 def _format_row_key(d: RowDiff) -> str:

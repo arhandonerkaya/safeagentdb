@@ -43,6 +43,7 @@ from safeagentdb.errors import (
     AssignedKey,
     ConflictError,
     ConflictWarning,
+    DuplicateRowKeyError,
     GeneratedValueError,
     IntegrityViolationError,
     SkippedConflict,
@@ -157,6 +158,10 @@ def apply_changeset(
 
             # ---- Gate 3: Execute with tenant-scoped WHERE ----
             if diff.diff_type == DiffType.INSERT:
+                # An INSERT must not quietly become an overwrite, so a key
+                # production already holds is refused here rather than later.
+                _refuse_existing_key(conn, table, diff, tenant_column, tenant_id, row_keys)
+
                 # A key the sandbox only held provisionally is left out, so the
                 # production sequence assigns the real one.
                 pending = diff.pending_key_columns()
@@ -223,6 +228,50 @@ def apply_changeset(
             affected += result.rowcount
 
     return affected
+
+
+def _refuse_existing_key(
+    conn: Connection,
+    table: Table,
+    diff: RowDiff,
+    tenant_column: str,
+    tenant_id: Any,
+    row_keys: dict[str, list[str]] | None,
+) -> None:
+    """Refuse an INSERT whose row key production already holds.
+
+    Without this the row key is never consulted on an INSERT, so a changeset
+    carrying a duplicate key reached production and the row that landed
+    depended on which statement ran last.
+    """
+    expected = (row_keys or {}).get(diff.table)
+    key = {
+        col: value
+        for col, value in (diff.pk or {}).items()
+        if col in table.c
+    }
+    if not key or not expected:
+        return
+    if set(key) != set(expected):
+        return
+    # A key production assigns is not known yet, so there is nothing to check.
+    if diff.pending_key_columns():
+        return
+
+    stmt = select(table)
+    for col, value in key.items():
+        stmt = stmt.where(_matches(table.c[col], value))
+    if tenant_column in table.c:
+        stmt = stmt.where(table.c[tenant_column] == tenant_id)
+
+    if conn.execute(stmt.limit(1)).fetchone() is not None:
+        raise DuplicateRowKeyError(
+            f"Refusing to INSERT into '{diff.table}': a row with key {key!r} "
+            f"already exists in production. Applying it would overwrite that "
+            f"row rather than add one.",
+            table=diff.table,
+            row_key=key,
+        )
 
 
 def _record_assignment(
