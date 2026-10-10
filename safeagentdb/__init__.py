@@ -2,6 +2,7 @@ from safeagentdb.diff import ChangeSet, DiffType, RowDiff
 from safeagentdb.errors import (
     AssignedKey,
     CascadeError,
+    ChangesetMismatchError,
     ConflictError,
     ConflictWarning,
     DuplicateRowKeyError,
@@ -21,6 +22,7 @@ __all__ = [
     "AssignedKey",
     "CascadeError",
     "ChangeSet",
+    "ChangesetMismatchError",
     "ConflictError",
     "ConflictWarning",
     "DiffType",

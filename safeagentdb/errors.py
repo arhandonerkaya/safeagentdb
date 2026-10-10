@@ -83,6 +83,30 @@ class IntegrityViolationError(SyncError):
         self.row_key = dict(row_key or {})
 
 
+class ChangesetMismatchError(SyncError):
+    """Raised when the changeset being committed is not the one reviewed.
+
+    ``commit_to_production(changeset=reviewed)`` recomputes the diff and
+    compares fingerprints. A mismatch means the sandbox changed after the
+    review, so approving one set of rows would be writing another.
+
+    Attributes:
+        reviewed: Fingerprint of the changeset that was approved.
+        current: Fingerprint of the changeset the sandbox holds now.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reviewed: str | None = None,
+        current: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reviewed = reviewed
+        self.current = current
+
+
 class CascadeError(SyncError):
     """Raised when a write would reach rows SafeAgentDB never scoped.
 
@@ -224,6 +248,7 @@ class MissingValidatorWarning(UserWarning):
 __all__ = [
     "AssignedKey",
     "CascadeError",
+    "ChangesetMismatchError",
     "ConflictError",
     "DuplicateRowKeyError",
     "ConflictWarning",

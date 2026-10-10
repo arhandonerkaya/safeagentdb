@@ -31,6 +31,7 @@ from safeagentdb.engine import (
 )
 from safeagentdb.errors import (
     AssignedKey,
+    ChangesetMismatchError,
     SafeAgentDBError,
     SchemaError,
     SkippedConflict,
@@ -272,8 +273,18 @@ class ShadowDB:
         changeset.blocking_errors.extend(self._preflight_errors(changeset))
         return changeset
 
-    def commit_to_production(self) -> int:
+    def commit_to_production(self, changeset: ChangeSet | None = None) -> int:
         """Validate and sync all sandbox changes to production atomically.
+
+        Args:
+            changeset: The changeset that was reviewed. When given, the diff is
+                recomputed and the commit refuses with ChangesetMismatchError
+                if its fingerprint differs, so only what was approved can be
+                written. **This is the recommended pattern wherever a human or
+                a second agent approves the change** -- without it, anything
+                that happened in the sandbox after the review is committed too.
+                Omitting it keeps the 0.2.x behaviour of committing whatever
+                the sandbox currently holds.
 
         Safety gates applied in order:
         1. Row-level diff computation, keyed on the primary key or ``row_key``
@@ -305,7 +316,21 @@ class ShadowDB:
         if self._committed:
             raise SyncError("This sandbox has already been committed. Create a new ShadowDB.")
 
+        reviewed = changeset
         changeset = self.diff()
+
+        if reviewed is not None and reviewed.fingerprint != changeset.fingerprint:
+            raise ChangesetMismatchError(
+                f"The sandbox changed since this changeset was reviewed, so "
+                f"committing it would write something other than what was "
+                f"approved. Reviewed {reviewed.summary} with fingerprint "
+                f"{reviewed.fingerprint}; the sandbox now holds "
+                f"{changeset.summary} with fingerprint {changeset.fingerprint}. "
+                f"Review the current diff and pass that instead.",
+                reviewed=reviewed.fingerprint,
+                current=changeset.fingerprint,
+            )
+
         if changeset.blocking_errors:
             raise SyncError(
                 "This changeset cannot be committed:\n  - "

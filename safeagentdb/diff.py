@@ -10,6 +10,8 @@ When piped to a file or CI log, it falls back to clean plain-text output.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
@@ -245,6 +247,36 @@ class ChangeSet:
         for d in self.diffs:
             counts[d.diff_type.value] += 1
         return counts
+
+    @property
+    def fingerprint(self) -> str:
+        """A stable hash of exactly what this changeset would write.
+
+        Content-addressed and order-independent: two changesets with the same
+        rows produce the same value whatever order the diffs are in, and any
+        difference in table, operation, key or value changes it. Used by
+        commit_to_production(changeset=...) to refuse writing something other
+        than what was reviewed.
+        """
+        entries = sorted(
+            json.dumps(
+                {
+                    "table": d.table,
+                    "op": d.diff_type.value,
+                    "key": d.pk,
+                    "old": d.old,
+                    "new": d.new,
+                },
+                sort_keys=True,
+                default=str,
+            )
+            for d in self.diffs
+        )
+        digest = hashlib.sha256()
+        for entry in entries:
+            digest.update(entry.encode("utf-8"))
+            digest.update(b"\x00")
+        return digest.hexdigest()[:32]
 
     def validate_all(self) -> list[tuple[RowDiff, bool, str]]:
         return [(d, *d.validate()) for d in self.diffs]
