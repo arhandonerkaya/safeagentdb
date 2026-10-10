@@ -5,6 +5,90 @@ All notable changes to SafeAgentDB are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-10
+
+A second safety release. An independent review of 0.2.0 found six further
+issues; all six were reproduced against the published package before anything
+was changed, and each is written up in [docs/AUDIT.md](docs/AUDIT.md) with a
+failing-first test in `tests/test_review_findings.py`.
+
+Two of them could destroy or leak production data silently, so upgrade if you
+use a custom `row_key` or have cascading foreign keys.
+
+### Breaking changes
+
+- **`ChangeSet.is_valid` is stricter.** A tenant breach, a row key that no
+  longer identifies a single row, or a write to a reference table now make it
+  `False`. 0.2.x reported those only at commit, so code branching on
+  `if changeset.is_valid:` will take the other path for changesets it used to
+  accept — which is the point: the commit was going to refuse them anyway.
+
+- **`commit_to_production()` raises in cases it previously allowed.**
+  `DuplicateRowKeyError` when an INSERT carries a key production already holds,
+  and `CascadeError` when a cascading foreign key would reach another tenant.
+  Both were silent data loss before.
+
+- **Statement order changed.** Tables are now ordered by foreign-key dependency
+  rather than alphabetically. If you depended on the old order, you depended on
+  a bug.
+
+- **`IntegrityViolationError`'s message no longer claims a cause.** It used to
+  say the rejection happened "because it holds only this tenant's rows" for
+  every integrity error, including ones that had nothing to do with tenancy.
+  Code matching on that text needs updating.
+
+- `safeagentdb.__all__` grew: `CascadeError`, `ChangesetMismatchError`,
+  `DuplicateRowKeyError`.
+
+### Added
+
+- **`commit_to_production(changeset=...)`** — pass the `ChangeSet` you reviewed
+  and the commit recomputes the diff, comparing fingerprints, and refuses with
+  `ChangesetMismatchError` if the sandbox changed since. This is the recommended
+  form wherever a human or a second agent approves the change; without it,
+  anything that happened after the review is committed too. Calling with no
+  argument behaves as in 0.2.x.
+- `ChangeSet.fingerprint` — a content-addressed, order-independent hash of
+  exactly what the changeset would write.
+- `ChangeSet.blocking_errors` — problems found without touching production, which
+  the commit will refuse. Rendered under `BLOCKED BEFORE COMMIT` in both the Rich
+  and plain output.
+- `ShadowDB.cascade_references` — the cascading foreign keys that point into the
+  cloned tables.
+- `CascadeError`, `ChangesetMismatchError` and `DuplicateRowKeyError`.
+- `diff.tenant_breach()` and `RowDiff.logical_row()`, the shared helpers that
+  keep `diff()` and the commit from disagreeing.
+- `sync.table_write_order()`, the topological table sort, which raises on a
+  dependency cycle.
+- Seven more server-backed tests, bringing that suite to 19 against PostgreSQL
+  in CI. 203 local tests.
+
+### Fixed
+
+- **A duplicate custom row key overwrote a production row.** Two sandbox rows
+  sharing a `row_key` were folded into one diff entry by a dict comprehension,
+  reported as a single UPDATE with `is_valid` `True`, and committed as an
+  overwrite: two rows in, one row out, holding the wrong payload. Uniqueness was
+  only ever checked at `__enter__`. Now re-checked on the current sandbox state
+  in `diff()`, guarded in `compute_diff()`, and refused at commit.
+- **`ON DELETE CASCADE` crossed the tenant boundary.** Deleting a parent owned by
+  one tenant also deleted another tenant's child, with nothing recorded or
+  warned. Cascading keys across *all* of production are now found at open and
+  checked at commit. SQLAlchemy's SQLite inspector does not report referential
+  actions, so `PRAGMA foreign_key_list` is used there.
+- **A populated `JSON` column crashed the sandbox open** with
+  `sqlite3.ProgrammingError: type 'dict' is not supported`. Remapped columns now
+  carry a conversion in each direction, and any `SQLAlchemyError` during
+  `__enter__` is wrapped in `SchemaError` rather than escaping raw.
+- **`diff()` reported `SAFE TO COMMIT` for a change the commit rejected.** The
+  tenant guard was commit-only. It, the reference-table guard and the row-key
+  checks now run in `diff()` through the same helpers sync uses.
+- **The changeset a reviewer approved was not necessarily the one committed.**
+  See `commit_to_production(changeset=...)` above.
+- **Statement order ignored foreign-key dependencies**, so a child could be
+  inserted before its parent and rejected. Ordering is topological now, and a
+  cycle raises `SchemaError` rather than being attempted.
+
 ## [0.2.0] - 2026-09-20
 
 A safety release. Every item under **Fixed** is a case where 0.1.x could lose or

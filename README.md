@@ -77,6 +77,11 @@ Gate 6: ATOMIC SYNC
   row order, writing only the columns the agent actually changed.
 ```
 
+Every gate that does not need production also runs inside `diff()`, through
+the same helpers, so the banner you review and the gate that writes cannot
+disagree. Only drift and cross-tenant uniqueness are commit-only, and a clean
+banner says so.
+
 See [Guarantees and limits](#guarantees-and-limits) for what these gates
 deliberately do **not** cover.
 
@@ -131,10 +136,11 @@ with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
     )
 
     # Review: see exactly what changed, with validation status
-    sandbox.diff().print()
+    changeset = sandbox.diff()
+    changeset.print()
 
-    # Approve: sync to production in a single atomic transaction
-    sandbox.commit_to_production()
+    # Approve: commit exactly what was reviewed, and nothing else
+    sandbox.commit_to_production(changeset=changeset)
 ```
 
 ### 4. Review the Diff
@@ -181,7 +187,7 @@ with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
     if not changeset.is_valid:
         print("AI output rejected. Production untouched.")
     else:
-        sandbox.commit_to_production()
+        sandbox.commit_to_production(changeset=changeset)
 ```
 
 The `[BLOCKED]` banner appears:
@@ -310,7 +316,7 @@ Two things to know before you list a table:
 | `execute` | `(sql: str, params: dict \| None) -> CursorResult` | Execute raw SQL inside the sandbox. Wraps the string in `text()` automatically so AI agents do not need to import it. Returns a standard SQLAlchemy `CursorResult`. |
 | `query` | `(sql: str, params: dict \| None) -> list[dict]` | Execute a SELECT and return results as a list of plain dictionaries. Convenience method for AI agents that work with JSON-like data. |
 | `diff` | `() -> ChangeSet` | Flushes pending changes, snapshots the current sandbox state, and computes a row-level diff against the original clone. Returns a `ChangeSet` object. |
-| `commit_to_production` | `() -> int` | Runs all 6 safety gates and syncs approved changes to production in one atomic transaction, writing only the columns the agent changed. Returns the number of rows **actually written**, summed from each statement's rowcount. Raises `ConflictError` on production drift, `GeneratedValueError` when a row needs a value only production can generate, `IntegrityViolationError` when production rejects a row the sandbox accepted, `SyncError` on tenant breach or a missing row key, `MissingValidatorError` when a table has no `SafeModel`, `pydantic.ValidationError` on schema violations. Can only be called once per sandbox (double-commit raises `SyncError`). |
+| `commit_to_production` | `(changeset: ChangeSet \| None = None) -> int` | Pass the `ChangeSet` you reviewed and the commit refuses with `ChangesetMismatchError` if the sandbox changed since -- **the recommended form wherever anything approves the change**. Omit it to commit whatever the sandbox currently holds. Runs all 6 safety gates and syncs approved changes to production in one atomic transaction, writing only the columns the agent changed. Returns the number of rows **actually written**, summed from each statement's rowcount. Raises `ConflictError` on production drift, `GeneratedValueError` when a row needs a value only production can generate, `IntegrityViolationError` when production rejects a row the sandbox accepted, `SyncError` on tenant breach or a missing row key, `MissingValidatorError` when a table has no `SafeModel`, `pydantic.ValidationError` on schema violations. Can only be called once per sandbox (double-commit raises `SyncError`). |
 
 **Properties:**
 
@@ -379,8 +385,10 @@ Returned by `sandbox.diff()`. Contains the full set of row-level changes.
 |--------|------|-------------|
 | `diffs` | `list[RowDiff]` | Raw list of individual row changes. |
 | `is_empty` | `bool` | `True` if the AI made no changes. |
-| `is_valid` | `bool` | `True` if every row passes Pydantic validation. With `require_validators=True`, a table with no registered `SafeModel` makes this `False`. Check it before calling `commit_to_production()`. |
+| `is_valid` | `bool` | `True` when nothing SafeAgentDB can check without production objects is wrong: per-row validation plus every `blocking_errors` entry. Stricter in 0.3.0 -- a tenant breach, a duplicate row key or a write to a reference table now make it `False`, where 0.2.x reported those only at commit. A clean `is_valid` still does not promise the commit will succeed; drift and cross-tenant uniqueness need production. |
 | `unsupported_constraints` | `list[str]` | Schema elements not enforced in the sandbox, carried through from `ShadowDB` so the rendered diff can warn about them. |
+| `blocking_errors` | `list[str]` | Problems the commit will refuse that were found without touching production: a tenant breach, a row key that no longer identifies a row, a write to a reference table. Any entry makes `is_valid` `False`. |
+| `fingerprint` | `str` | Content-addressed hash of exactly what this changeset would write. Pass the changeset to `commit_to_production()` and it is compared, so only what was reviewed can land. |
 | `summary` | `dict[str, int]` | `{"INSERT": n, "UPDATE": n, "DELETE": n}` |
 | `print()` | `-> None` | Renders the Rich color-coded dashboard directly to the terminal. |
 | `display()` | `-> str` | Returns the diff as a printable string. Auto-detects TTY: Rich ANSI in terminals, plain ASCII in pipes/CI. |
@@ -412,6 +420,9 @@ SafeAgentDBError
 |-- SchemaError                 production schema cannot be sandboxed safely
 |-- SyncError                   a changeset was rejected or could not be applied
 |   |-- ConflictError           production drifted between clone and commit
+|   |-- CascadeError            a cascading key would reach another tenant
+|   |-- ChangesetMismatchError  the sandbox changed since the review
+|   |-- DuplicateRowKeyError    the row key does not identify one row
 |   |-- GeneratedValueError     a row needs a value only production can generate
 |   +-- IntegrityViolationError production rejected a row the sandbox accepted
 +-- MissingValidatorError       no SafeModel registered and one is required
@@ -429,6 +440,9 @@ exception is kept as `__cause__`.
 | `GeneratedValueError` | A new row supplies a key production is meant to assign, needs a generated value the sandbox could not hold for it, or references another new row's placeholder key. Carries `.table` and `.columns`. See [Generated keys](#generated-keys). |
 | `IntegrityViolationError` | Production rejected a row the sandbox accepted, most often a `UNIQUE` collision with a row belonging to another tenant. Carries `.table` and `.row_key`, and the driver's `IntegrityError` as `__cause__`. |
 | `MissingValidatorError` | A table has no registered `SafeModel` and `require_validators` is `True`. Also subclasses `KeyError`, so 0.1.x handlers keep working. |
+| `DuplicateRowKeyError` | A row key does not identify a single row: two sandbox rows share it, or an INSERT carries a key production already holds. Carries `.table` and `.row_key`. |
+| `CascadeError` | A `DELETE`, or an `UPDATE` to a referenced column, would make production act on rows belonging to another tenant through a cascading foreign key. Carries `.table`, `.referencing_table`, `.tenants` and `.action`. |
+| `ChangesetMismatchError` | `commit_to_production(changeset=...)` was given a changeset the sandbox no longer matches. Carries `.reviewed` and `.current` fingerprints. |
 | `MissingValidatorWarning` | Not an error: warned when `require_validators=False` and a row is written unvalidated. |
 | `ConflictWarning` | Not an error: warned once per row skipped under `on_conflict="ignore"`. |
 
@@ -586,6 +600,19 @@ honest version of what that means.
   clause of every statement.
 - **Unidentifiable rows**: a table with no primary key and no `row_key` is
   refused rather than guessed at.
+- **Indirect writes through cascading keys**: the tenant filter applies to the
+  statements SafeAgentDB issues. A foreign key declared `ON DELETE CASCADE`,
+  `SET NULL` or `SET DEFAULT` makes the database act on further rows *by
+  itself*, and no `WHERE` clause of ours constrains those. Every such key
+  pointing into a cloned table is now found at `__enter__` -- across all of
+  production, not just the cloned tables -- reported in
+  `unsupported_constraints`, and checked at commit: if the propagated effect
+  would reach another tenant, `CascadeError` rolls the changeset back. The
+  sandbox still cannot *preview* the effect, because the referencing table is
+  usually not cloned.
+- **Exactly what was reviewed**: `commit_to_production(changeset=...)` compares
+  the changeset's fingerprint against a freshly computed diff and refuses if the
+  sandbox moved on, so an approval cannot be widened after the fact.
 - **Production drift**: a row changed by another process between clone and
   commit is a `ConflictError`, not a silent overwrite. The clone-time values are
   carried in the `WHERE` clause of the `UPDATE`/`DELETE` itself, so the check and
@@ -604,8 +631,20 @@ honest version of what that means.
 - **Anything listed in `unsupported_constraints`.** Dialect-specific column
   types are stored as `TEXT`/`VARCHAR`, so a malformed UUID or a non-JSON string
   passes in the sandbox and is rejected by production. Server defaults with no
-  SQLite equivalent, foreign keys pointing outside the cloned tables, and
-  `CHECK` constraints that reflection could not reproduce are all listed there.
+  SQLite equivalent, foreign keys pointing outside the cloned tables, cascading
+  keys whose referencing table was not cloned, and `CHECK` constraints that
+  reflection could not reproduce are all listed there.
+- **The shape of a cascade, before it happens.** `CascadeError` tells you a
+  cascading write *would* reach another tenant, at commit. It cannot show you
+  which rows in the diff, because the referencing table is usually outside the
+  sandbox entirely.
+- **Values in remapped columns, exactly.** A `JSON`, `JSONB`, `ARRAY` or
+  `HSTORE` column is carried through the sandbox as serialised text and
+  converted back at commit, and a `UUID` or `INET` as a string. Round-tripping
+  is lossless for the types above, but the sandbox cannot enforce the column's
+  own validity rules, and these columns are excluded from the
+  compare-and-swap guard because the two sides hold different
+  representations.
 - **Uniqueness against rows you did not clone.** The sandbox holds one tenant's
   rows. A value that is unique within that tenant can still collide with another
   tenant's row, and that only surfaces when production rejects the commit.

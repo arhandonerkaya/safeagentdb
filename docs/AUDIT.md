@@ -2,10 +2,12 @@
 
 Date: 2026-09-20 · Version audited: 0.1.2 · Branch: `audit`
 
-> **Status: all four findings fixed in 0.2.0.** See [CHANGELOG.md](../CHANGELOG.md)
-> for what changed and which changes are breaking. The tests below were rewritten
-> as regression guards and now assert the fixed behaviour; this document is kept
-> as the record of what was wrong and why.
+> **Status: findings 1-4 fixed in 0.2.0; findings 5-10, from a second
+> independent review of 0.2.0, fixed in 0.3.0.** See
+> [CHANGELOG.md](../CHANGELOG.md) for what changed and which changes are
+> breaking. The tests referenced below were rewritten as regression guards and
+> now assert the fixed behaviour; this document is kept as the record of what
+> was wrong and why.
 
 Verification only — no library code was changed. Evidence lives in
 [tests/test_weaknesses.py](../tests/test_weaknesses.py).
@@ -194,7 +196,7 @@ current behaviour.
 
 ---
 
-## Summary
+## Summary -- first review (0.1.2)
 
 | # | Claim | Verdict |
 |---|---|---|
@@ -214,3 +216,231 @@ Two smaller observations, not filed above:
   `_SQLITE_TYPE_MAP` is keyed by string. `_sqlite_safe_type()` matches on class
   name only, so generic `sqlalchemy.ARRAY` and `sqlalchemy.JSON` also hit the
   Postgres entries, and MySQL `TINYINT` is mapped to `String(255)`.
+
+
+---
+
+# Second review -- 0.2.0 at `9dea013`
+
+Date: 2026-10-10 · Version audited: 0.2.0 · Branch: `hardening-2`
+
+An independent review of the released 0.2.0 found six further issues. All six
+were reproduced against the published package before anything was changed; each
+has a failing-first test in
+[tests/test_review_findings.py](../tests/test_review_findings.py), and findings
+6, 7 and 10 also have PostgreSQL versions in
+[tests/test_server_backed.py](../tests/test_server_backed.py).
+
+**All six CONFIRMED and fixed in 0.3.0.** 203 local tests pass, plus 19
+server-backed tests against PostgreSQL in CI.
+
+---
+
+## 5. Duplicate custom row key overwrote a production row — CONFIRMED
+
+**Code path.** [diff.py `compute_diff()`](../safeagentdb/diff.py) indexed both
+snapshots with a dict comprehension, `{_pk_key(r, pks): r for r in rows}`. Two
+rows sharing a key collapsed to one entry, last writer winning.
+[sandbox.py `_assert_row_keys_unique()`](../safeagentdb/sandbox.py) checked
+uniqueness only at `__enter__`, against the cloned rows.
+
+**What the test does.** A PK-less `events` table with
+`row_key={"events": ["kind"]}`; production holds `('a', 42, 'original')`. The
+sandbox inserts a second row with `kind='a'`.
+
+**Observed behaviour.** `diff()` reported one UPDATE and `is_valid` was `True`.
+The commit ran `UPDATE events SET ... WHERE kind='a' AND tenant_id=42`, so two
+rows went into the sandbox, one row came out of production, and the row that
+survived held the *new* payload. The original data was destroyed and the second
+row was never written.
+
+**Practical impact.** The most severe of the six. A custom `row_key` is
+recommended in the README for PK-less tables, and nothing stops an agent
+inserting a row that collides on it — audit logs and event streams, the exact
+tables that need `row_key`, are also the ones where duplicate natural keys are
+most likely. Silent, and it destroys data rather than failing.
+
+**Fixed by** three guards, one at each point the collision can appear:
+`diff()` re-checks uniqueness on the *current* sandbox state and returns a
+changeset carrying a blocking error; `compute_diff()` indexes through
+`_keyed_rows()`, which raises `SchemaError` rather than picking a winner; and
+`apply_changeset()` refuses an INSERT whose key production already holds with
+`DuplicateRowKeyError`.
+
+---
+
+## 6. ON DELETE CASCADE crossed the tenant boundary — CONFIRMED
+
+**Code path.** [sync.py `apply_changeset()`](../safeagentdb/sync.py) put the
+tenant predicate in the WHERE clause of every statement it issued. A referential
+action makes the database act on *further* rows by itself, and no WHERE clause
+of ours constrains those.
+
+**What the test does.** `parent(id, tenant_id)` with row 1 owned by tenant 42;
+`child(tenant_id=99, parent_id REFERENCES parent(id) ON DELETE CASCADE)`. Tenant
+42's sandbox deletes the parent.
+
+**Observed behaviour.** The delete succeeded and took tenant 99's child row with
+it. `unsupported_constraints` was empty and nothing warned, at open or at
+commit.
+
+**Practical impact.** A tenant-isolation breach in the one direction the library
+claims to prevent, through a schema feature that is entirely ordinary. The
+sandbox could not have shown it either: `child` was never cloned.
+
+**Fixed by** inspecting the foreign keys of *every* production table at
+`__enter__` — not only the cloned ones, since the dangerous child is the one
+nobody asked to sandbox — for propagating actions (`CASCADE`, `SET NULL`,
+`SET DEFAULT`, on delete or update) into a cloned table. Each is recorded in
+`unsupported_constraints`, rendered in the diff, and exposed as
+`ShadowDB.cascade_references`. At commit, before a DELETE or an UPDATE touching
+a referenced column, the referencing rows are counted per tenant inside the
+transaction; rows belonging to another tenant, or in a child table with no
+tenant column at all, raise `CascadeError` and roll the changeset back. A
+cascade confined to the acting tenant still applies.
+
+**Worth knowing:** SQLAlchemy's SQLite inspector returns an empty `options`
+dict for every foreign key, so the referential action is invisible there.
+`PRAGMA foreign_key_list` reports it; PostgreSQL and MySQL use the inspector.
+
+---
+
+## 7. A populated JSON column crashed the sandbox open — CONFIRMED
+
+**Code path.** [engine.py `load_rows()`](../safeagentdb/engine.py) inserted
+production values straight into the sandbox. `_sqlite_safe_type()` remapped the
+*column type* to `Text`, but nothing converted the *values*.
+
+**What the test does.** A production column `data JSON` holding `{"a": 1}`.
+
+**Observed behaviour.** `__enter__` raised
+`sqlite3.ProgrammingError: type 'dict' is not supported` — a raw driver
+exception, outside the documented hierarchy. SQLAlchemy's JSON result processor
+returns a `dict`; SQLite can bind only `None`, `int`, `float`, `str` and
+`bytes`.
+
+**Practical impact.** The library could not be used at all against any
+PostgreSQL schema with a populated `JSON`/`JSONB`/`ARRAY`/`HSTORE` column — a
+common shape — and the failure was a bare driver error rather than anything a
+caller could act on.
+
+**Fixed by** recording a conversion for every remapped column: `json.dumps` for
+JSON, JSONB, ARRAY and HSTORE, `str` for UUID, INET and the rest, with values
+SQLite can already bind passed through untouched. The value is converted back
+before it is written at commit. `RowDiff.logical_row()` produces the production
+representation and is used for change detection, `RowDiff.validate()` and sync's
+Pydantic gate alike — the `SafeModel` describes production, not the sandbox — so
+a value that differs only in serialisation is not reported as changed. Remapped
+columns are excluded from the compare-and-swap guard, whose two sides hold
+different representations. Any `SQLAlchemyError` during `__enter__` is now
+wrapped in `SchemaError`.
+
+---
+
+## 8. diff() reported SAFE for a change the commit rejected — CONFIRMED
+
+**Code path.** The tenant guard lived only in
+[sync.py `apply_changeset()`](../safeagentdb/sync.py), inside the commit
+transaction. [diff.py `ChangeSet.is_valid`](../safeagentdb/diff.py) consulted
+only per-row Pydantic validation.
+
+**What the test does.** `UPDATE tasks SET tenant_id=99 WHERE id=1`.
+
+**Observed behaviour.** `diff().is_valid` was `True` and the banner read
+`[SAFE] AI CHANGES VERIFIED -- SAFE TO COMMIT`. The commit then raised
+`SyncError` for a tenant breach.
+
+**Practical impact.** The diff is the review surface — the thing a human or an
+approving agent reads before saying yes. Having it disagree with the gate is the
+worst place for a disagreement: it trains reviewers to trust a green banner that
+does not mean what it says, and in a multi-table changeset the rejection arrives
+after everything else has already validated.
+
+**Fixed by** moving the tenant rule into one function, `diff.tenant_breach()`,
+called by `apply_changeset()` before it writes and by `ShadowDB.diff()` so the
+dashboard reaches the same verdict. The reference-table and row-key checks join
+it in a pre-flight pass whose results land in `ChangeSet.blocking_errors`, so
+`is_valid` and both renderers reflect them. Drift and cross-tenant uniqueness
+stay commit-only because they genuinely need production objects — and a clean
+banner now says so instead of promising success.
+
+---
+
+## 9. The reviewed changeset was not the committed changeset — CONFIRMED
+
+**Code path.** [sandbox.py `commit_to_production()`](../safeagentdb/sandbox.py)
+called `self.diff()` itself and committed whatever that returned. The
+`ChangeSet` a caller had already inspected played no part.
+
+**What the test does.** `diff()` is called and shows one UPDATE; a DELETE is
+then executed in the sandbox; `commit_to_production()` is called.
+
+**Observed behaviour.** Two changes were written. The changeset that was
+reviewed and the changeset that landed were different objects, and nothing
+compared them.
+
+**Practical impact.** It makes the approval step advisory rather than binding.
+Any pattern of the form *render the diff, ask a human, commit* is unsound: a
+second agent turn, a retry, or a background task touching the session between
+the review and the commit silently widens what gets written.
+
+**Fixed by** `ChangeSet.fingerprint`, a content-addressed, order-independent
+sha256 of exactly what the changeset would write, and
+`commit_to_production(changeset=reviewed)`, which recomputes the diff and
+refuses with `ChangesetMismatchError` when the fingerprints differ. Calling with
+no argument keeps the 0.2.x behaviour; the README now uses the pinned form in
+its approval examples.
+
+---
+
+## 10. Statement order ignored foreign-key dependencies — CONFIRMED
+
+**Code path.** [sync.py `_statement_order()`](../safeagentdb/sync.py) sorted by
+`(table name, row key, operation)`. Table name was alphabetical, with no regard
+for which table referenced which.
+
+**What the test does.** `b_parent` and `a_child`, the child referencing the
+parent. Both rows are inserted in the sandbox.
+
+**Observed behaviour.** `a_child` sorted first, so the child was inserted before
+its parent and production rejected it with a foreign-key violation. The
+changeset was correct; only the order was wrong.
+
+**Practical impact.** Any changeset creating a parent and a child together fails
+whenever the child's table name sorts first — roughly half of all such schemas,
+decided by nothing more than naming. The error it produced then compounded the
+problem: `IntegrityViolationError` told the caller the rejection happened
+"because it holds only this tenant's rows", which here was simply untrue.
+
+**Fixed by** ordering tables topologically on the foreign-key graph (Kahn's
+algorithm, ties broken by name). DELETEs run first, children before parents;
+then INSERTs and UPDATEs, parents before children, so a row deleted and
+re-inserted under the same key still goes in the right order. Within a table the
+existing row-key order stands, and the whole order remains a total deterministic
+function of the changeset, which is what the deadlock argument rests on. A
+dependency cycle raises `SchemaError` naming the tables rather than being
+attempted. `IntegrityViolationError` now reports what production said and that
+the sandbox could not evaluate the rule, and claims nothing further.
+
+---
+
+## Summary -- second review (0.2.0)
+
+| # | Finding | Verdict |
+|---|---------|---------|
+| 5 | Duplicate custom row key overwrote a production row | **CONFIRMED** |
+| 6 | ON DELETE CASCADE crossed the tenant boundary | **CONFIRMED** |
+| 7 | A populated JSON column crashed the sandbox open | **CONFIRMED** |
+| 8 | diff() reported SAFE for a change the commit rejected | **CONFIRMED** |
+| 9 | The reviewed changeset was not the committed changeset | **CONFIRMED** |
+| 10 | Statement order ignored foreign-key dependencies | **CONFIRMED** |
+
+### What this round says about the first round
+
+Findings 6, 7 and 10 all share a shape: a behaviour that is invisible on SQLite
+and only appears against a real server, or only appears in a schema feature the
+first round's tests never used. The first audit was written entirely against
+SQLite, and 0.2.0's PostgreSQL job existed but had not yet run when 0.2.0 was
+cut. Three of these six would have been caught earlier by a server-backed test
+of ordinary schema features — cascading keys, JSON columns, a parent and a child
+in one changeset — rather than by more tests of the paths already covered.
