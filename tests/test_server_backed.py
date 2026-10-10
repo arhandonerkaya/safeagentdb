@@ -407,3 +407,232 @@ class TestForeignKeysOnServer:
 
         with engine.connect() as conn:
             assert conn.execute(text("SELECT COUNT(*) FROM items")).scalar_one() == 1
+
+
+# ============================================================
+# Review findings that need a real server: 2, 3 and 6
+# ============================================================
+
+
+class TestCascadeOnServer:
+    """Finding 2. SQLite reports referential actions only through a pragma;
+    PostgreSQL reports them through the inspector, so detection takes a
+    different code path here."""
+
+    CASCADE = [
+        """
+        CREATE TABLE cparent (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            label TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE cchild (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            parent_id INTEGER NOT NULL REFERENCES cparent(id) ON DELETE CASCADE,
+            note TEXT NOT NULL
+        )
+        """,
+        "INSERT INTO cparent (id, user_id, label) VALUES (1, 42, 'owned by 42')",
+        "INSERT INTO cchild (user_id, parent_id, note) VALUES (99, 1, 'belongs to 99')",
+    ]
+
+    @staticmethod
+    def _register():
+        class CParentValidator(SafeModel):
+            __table_name__ = "cparent"
+            id: int
+            user_id: int
+            label: str
+
+        return CParentValidator
+
+    def test_the_inspector_path_finds_the_cascade(self, make_tables):
+        engine = make_tables(self.CASCADE, ["cchild", "cparent"])
+        self._register()
+
+        with ShadowDB(engine, tables=["cparent"], tenant_id=42) as sandbox:
+            reported = sandbox.unsupported_constraints
+            assert any("cchild" in item for item in reported), reported
+            assert any("CASCADE" in item.upper() for item in reported), reported
+            assert [r.child_table for r in sandbox.cascade_references] == ["cchild"]
+
+    def test_a_cross_tenant_cascade_is_refused_on_the_server(self, make_tables):
+        from safeagentdb import CascadeError
+
+        engine = make_tables(self.CASCADE, ["cchild", "cparent"])
+        self._register()
+
+        with ShadowDB(engine, tables=["cparent"], tenant_id=42) as sandbox:
+            sandbox.execute("DELETE FROM cparent WHERE id=1")
+            with pytest.raises(CascadeError) as excinfo:
+                sandbox.commit_to_production()
+            assert excinfo.value.referencing_table == "cchild"
+            assert 99 in excinfo.value.tenants
+
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM cparent")).scalar_one() == 1
+            assert conn.execute(text("SELECT COUNT(*) FROM cchild")).scalar_one() == 1
+
+
+class TestJsonOnServer:
+    """Finding 3. On PostgreSQL the driver really does hand back a dict and a
+    list, which is what crashed the sandbox open."""
+
+    DOCS = [
+        """
+        CREATE TABLE docs (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            data JSONB,
+            tags TEXT[]
+        )
+        """,
+        "INSERT INTO docs (user_id, title, data, tags) VALUES "
+        "(42, 'first', '{\"a\": 1}', ARRAY['x','y'])",
+        "INSERT INTO docs (user_id, title, data, tags) VALUES "
+        "(42, 'second', '{\"outer\": {\"inner\": [1, 2]}}', NULL)",
+        "INSERT INTO docs (user_id, title, data, tags) VALUES "
+        "(42, 'third', NULL, NULL)",
+    ]
+
+    @staticmethod
+    def _register():
+        class DocValidator(SafeModel):
+            __table_name__ = "docs"
+            id: int
+            user_id: int
+            title: str
+            data: dict | list | None
+            tags: list | None
+
+        return DocValidator
+
+    def test_the_sandbox_opens_with_jsonb_and_array_columns(self, make_tables):
+        engine = make_tables(self.DOCS, ["docs"])
+        self._register()
+
+        with ShadowDB(engine, tables=["docs"], tenant_id=42) as sandbox:
+            assert sandbox.clone_stats["docs"] == 3
+            titles = sorted(r["title"] for r in sandbox.query("SELECT title FROM docs"))
+            assert titles == ["first", "second", "third"]
+            # SERIAL, so production assigns new keys.
+            assert sandbox.generated_columns == {"docs": ["id"]}
+
+    def test_an_untouched_json_value_is_not_reported_as_changed(self, make_tables):
+        engine = make_tables(self.DOCS, ["docs"])
+        self._register()
+
+        with ShadowDB(engine, tables=["docs"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE docs SET title='renamed' WHERE title='first'")
+            changeset = sandbox.diff()
+            (diff,) = changeset.diffs
+            assert diff.changed_columns() == ["title"]
+            assert changeset.is_valid is True
+            assert sandbox.commit_to_production(changeset=changeset) == 1
+
+        with engine.connect() as conn:
+            data, tags = conn.execute(
+                text("SELECT data, tags FROM docs WHERE title='renamed'")
+            ).one()
+        assert data == {"a": 1}
+        assert list(tags) == ["x", "y"]
+
+    def test_a_changed_json_value_round_trips_to_the_server(self, make_tables):
+        engine = make_tables(self.DOCS, ["docs"])
+        self._register()
+
+        with ShadowDB(engine, tables=["docs"], tenant_id=42) as sandbox:
+            sandbox.execute(
+                "UPDATE docs SET data='{\"a\": 2, \"b\": [1, 2]}' WHERE title='first'"
+            )
+            assert sandbox.commit_to_production() == 1
+
+        with engine.connect() as conn:
+            data = conn.execute(
+                text("SELECT data FROM docs WHERE title='first'")
+            ).scalar_one()
+        assert data == {"a": 2, "b": [1, 2]}
+
+
+class TestStatementOrderOnServer:
+    """Finding 6. PostgreSQL checks foreign keys immediately, so a child
+    inserted before its parent is rejected outright."""
+
+    ORDER = [
+        """
+        CREATE TABLE zparent (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            label TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE achild (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            parent_id INTEGER NOT NULL REFERENCES zparent(id),
+            note TEXT NOT NULL
+        )
+        """,
+    ]
+
+    @staticmethod
+    def _register():
+        class ZParentValidator(SafeModel):
+            __table_name__ = "zparent"
+            id: int
+            user_id: int
+            label: str
+
+        class AChildValidator(SafeModel):
+            __table_name__ = "achild"
+            id: int
+            user_id: int
+            parent_id: int
+            note: str
+
+        return ZParentValidator, AChildValidator
+
+    def test_a_parent_is_inserted_before_its_child(self, make_tables):
+        """achild sorts before zparent, so this is exactly the case the old
+        alphabetical ordering got wrong."""
+        engine = make_tables(self.ORDER, ["achild", "zparent"])
+        self._register()
+
+        with ShadowDB(engine, tables=["achild", "zparent"], tenant_id=42) as sandbox:
+            sandbox.execute(
+                "INSERT INTO zparent (id, user_id, label) VALUES (1, 42, 'parent')"
+            )
+            sandbox.execute(
+                "INSERT INTO achild (id, user_id, parent_id, note) "
+                "VALUES (10, 42, 1, 'child')"
+            )
+            assert sandbox.commit_to_production() == 2
+
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM zparent")).scalar_one() == 1
+            assert conn.execute(text("SELECT COUNT(*) FROM achild")).scalar_one() == 1
+
+    def test_a_child_is_deleted_before_its_parent(self, make_tables):
+        engine = make_tables(
+            self.ORDER
+            + [
+                "INSERT INTO zparent VALUES (1, 42, 'parent')",
+                "INSERT INTO achild VALUES (10, 42, 1, 'child')",
+            ],
+            ["achild", "zparent"],
+        )
+        self._register()
+
+        with ShadowDB(engine, tables=["achild", "zparent"], tenant_id=42) as sandbox:
+            sandbox.execute("DELETE FROM achild WHERE id=10")
+            sandbox.execute("DELETE FROM zparent WHERE id=1")
+            assert sandbox.commit_to_production() == 2
+
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM zparent")).scalar_one() == 0
+            assert conn.execute(text("SELECT COUNT(*) FROM achild")).scalar_one() == 0
