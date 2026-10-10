@@ -33,14 +33,17 @@ from sqlalchemy import (
     delete,
     insert,
     select,
+    text,
     update,
 )
 from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from safeagentdb.diff import ChangeSet, DiffType, RowDiff
+from safeagentdb.engine import CascadeReference
 from safeagentdb.errors import (
     AssignedKey,
+    CascadeError,
     ConflictError,
     ConflictWarning,
     DuplicateRowKeyError,
@@ -64,6 +67,7 @@ def apply_changeset(
     row_keys: dict[str, list[str]] | None = None,
     on_conflict: OnConflict = "abort",
     require_validators: bool = True,
+    cascade_references: list[CascadeReference] | None = None,
     skipped: list[SkippedConflict] | None = None,
     assigned: list[AssignedKey] | None = None,
 ) -> int:
@@ -83,6 +87,9 @@ def apply_changeset(
         require_validators: When True (default), a table with no registered
             SafeModel raises MissingValidatorError. When False it warns and the
             row is written unvalidated -- matching RowDiff.validate() exactly.
+        cascade_references: Foreign keys that propagate into the written tables.
+            Each DELETE, and each UPDATE touching a referenced column, is
+            checked for referencing rows in other tenants before it runs.
         skipped: A list to append one SkippedConflict to per row skipped under
             ``on_conflict="ignore"``. Without it a partial apply leaves no
             record of what was left out.
@@ -179,6 +186,11 @@ def apply_changeset(
             # ---- Gate 4: never touch rows without identifying them ----
             key = _require_row_key(diff, table, tenant_column, tenant_id, row_keys)
 
+            # ---- Gate 4b: no indirect writes outside the tenant ----
+            _refuse_cross_tenant_cascade(
+                conn, diff, key, tenant_column, tenant_id, cascade_references
+            )
+
             # ---- Gate 5: compare and swap ----
             # The clone-time values go into the WHERE clause, so the check and
             # the write are one statement. Nothing can slip in between them.
@@ -228,6 +240,113 @@ def apply_changeset(
             affected += result.rowcount
 
     return affected
+
+
+def _refuse_cross_tenant_cascade(
+    conn: Connection,
+    diff: RowDiff,
+    key: dict[str, Any],
+    tenant_column: str,
+    tenant_id: Any,
+    references: list[CascadeReference] | None,
+) -> None:
+    """Refuse a write whose referential action would reach another tenant.
+
+    SafeAgentDB scopes the statements it issues. A propagating foreign key makes
+    the database act on further rows itself, and the tenant predicate in our
+    WHERE clause has no bearing on those. So before deleting a referenced row,
+    or changing a referenced column, the referencing rows are counted per tenant
+    inside the same transaction.
+    """
+    if not references:
+        return
+
+    relevant = [r for r in references if r.parent_table == diff.table]
+    if not relevant:
+        return
+
+    old = diff.old or {}
+
+    for reference in relevant:
+        if diff.diff_type == DiffType.DELETE:
+            if not reference.on_delete:
+                continue
+            action = f"ON DELETE {reference.on_delete}"
+        else:
+            # An UPDATE only propagates when it changes a referenced column.
+            if not reference.on_update:
+                continue
+            touched = set(diff.changed_columns()) & set(reference.parent_columns)
+            if not touched:
+                continue
+            action = f"ON UPDATE {reference.on_update}"
+
+        values = [old.get(col) for col in reference.parent_columns]
+        if any(value is None for value in values):
+            continue
+
+        affected = _referencing_tenants(
+            conn, reference, values, tenant_column, tenant_id
+        )
+        if affected is None:
+            continue
+        if affected:
+            tenants = sorted(str(t) for t in affected)
+            raise CascadeError(
+                f"Refusing to {diff.diff_type.value} row {key!r} in "
+                f"'{diff.table}': '{reference.child_table}' references it "
+                f"{action}, so production would also act on "
+                f"{len(affected)} other tenant(s) worth of rows there "
+                f"({tenant_column} in {tenants}). That is outside the tenant "
+                f"scope SafeAgentDB can enforce, so the whole changeset was "
+                f"rolled back.",
+                table=diff.table,
+                referencing_table=reference.child_table,
+                tenants=sorted(affected, key=str),
+                action=action,
+            )
+
+
+def _referencing_tenants(
+    conn: Connection,
+    reference: CascadeReference,
+    values: list[Any],
+    tenant_column: str,
+    tenant_id: Any,
+) -> set[Any] | None:
+    """Tenants other than ours holding rows that reference the given key.
+
+    Returns an empty set when every referencing row is ours, and None when the
+    question cannot be asked -- a child table with no tenant column, where a
+    non-empty result is reported as the sentinel below instead.
+    """
+    child = reference.child_table
+    predicates = " AND ".join(
+        f'"{column}" = :v{index}'
+        for index, column in enumerate(reference.child_columns)
+    )
+    params = {f"v{index}": value for index, value in enumerate(values)}
+
+    # The child table may not be in our metadata at all, so its columns are
+    # read from the database rather than from a Table object.
+    columns = set(
+        conn.exec_driver_sql(f'SELECT * FROM "{child}" WHERE 1=0').keys()
+    )
+
+    if tenant_column not in columns:
+        # No tenant column: any referencing row is outside the sandbox's scope.
+        count = conn.execute(
+            text(f'SELECT COUNT(*) FROM "{child}" WHERE {predicates}'), params
+        ).scalar_one()
+        return {f"<no {tenant_column} column>"} if count else set()
+
+    rows = conn.execute(
+        text(
+            f'SELECT DISTINCT "{tenant_column}" FROM "{child}" WHERE {predicates}'
+        ),
+        params,
+    ).fetchall()
+    return {row[0] for row in rows if row[0] != tenant_id}
 
 
 def _refuse_existing_key(

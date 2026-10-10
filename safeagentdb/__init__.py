@@ -1,6 +1,7 @@
 from safeagentdb.diff import ChangeSet, DiffType, RowDiff
 from safeagentdb.errors import (
     AssignedKey,
+    CascadeError,
     ConflictError,
     ConflictWarning,
     DuplicateRowKeyError,
@@ -18,6 +19,7 @@ from safeagentdb.sandbox import ShadowDB
 
 __all__ = [
     "AssignedKey",
+    "CascadeError",
     "ChangeSet",
     "ConflictError",
     "ConflictWarning",

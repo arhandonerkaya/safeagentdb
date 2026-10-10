@@ -83,6 +83,37 @@ class IntegrityViolationError(SyncError):
         self.row_key = dict(row_key or {})
 
 
+class CascadeError(SyncError):
+    """Raised when a write would reach rows SafeAgentDB never scoped.
+
+    The tenant filter applies to the statements SafeAgentDB issues. A foreign
+    key declared ON DELETE CASCADE, SET NULL or SET DEFAULT makes the database
+    act on further rows by itself, and those rows can belong to another tenant
+    or to a table that was never cloned.
+
+    Attributes:
+        table: The table being written to.
+        referencing_table: The table whose rows the database would also touch.
+        tenants: The other tenants whose rows would be affected.
+        action: The referential action, e.g. "CASCADE".
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        table: str | None = None,
+        referencing_table: str | None = None,
+        tenants: list[Any] | None = None,
+        action: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.table = table
+        self.referencing_table = referencing_table
+        self.tenants = list(tenants or [])
+        self.action = action
+
+
 class DuplicateRowKeyError(SyncError):
     """Raised when a row key does not identify a single row.
 
@@ -192,6 +223,7 @@ class MissingValidatorWarning(UserWarning):
 
 __all__ = [
     "AssignedKey",
+    "CascadeError",
     "ConflictError",
     "DuplicateRowKeyError",
     "ConflictWarning",

@@ -19,9 +19,11 @@ from sqlalchemy.orm import Session
 
 from safeagentdb.diff import ChangeSet, compute_diff
 from safeagentdb.engine import (
+    CascadeReference,
     clone_schema_to_sandbox,
     create_sandbox_engine,
     fetch_rows,
+    find_cascade_references,
     load_rows,
     reflect_tables,
     seed_provisional_keys,
@@ -111,6 +113,7 @@ class ShadowDB:
         self._clone_stats: dict[str, int] = {}
         self._row_keys: dict[str, list[str]] = {}
         self._unsupported: list[str] = []
+        self._cascade_references: list[CascadeReference] = []
         self._generated_columns: dict[str, list[str]] = {}
         self._skipped_conflicts: list[SkippedConflict] = []
         self._assigned_keys: list[AssignedKey] = []
@@ -144,6 +147,16 @@ class ShadowDB:
             )
             self._unsupported = list(
                 self._sandbox_metadata.info.get("unsupported_constraints", [])
+            )
+
+            # Referential actions reach rows no statement of ours names, so
+            # every table in production is inspected, not only the cloned ones.
+            self._cascade_references = find_cascade_references(
+                self.prod_engine,
+                [t.name for t in self._sandbox_metadata.tables.values()],
+            )
+            self._unsupported.extend(
+                reference.describe() for reference in self._cascade_references
             )
             self._generated_columns = dict(
                 self._sandbox_metadata.info.get("generated_columns", {})
@@ -292,6 +305,7 @@ class ShadowDB:
             row_keys=self._row_keys,
             on_conflict=self.on_conflict,
             require_validators=self.require_validators,
+            cascade_references=self._cascade_references,
             skipped=self._skipped_conflicts,
             assigned=self._assigned_keys,
         )
@@ -355,6 +369,15 @@ class ShadowDB:
     def reference_table_names(self) -> list[str]:
         """Tables cloned in full and treated as read-only."""
         return list(self.reference_tables)
+
+    @property
+    def cascade_references(self) -> list[CascadeReference]:
+        """Foreign keys that make production write rows beyond our statements.
+
+        Each one is also described in ``unsupported_constraints``. The commit
+        refuses when the propagated effect would reach another tenant.
+        """
+        return list(self._cascade_references)
 
     @property
     def unsupported_constraints(self) -> list[str]:

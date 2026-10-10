@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import (
@@ -35,6 +36,7 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.types import TypeEngine
@@ -413,6 +415,133 @@ def create_sandbox_engine() -> Engine:
         cursor.close()
 
     return engine
+
+
+# Referential actions that make the database write rows of its own accord.
+_PROPAGATING_ACTIONS = ("CASCADE", "SET NULL", "SET DEFAULT")
+
+
+@dataclass(frozen=True)
+class CascadeReference:
+    """A foreign key that makes production act beyond the statement we issue."""
+
+    child_table: str
+    child_columns: tuple[str, ...]
+    parent_table: str
+    parent_columns: tuple[str, ...]
+    on_delete: str | None
+    on_update: str | None
+    child_in_sandbox: bool
+
+    def describe(self) -> str:
+        actions = []
+        if self.on_delete:
+            actions.append(f"ON DELETE {self.on_delete}")
+        if self.on_update:
+            actions.append(f"ON UPDATE {self.on_update}")
+        scope = (
+            "is part of the sandbox"
+            if self.child_in_sandbox
+            else "was never cloned, so the sandbox cannot see its rows at all"
+        )
+        return (
+            f"{self.parent_table}: {self.child_table}"
+            f"({', '.join(self.child_columns)}) references it "
+            f"{' '.join(actions)} -- writing {self.parent_table} makes production "
+            f"act on {self.child_table} by itself, outside any statement "
+            f"SafeAgentDB issues. {self.child_table} {scope}. The commit checks "
+            f"for affected rows in other tenants and refuses, but the sandbox "
+            f"cannot preview the effect."
+        )
+
+
+def find_cascade_references(
+    source_engine: Engine,
+    parent_tables: Sequence[str],
+) -> list[CascadeReference]:
+    """Foreign keys anywhere in production that propagate into a cloned table.
+
+    Deliberately inspects EVERY table, not only the cloned ones: the dangerous
+    case is a child table nobody asked to sandbox. Uses the inspector rather
+    than full reflection, so this reads metadata and never builds Table objects
+    for the whole schema.
+    """
+    parents = {name for name in parent_tables}
+    if not parents:
+        return []
+
+    inspector = sa_inspect(source_engine)
+    found: list[CascadeReference] = []
+
+    for child in inspector.get_table_names():
+        pragma_actions = _sqlite_referential_actions(source_engine, child)
+
+        for fk in inspector.get_foreign_keys(child):
+            referred = fk.get("referred_table")
+            if referred not in parents:
+                continue
+
+            columns = tuple(fk.get("constrained_columns") or ())
+
+            # PostgreSQL and MySQL report the actions here. SQLite's inspector
+            # leaves options empty, so PRAGMA foreign_key_list fills the gap.
+            options = fk.get("options") or {}
+            on_delete = (options.get("ondelete") or "").upper() or None
+            on_update = (options.get("onupdate") or "").upper() or None
+            if on_delete is None and on_update is None:
+                on_delete, on_update = pragma_actions.get(columns, (None, None))
+
+            on_delete = on_delete if on_delete in _PROPAGATING_ACTIONS else None
+            on_update = on_update if on_update in _PROPAGATING_ACTIONS else None
+            if on_delete is None and on_update is None:
+                continue
+
+            found.append(
+                CascadeReference(
+                    child_table=child,
+                    child_columns=columns,
+                    parent_table=referred,
+                    parent_columns=tuple(fk.get("referred_columns") or ()),
+                    on_delete=on_delete,
+                    on_update=on_update,
+                    child_in_sandbox=child in parents,
+                )
+            )
+
+    return sorted(found, key=lambda r: (r.parent_table, r.child_table, r.child_columns))
+
+
+def _sqlite_referential_actions(
+    source_engine: Engine, table: str
+) -> dict[tuple[str, ...], tuple[str | None, str | None]]:
+    """{constrained columns: (on_delete, on_update)} from SQLite's own pragma.
+
+    SQLAlchemy's SQLite inspector returns an empty ``options`` for every
+    foreign key, so the referential action is invisible there. The pragma
+    reports it. Returns an empty mapping on any other dialect.
+    """
+    if source_engine.dialect.name != "sqlite":
+        return {}
+
+    grouped: dict[int, dict] = {}
+    with source_engine.connect() as conn:
+        rows = conn.exec_driver_sql(
+            f'PRAGMA foreign_key_list("{table}")'
+        ).fetchall()
+
+    for row in rows:
+        fields = ("id", "seq", "table", "from", "to", "on_update", "on_delete")
+        entry = dict(zip(fields, row, strict=False))
+        bucket = grouped.setdefault(entry["id"], {"columns": [], "actions": (None, None)})
+        bucket["columns"].append(entry["from"])
+        bucket["actions"] = (
+            (entry["on_delete"] or "").upper() or None,
+            (entry["on_update"] or "").upper() or None,
+        )
+
+    return {
+        tuple(bucket["columns"]): bucket["actions"] for bucket in grouped.values()
+    }
 
 
 def reflect_tables(
