@@ -654,17 +654,17 @@ class TestStatementOrder:
         with pytest.raises(SchemaError, match="cycle"):
             table_write_order({"a": {"b"}, "b": {"a"}})
 
-    def test_the_integrity_error_does_not_invent_a_cause(self, tmp_path):
-        """IntegrityViolationError used to blame the tenant-scoped clone for
-        every rejection, including ones it could not have caused."""
+    def test_a_dangling_reference_is_caught_in_the_sandbox(self, tmp_path):
+        """With the parent cloned, the sandbox enforces the foreign key itself,
+        so an orphan never reaches the commit at all."""
+        from sqlalchemy.exc import IntegrityError
+
         engine, _ = _prod(
             tmp_path,
-            "fk_message.db",
+            "fk_sandbox.db",
             FK_ORDER_DDL + ["INSERT INTO b_parent VALUES (1, 42, 'parent')"],
         )
         _register_fk_validators()
-
-        from safeagentdb import IntegrityViolationError
 
         with ShadowDB(
             engine,
@@ -672,14 +672,54 @@ class TestStatementOrder:
             tenant_id=42,
             tenant_column="tenant_id",
         ) as sandbox:
-            # References a parent that does not exist anywhere.
-            sandbox.execute(
-                "INSERT INTO a_child (id, tenant_id, parent_id, note) "
-                "VALUES (10, 42, 999, 'orphan')"
-            )
+            with pytest.raises(IntegrityError):
+                sandbox.execute(
+                    "INSERT INTO a_child (id, tenant_id, parent_id, note) "
+                    "VALUES (10, 42, 999, 'orphan')"
+                )
+                sandbox.session.commit()
+
+    def test_the_integrity_error_does_not_invent_a_cause(self, tmp_path):
+        """IntegrityViolationError used to tell every caller the rejection
+        happened "because it holds only this tenant's rows", whatever the real
+        reason was. It now reports what production said and stops there.
+
+        Uses a cross-tenant UNIQUE collision, which the tenant-scoped sandbox
+        genuinely cannot see, so the rejection really does happen at commit.
+        """
+        from safeagentdb import IntegrityViolationError
+
+        engine, _ = _prod(
+            tmp_path,
+            "msg.db",
+            [
+                "CREATE TABLE people (\n"
+                " id INTEGER PRIMARY KEY,\n"
+                " tenant_id INTEGER NOT NULL,\n"
+                " email TEXT NOT NULL UNIQUE\n"
+                ")",
+                "INSERT INTO people VALUES (1, 42, 'mine@x.test')",
+                "INSERT INTO people VALUES (2, 99, 'theirs@x.test')",
+            ],
+        )
+
+        class PersonValidator(SafeModel):
+            __table_name__ = "people"
+            id: int
+            tenant_id: int
+            email: str
+
+        with ShadowDB(
+            engine, tables=["people"], tenant_id=42, tenant_column="tenant_id"
+        ) as sandbox:
+            sandbox.execute("UPDATE people SET email='theirs@x.test' WHERE id=1")
             with pytest.raises(IntegrityViolationError) as excinfo:
                 sandbox.commit_to_production()
 
         message = str(excinfo.value)
-        assert "a_child" in message
-        assert "only this tenant's rows" not in message
+        # Says what production rejected...
+        assert "people" in message
+        assert "UNIQUE constraint failed" in message
+        assert "rolled back" in message
+        # ...without asserting a cause it cannot know.
+        assert "because it holds only this tenant's rows" not in message

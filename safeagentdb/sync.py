@@ -27,6 +27,7 @@ from sqlalchemy import (
     JSON,
     Column,
     Float,
+    ForeignKeyConstraint,
     LargeBinary,
     MetaData,
     Table,
@@ -49,6 +50,7 @@ from safeagentdb.errors import (
     DuplicateRowKeyError,
     GeneratedValueError,
     IntegrityViolationError,
+    SchemaError,
     SkippedConflict,
     SyncError,
 )
@@ -118,7 +120,7 @@ def apply_changeset(
     affected = 0
 
     with engine.begin() as conn:
-        for diff in sorted(changeset.diffs, key=_statement_order):
+        for diff in _order_diffs(changeset, metadata):
             table = metadata.tables.get(diff.table)
             if table is None:
                 raise SyncError(f"Table '{diff.table}' not found in production metadata.")
@@ -457,17 +459,86 @@ def _record_skip(
     )
 
 
-def _statement_order(diff: RowDiff) -> tuple:
-    """Total order over a changeset: table, then row key, then operation.
+def table_write_order(dependencies: dict[str, set[str]]) -> list[str]:
+    """Tables ordered parents first, from {table: tables it references}.
 
-    Two concurrent changesets touching the same rows therefore take them in the
-    same order and cannot deadlock against each other.
+    Kahn's algorithm, with ties broken by name so the result is a deterministic
+    function of the schema. A cycle has no safe order, so it is refused rather
+    than attempted -- guessing would mean emitting a statement production is
+    certain to reject.
     """
-    return (
-        diff.table,
-        tuple(sorted((k, repr(v)) for k, v in (diff.pk or {}).items())),
-        diff.diff_type.value,
-    )
+    remaining = {table: set(deps) & set(dependencies) for table, deps in dependencies.items()}
+    ordered: list[str] = []
+
+    while remaining:
+        ready = sorted(t for t, deps in remaining.items() if not deps)
+        if not ready:
+            cycle = sorted(remaining)
+            raise SchemaError(
+                f"These tables form a foreign-key dependency cycle: {cycle}. "
+                f"There is no order in which they can be written that production "
+                f"would accept, so SafeAgentDB will not guess one. Break the "
+                f"cycle, or commit the tables in separate changesets."
+            )
+        for table in ready:
+            ordered.append(table)
+            del remaining[table]
+        for deps in remaining.values():
+            deps.difference_update(ready)
+
+    return ordered
+
+
+def _dependencies(metadata: MetaData) -> dict[str, set[str]]:
+    """{table: the tables its foreign keys point at}, within this metadata."""
+    known = {table.name for table in metadata.tables.values()}
+    graph: dict[str, set[str]] = {name: set() for name in known}
+
+    for table in metadata.tables.values():
+        for constraint in table.constraints:
+            if not isinstance(constraint, ForeignKeyConstraint):
+                continue
+            for element in constraint.elements:
+                parent = element.target_fullname.rsplit(".", 1)[0]
+                if parent in known and parent != table.name:
+                    graph[table.name].add(parent)
+
+    return graph
+
+
+# DELETEs run first and children before parents; then INSERTs and UPDATEs,
+# parents before children. A row deleted and re-inserted under the same key
+# therefore still goes in the right order.
+_PHASE = {DiffType.DELETE: 0, DiffType.INSERT: 1, DiffType.UPDATE: 2}
+
+
+def _order_diffs(changeset: ChangeSet, metadata: MetaData) -> list[RowDiff]:
+    """The changeset in an order production will accept.
+
+    Alphabetical table order put a child before its parent, so a perfectly
+    valid changeset was rejected by the database. Ordering is now topological
+    on the foreign-key graph, and still a total deterministic function of the
+    changeset, so two concurrent commits take shared rows in the same order and
+    cannot deadlock against each other.
+    """
+    order = table_write_order(_dependencies(metadata))
+    rank = {name: index for index, name in enumerate(order)}
+    depth = len(rank)
+
+    def key(diff: RowDiff) -> tuple:
+        phase = _PHASE[diff.diff_type]
+        position = rank.get(diff.table, depth)
+        # Children before parents when removing, parents first otherwise.
+        if diff.diff_type == DiffType.DELETE:
+            position = depth - position
+        return (
+            phase,
+            position,
+            diff.table,
+            tuple(sorted((k, repr(v)) for k, v in (diff.pk or {}).items())),
+        )
+
+    return sorted(changeset.diffs, key=key)
 
 
 # Types whose equality does not survive a driver round-trip reliably enough to
@@ -553,11 +624,15 @@ def _execute(
     try:
         return conn.execute(stmt)
     except IntegrityError as exc:
+        # Say what production rejected, not why. The reason could be a
+        # constraint whose other side is outside this tenant, or a column the
+        # sandbox had to store differently -- and from here there is no way to
+        # tell which, so claiming one would be a guess the caller then trusts.
         raise IntegrityViolationError(
             f"Production rejected the {diff.diff_type.value} on '{diff.table}' "
-            f"for row {row_key!r}: {_driver_message(exc)}. The sandbox could not "
-            f"catch this because it holds only this tenant's rows. The whole "
-            f"changeset was rolled back.",
+            f"for row {row_key!r}: {_driver_message(exc)}. The whole changeset "
+            f"was rolled back. The sandbox accepted this row, so the rule that "
+            f"rejected it is one the tenant-scoped clone could not evaluate.",
             table=diff.table,
             row_key=row_key,
         ) from exc

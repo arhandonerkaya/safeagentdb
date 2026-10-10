@@ -686,7 +686,10 @@ class TestDatabaseErrorsAreWrapped:
         assert error.table == "users"
         assert error.row_key == {"id": 1}
         assert isinstance(error.__cause__, IntegrityError)
-        assert "only this tenant's rows" in str(error)
+        # Reports what production rejected, and says the sandbox could not
+        # evaluate the rule, without claiming to know which rule it was.
+        assert "UNIQUE constraint failed" in str(error)
+        assert "could not evaluate" in str(error)
 
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT id, email FROM users ORDER BY id")).fetchall()
@@ -999,9 +1002,20 @@ class TestCompareAndSwap:
             assert sandbox.commit_to_production() == 1
 
     def test_statements_run_in_a_deterministic_order(self):
-        """Two changesets touching the same rows take them in the same order."""
-        from safeagentdb.diff import DiffType, RowDiff
-        from safeagentdb.sync import _statement_order
+        """Two changesets touching the same rows take them in the same order.
+
+        Table order is topological now rather than alphabetical, but it is
+        still a total deterministic function of the changeset, which is what
+        the deadlock argument rests on.
+        """
+        from sqlalchemy import Column, Integer, MetaData, Table
+
+        from safeagentdb.diff import ChangeSet, DiffType, RowDiff
+        from safeagentdb.sync import _order_diffs
+
+        meta = MetaData()
+        for name in ("tasks", "users"):
+            Table(name, meta, Column("id", Integer, primary_key=True))
 
         diffs = [
             RowDiff(table="tasks", diff_type=DiffType.UPDATE, pk={"id": 3}),
@@ -1009,15 +1023,25 @@ class TestCompareAndSwap:
             RowDiff(table="tasks", diff_type=DiffType.UPDATE, pk={"id": 1}),
             RowDiff(table="tasks", diff_type=DiffType.DELETE, pk={"id": 2}),
         ]
-        ordered = [(d.table, d.pk["id"]) for d in sorted(diffs, key=_statement_order)]
-        assert ordered == [("tasks", 1), ("tasks", 2), ("tasks", 3), ("users", 1)]
 
-        # The reverse input gives the same order.
-        reversed_order = [
+        forwards = [
             (d.table, d.pk["id"])
-            for d in sorted(list(reversed(diffs)), key=_statement_order)
+            for d in _order_diffs(ChangeSet(diffs=list(diffs)), meta)
         ]
-        assert reversed_order == ordered
+        backwards = [
+            (d.table, d.pk["id"])
+            for d in _order_diffs(ChangeSet(diffs=list(reversed(diffs))), meta)
+        ]
+
+        # The DELETE goes first, then the updates; the reverse input agrees.
+        assert forwards[0] == ("tasks", 2)
+        assert forwards == backwards
+        assert sorted(forwards) == [
+            ("tasks", 1),
+            ("tasks", 2),
+            ("tasks", 3),
+            ("users", 1),
+        ]
 
     def test_a_row_key_matching_several_production_rows_conflicts(self, tmp_path):
         engine, url = _prod(
