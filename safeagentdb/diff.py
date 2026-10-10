@@ -26,6 +26,15 @@ from safeagentdb.errors import SchemaError
 from safeagentdb.models import get_validator, missing_validator_message
 
 _BLOCKED_HEADER = "[BLOCKED] SAFETY ALERT -- INVALID DATA DETECTED"
+_SAFE_HEADER = "[SAFE] AI CHANGES VERIFIED -- SAFE TO COMMIT"
+
+# Two checks genuinely need production objects, so a clean diff cannot promise
+# the commit will succeed. Saying so is the honest version of a green banner.
+_COMMIT_CAVEAT = (
+    "  note: the commit re-checks against production and can still refuse on "
+    "drift since the clone, or on a constraint whose other side is outside "
+    "this tenant."
+)
 
 _OP_STYLES = {
     "INSERT": "bold green",
@@ -308,7 +317,8 @@ class ChangeSet:
 
         if all_valid:
             banner = Panel(
-                "[bold green][SAFE] AI CHANGES VERIFIED -- SAFE TO COMMIT[/bold green]",
+                f"[bold green]{_SAFE_HEADER}[/bold green]\n"
+                f"[dim]{_COMMIT_CAVEAT.strip()}[/dim]",
                 title="[bold green]SAFE[/bold green]",
                 border_style="green",
                 padding=(0, 2),
@@ -448,7 +458,7 @@ class ChangeSet:
         s = self.summary
 
         if all_valid:
-            header = "[SAFE] AI CHANGES VERIFIED -- SAFE TO COMMIT"
+            header = _SAFE_HEADER
         else:
             header = _BLOCKED_HEADER
 
@@ -502,6 +512,8 @@ class ChangeSet:
         verdict = "ALL VALIDATIONS PASSED" if all_valid else "VALIDATION FAILURES DETECTED"
 
         lines = [header]
+        if all_valid:
+            lines.append(_COMMIT_CAVEAT)
         lines.extend(self._plain_blocking_lines())
         lines.extend(self._plain_unsupported_lines())
         lines.extend([
@@ -532,6 +544,39 @@ class ChangeSet:
         lines.extend(f"  - {item}" for item in self.unsupported_constraints)
         lines.append("")
         return lines
+
+
+def tenant_breach(
+    diff: RowDiff, tenant_column: str, tenant_id: Any
+) -> str | None:
+    """The tenant rule, in one place.
+
+    Called by sync.apply_changeset before it writes, and by ShadowDB.diff() so
+    the dashboard reaches the same verdict. A breach used to be invisible until
+    the commit raised.
+    """
+    if diff.diff_type in (DiffType.INSERT, DiffType.UPDATE):
+        row_data = diff.new
+        if row_data is None:
+            return (
+                f"Missing row data for {diff.diff_type.value} on '{diff.table}'."
+            )
+        found = row_data.get(tenant_column)
+        if found != tenant_id:
+            return (
+                f"Tenant breach blocked on {diff.diff_type.value}: row in "
+                f"'{diff.table}' has {tenant_column}={found!r}, expected "
+                f"{tenant_id!r}."
+            )
+        return None
+
+    if diff.old and diff.old.get(tenant_column) != tenant_id:
+        return (
+            f"Tenant breach blocked on DELETE: row in '{diff.table}' belongs "
+            f"to {tenant_column}={diff.old.get(tenant_column)!r}, not "
+            f"{tenant_id!r}."
+        )
+    return None
 
 
 def _is_provisional(value: Any) -> bool:

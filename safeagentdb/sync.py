@@ -39,7 +39,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from safeagentdb.diff import ChangeSet, DiffType, RowDiff
+from safeagentdb.diff import ChangeSet, DiffType, RowDiff, tenant_breach
 from safeagentdb.engine import CascadeReference, convert_row_for_production
 from safeagentdb.errors import (
     AssignedKey,
@@ -124,19 +124,14 @@ def apply_changeset(
                 raise SyncError(f"Table '{diff.table}' not found in production metadata.")
 
             # ---- Gate 1: Tenant guard on row data ----
+            # Same helper ShadowDB.diff() calls, so a breach is visible in the
+            # dashboard rather than only here.
+            breach = tenant_breach(diff, tenant_column, tenant_id)
+            if breach is not None:
+                raise SyncError(breach)
+
             if diff.diff_type in (DiffType.INSERT, DiffType.UPDATE):
                 row_data = diff.new
-                if row_data is None:
-                    raise SyncError(
-                        f"Missing row data for {diff.diff_type.value} on '{diff.table}'."
-                    )
-
-                if row_data.get(tenant_column) != tenant_id:
-                    raise SyncError(
-                        f"Tenant breach blocked on {diff.diff_type.value}: "
-                        f"row has {tenant_column}={row_data.get(tenant_column)!r}, "
-                        f"expected {tenant_id!r}."
-                    )
 
                 # ---- Gate 2: Pydantic validation ----
                 # The SafeModel describes production, so a column the sandbox
@@ -147,13 +142,6 @@ def apply_changeset(
                     diff.logical_row(row_data),
                     require_validator=require_validators,
                 )
-
-            elif diff.diff_type == DiffType.DELETE:
-                if diff.old and diff.old.get(tenant_column) != tenant_id:
-                    raise SyncError(
-                        f"Tenant breach blocked on DELETE: row in '{diff.table}' "
-                        f"belongs to {tenant_column}={diff.old.get(tenant_column)!r}."
-                    )
 
             # ---- Gate 2b: refuse values only production can generate ----
             blocked = diff.blocked_generated_columns()

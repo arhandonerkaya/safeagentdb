@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from safeagentdb.diff import ChangeSet, compute_diff
+from safeagentdb.diff import ChangeSet, compute_diff, tenant_breach
 from safeagentdb.engine import (
     CascadeReference,
     clone_schema_to_sandbox,
@@ -259,7 +259,7 @@ class ShadowDB:
             for name, rows in self._original_snapshot.items()
             if not self._is_reference_table(name)
         }
-        return compute_diff(
+        changeset = compute_diff(
             original,
             tenant_tables,
             self._row_keys,
@@ -269,6 +269,8 @@ class ShadowDB:
             provisional_key_columns=self._provisional_keys,
             converted_columns=self._converted_columns,
         )
+        changeset.blocking_errors.extend(self._preflight_errors(changeset))
+        return changeset
 
     def commit_to_production(self) -> int:
         """Validate and sync all sandbox changes to production atomically.
@@ -426,6 +428,28 @@ class ShadowDB:
                 rows = conn.execute(select(table)).fetchall()
                 snapshot[table_name] = [row._asdict() for row in rows]
         return snapshot
+
+    def _preflight_errors(self, changeset: ChangeSet) -> list[str]:
+        """Everything the commit will refuse that can be known without production.
+
+        The tenant guard used to be commit-only, so diff() showed
+        SAFE TO COMMIT for a row that the commit then rejected. These run
+        through the same helpers sync uses, so the two cannot drift apart.
+
+        Drift and cross-tenant uniqueness stay commit-only -- they need
+        production objects -- which is why the banner says so even when clean.
+        """
+        problems: list[str] = []
+        for diff in changeset.diffs:
+            breach = tenant_breach(diff, self.tenant_column, self.tenant_id)
+            if breach is not None:
+                problems.append(breach)
+            if self._is_reference_table(diff.table):
+                problems.append(
+                    f"Table '{diff.table}' is a reference table and is "
+                    f"read-only; it cannot be part of a changeset."
+                )
+        return problems
 
     def _row_key_problems(
         self, snapshot: dict[str, list[dict[str, Any]]]
