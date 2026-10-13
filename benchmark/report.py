@@ -64,6 +64,27 @@ class Metric:
         }
 
 
+# Above this share of failed agent calls the run tells you nothing about the
+# library, only about the API. The first real run was 100% and read as clean.
+UNUSABLE_AGENT_ERROR_RATE = 0.10
+
+
+def _is_agent_error(record: dict[str, Any]) -> bool:
+    """A record with no SQL to measure.
+
+    Checks the explicit marker and also infers it for raw files written before
+    the marker existed, where an agent failure left both arms untouched.
+    """
+    if record.get("agent_error"):
+        return True
+    if record.get("arm_a") is None or record.get("arm_b") is None:
+        return True
+    agent = record.get("agent") or {}
+    return bool(agent.get("error") or agent.get("refusal")) and not agent.get(
+        "statements"
+    )
+
+
 def _ratio(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
 
@@ -86,7 +107,46 @@ def _db_rejected(record: dict[str, Any]) -> bool:
 
 
 def compute(raw: dict[str, Any]) -> dict[str, Any]:
-    records = raw["records"]
+    all_records = raw["records"]
+    failed = [r for r in all_records if _is_agent_error(r)]
+    records = [r for r in all_records if not _is_agent_error(r)]
+
+    error_rate = _ratio(len(failed), len(all_records)) or 0.0
+    excluded = {
+        "agent_errors": len(failed),
+        "records_total": len(all_records),
+        "records_measured": len(records),
+        "agent_error_rate": error_rate,
+        "unusable": error_rate > UNUSABLE_AGENT_ERROR_RATE,
+        "reasons": sorted(
+            {
+                _first_line(r.get("agent_error") or (r.get("agent") or {}).get("error") or "")
+                for r in failed
+            }
+            - {""}
+        ),
+    }
+
+    if not records:
+        # Nothing measurable. Returning zeroed metrics would look like a result.
+        return {
+            "schema_version": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": raw.get("_source_path"),
+            "dry_run": raw.get("dry_run", False),
+            "agent_config": raw.get("agent_config", {}),
+            "safeagentdb_version": raw.get("safeagentdb_version"),
+            "safeagentdb_commit": raw.get("safeagentdb_commit"),
+            "runs": raw.get("runs"),
+            "task_count": raw.get("task_count"),
+            "excluded": excluded,
+            "metrics": {},
+            "latency": {},
+            "token_usage": {"api_calls": 0},
+            "per_category": {},
+            "per_task": {},
+        }
+
     grouped = _by_run(records)
     run_ids = sorted(grouped)
 
@@ -190,9 +250,15 @@ def compute(raw: dict[str, Any]) -> dict[str, Any]:
         "metrics": {m.key: m.as_dict() for m in metrics},
         "latency": {m.key: m.as_dict() for m in latency},
         "token_usage": usage,
+        "excluded": excluded,
         "per_category": _per_category(records),
         "per_task": _per_task(records),
     }
+
+
+def _first_line(message: str) -> str:
+    flat = " ".join(str(message).split())
+    return flat if len(flat) <= 160 else flat[:157] + "..."
 
 
 def _per_category(records: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
@@ -246,7 +312,15 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines.append("## SafeAgentDB agent benchmark")
     lines.append("")
     lines.append(f"- Model: `{config.get('model', '?')}`")
-    lines.append(f"- Effort: `{config.get('effort')}`  Temperature: `{config.get('temperature')}`")
+    # Older raw files used a single "effort" key that recorded the request, not
+    # what was accepted. New ones separate the two.
+    requested = config.get("effort_requested", config.get("effort"))
+    sent = config.get("effort_sent", config.get("effort"))
+    effort = f"`{sent}` sent" if sent else "not sent"
+    if requested != sent:
+        effort += f" (`{requested}` requested)"
+    temperature = config.get("temperature_sent", config.get("temperature"))
+    lines.append(f"- Effort: {effort}  Temperature: `{temperature}`")
     lines.append(
         f"- SafeAgentDB: `{summary.get('safeagentdb_version')}`"
         f" (commit `{summary.get('safeagentdb_commit')}`)"
@@ -256,6 +330,38 @@ def render_markdown(summary: dict[str, Any]) -> str:
     if summary.get("dry_run"):
         lines.append("- **DRY RUN -- fixed SQL, no model involved. Not a result.**")
     lines.append("")
+
+    excluded = summary.get("excluded") or {}
+    if excluded.get("unusable"):
+        share = (excluded.get("agent_error_rate") or 0.0) * 100
+        lines.append("> ## RESULTS NOT USABLE")
+        lines.append(">")
+        lines.append(
+            f"> **{excluded['agent_errors']} of {excluded['records_total']} agent "
+            f"calls failed ({share:.0f}%).** Above "
+            f"{UNUSABLE_AGENT_ERROR_RATE * 100:.0f}% these figures describe the API, "
+            f"not the library. Fix the cause and re-run before quoting anything "
+            f"below."
+        )
+        for reason in excluded.get("reasons", []):
+            lines.append(">")
+            lines.append(f"> - `{reason}`")
+        lines.append("")
+
+    if excluded.get("agent_errors"):
+        lines.append(
+            f"Excluded from every metric: {excluded['agent_errors']} agent "
+            f"error(s) of {excluded['records_total']} record(s); "
+            f"{excluded['records_measured']} measured."
+        )
+        lines.append("")
+
+    if not summary.get("metrics"):
+        lines.append(
+            "No measurable records, so there are no metrics. Every agent call "
+            "failed."
+        )
+        return "\n".join(lines)
 
     lines.append("| Metric | Mean +/- SD | Denominator per run |")
     lines.append("|---|---|---|")

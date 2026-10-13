@@ -41,7 +41,7 @@ table.
 | Flag | Default | Notes |
 |---|---|---|
 | `--model` | `claude-opus-5-5` | Recorded with the results. |
-| `--effort` | `medium` | `low`–`max`. The depth control on current models. |
+| `--effort` | not sent | `low`–`max`, or `none` to omit it explicitly. **Not sent unless you ask for it:** `claude-haiku-4-5` rejects the parameter with a 400, and a default of `medium` cost a whole 68-call run to discover. The results record what was requested and what was actually sent. |
 | `--temperature` | unset | **Current Claude models reject it with a 400.** Sampling parameters were removed; use `--effort`. Left in because older models still accept it; the harness raises a clear error if the model refuses. |
 | `--runs` | `3` | Repeats of the whole suite. |
 | `--dry-run` | off | Fixed placeholder SQL, no model. Exercises both arms and the auditor. Never a result. |

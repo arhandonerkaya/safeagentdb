@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "safeagentdb"
-version = "0.3.1"
+dynamic = ["version"]
 description = "Shadow-Sandbox DB Layer -- let AI agents modify your database safely with tenant isolation, Pydantic validation, and atomic sync."
 readme = "README.md"
 license = "MIT"
@@ -49,6 +49,11 @@ Issues = "https://github.com/arhandonerkaya/safeagentdb/issues"
 pg = ["psycopg2-binary>=2.9"]
 mysql = ["pymysql>=1.1"]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.hatch.version]
+# One source of truth: the package the benchmark imports is the package
+# whose version gets published.
+path = "safeagentdb/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["safeagentdb"]

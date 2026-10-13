@@ -54,9 +54,19 @@ decided to write. The cost of that choice is that the agent cannot inspect the
 database before writing; see [Limitations](#limitations).
 
 Current Claude models removed sampling parameters, so `temperature` returns a
-400 and `output_config.effort` is the depth control. The harness passes
-temperature only if you set it, and raises a readable error if the model refuses
-it.
+400 and `output_config.effort` is the depth control -- but not on every model:
+`claude-haiku-4-5` rejects `effort` with a 400 too. Neither parameter is sent
+unless you ask for it, `--effort none` omits it explicitly, and the results
+record what was requested alongside what was actually sent. Both raise a
+readable error naming the fix if the model refuses them.
+
+**An agent call that fails is never counted as a result.** The record is marked
+`agent_error`, the console prints `AGENT ERROR: <message>`, both arms are
+skipped, and `report.py` excludes it from every metric while printing how many
+were excluded. Above 10% failures the report leads with RESULTS NOT USABLE and
+computes nothing. If the first three calls fail identically the run stops rather
+than paying for the rest. All of this exists because the first real run spent 68
+calls on the same 400 and printed `A:0v B:0v applied` for every one.
 
 ### The two arms
 
@@ -128,7 +138,7 @@ mine. That is a real limitation, not a solved problem; see below.
 pip install -e .
 pip install -r benchmark/requirements.txt
 export ANTHROPIC_API_KEY=...
-python -m benchmark.run --runs 3 --model claude-opus-5-5 --effort medium
+python -m benchmark.run --runs 3 --model claude-opus-5-5 --effort high
 python -m benchmark.report
 ```
 
@@ -147,7 +157,8 @@ The system prompt — instructions plus schema plus seed rows, about 1.5k tokens
 is identical for every task and marked for caching, so after the first call it
 is a cache read. Per-task input is ~150 tokens. Output dominates the bill
 because thinking is on by default: budget roughly 600–1,000 output tokens per
-call at `--effort medium`, less at `low`, considerably more at `high`.
+call at `--effort medium`, less at `low`, considerably more at `high`. With no
+`--effort` the model's own default applies.
 
 Estimated cost for **68 tasks × 3 runs = 204 calls**, at ~800 output tokens
 each:

@@ -40,6 +40,8 @@ from benchmark import validators  # noqa: F401 -- importing registers the SafeMo
 from benchmark.agent import (
     AgentConfig,
     AgentResult,
+    EffortNotSupported,
+    TemperatureNotSupported,
     assert_no_credential,
     build_client,
     generate_sql,
@@ -54,6 +56,9 @@ REFERENCE_TABLES = ["plans"]
 
 REQUIRED_FIELDS = ("id", "prompt", "tenant_id", "category", "expected", "expected_effect")
 VALID_EXPECTED = ("safe", "unsafe")
+
+# Identical failures at the start of a run mean the rest will fail identically.
+FAIL_FAST_AFTER = 3
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +213,22 @@ def _row_counts(db_path: Path) -> dict[str, int]:
         conn.close()
 
 
+class AgentFailing(RuntimeError):
+    """Raised to stop a run whose opening agent calls all fail the same way.
+
+    The first real run spent 68 calls on an error the first one already showed.
+    """
+
+
+def _agent_failure(agent: AgentResult) -> str | None:
+    """A short reason this call produced no SQL, or None if it worked."""
+    if agent.error:
+        return agent.error
+    if agent.refusal:
+        return f"model refused ({agent.refusal})"
+    return None
+
+
 def run_once(
     tasks: list[dict[str, Any]],
     config: AgentConfig,
@@ -219,6 +240,7 @@ def run_once(
     baseline = build(workdir / "seed.db")
     client = None if dry_run else build_client()
     records: list[dict[str, Any]] = []
+    opening_failures: list[str] = []
 
     for task in tasks:
         tenant_id = int(task.get("tenant_id", TENANT_A))
@@ -230,6 +252,47 @@ def run_once(
             )
         else:
             agent = generate_sql(client, config, task["prompt"], tenant_id)
+
+        failure = _agent_failure(agent)
+        status = "unsafe" if task["expected"] == "unsafe" else "safe "
+
+        if failure is not None:
+            # No SQL means nothing to measure. Running the arms anyway produced
+            # "A:0v B:0v applied" -- indistinguishable from a clean task, which
+            # is how 68 failed calls looked like a successful run.
+            records.append(
+                {
+                    "run": run_index,
+                    "task_id": task["id"],
+                    "category": task["category"],
+                    "expected": task["expected"],
+                    "expected_effect": task["expected_effect"],
+                    "tenant_id": tenant_id,
+                    "agent_error": failure,
+                    "agent": agent.as_dict(),
+                    "arm_a": None,
+                    "arm_b": None,
+                }
+            )
+            print(
+                f"  run {run_index} {task['id']:<28} {status} "
+                f"AGENT ERROR: {_short(failure)}"
+            )
+
+            # Fail fast: three identical failures at the start means the rest of
+            # the suite will fail the same way and cost the same money.
+            if len(records) == len(opening_failures) + 1:
+                opening_failures.append(failure)
+                if len(opening_failures) >= FAIL_FAST_AFTER and len(
+                    set(opening_failures)
+                ) == 1:
+                    raise AgentFailing(
+                        f"The first {FAIL_FAST_AFTER} agent calls all failed with "
+                        f"the same error, so the remaining "
+                        f"{len(tasks) - len(records)} would too. Stopping before "
+                        f"they are paid for.\n\n  {failure}"
+                    )
+            continue
 
         db_a = copy(baseline, workdir / f"run{run_index}-{task['id']}-a.db")
         db_b = copy(baseline, workdir / f"run{run_index}-{task['id']}-b.db")
@@ -248,6 +311,7 @@ def run_once(
                 "expected": task["expected"],
                 "expected_effect": task["expected_effect"],
                 "tenant_id": tenant_id,
+                "agent_error": None,
                 "agent": agent.as_dict(),
                 "arm_a": {
                     **arm_a,
@@ -262,7 +326,6 @@ def run_once(
             }
         )
 
-        status = "unsafe" if task["expected"] == "unsafe" else "safe "
         print(
             f"  run {run_index} {task['id']:<28} {status} "
             f"A:{len(violations_a)}v {'ERR' if arm_a['error'] else '   '} "
@@ -272,6 +335,12 @@ def run_once(
     return records
 
 
+def _short(message: str, limit: int = 90) -> str:
+    """One line, trimmed, so a console row stays readable."""
+    flat = " ".join(str(message).split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", default="benchmark/tasks.yaml")
@@ -279,8 +348,12 @@ def main() -> None:
     parser.add_argument("--model", default=AgentConfig.model)
     parser.add_argument(
         "--effort",
-        default=AgentConfig.effort,
-        help="low | medium | high | xhigh | max (recorded with the results)",
+        default=None,
+        help=(
+            "low | medium | high | xhigh | max, or 'none' to omit the parameter. "
+            "Omitted entirely unless asked for: not every model accepts it "
+            "(Haiku 4.5 rejects it with a 400). Recorded with the results."
+        ),
     )
     parser.add_argument(
         "--temperature",
@@ -327,10 +400,15 @@ def main() -> None:
     )
 
     records: list[dict[str, Any]] = []
-    for run_index in range(1, args.runs + 1):
-        records += run_once(
-            tasks, config, workdir, dry_run=args.dry_run, run_index=run_index
-        )
+    stopped_early: str | None = None
+    try:
+        for run_index in range(1, args.runs + 1):
+            records += run_once(
+                tasks, config, workdir, dry_run=args.dry_run, run_index=run_index
+            )
+    except (AgentFailing, TemperatureNotSupported, EffortNotSupported) as exc:
+        stopped_early = str(exc)
+        print(f"\nSTOPPED: {exc}")
 
     finished = datetime.now(timezone.utc)
     raw = {
@@ -342,6 +420,8 @@ def main() -> None:
         "task_file": str(args.tasks),
         "task_count": len(tasks),
         "agent_config": config.as_dict(),
+        "stopped_early": stopped_early,
+        "agent_errors": sum(1 for r in records if r.get("agent_error")),
         "safeagentdb_version": _library_version(),
         "safeagentdb_commit": _library_commit(),
         "records": records,
@@ -355,25 +435,48 @@ def main() -> None:
     assert_no_credential(serialized)
     out.write_text(serialized, encoding="utf-8")
 
+    failed = raw["agent_errors"]
+    if failed:
+        print(
+            f"\n{failed} of {len(records)} agent call(s) failed and were "
+            f"recorded as agent_error. They are excluded from every metric."
+        )
+
     print(f"\nraw results -> {out}")
     print(f"now run:  python -m benchmark.report --raw {out}")
 
+    if stopped_early or (records and failed == len(records)):
+        raise SystemExit(1)
+
 
 def _library_version() -> str:
-    """The version of the safeagentdb that is actually imported.
+    """The version of the safeagentdb that was actually imported.
 
-    Read from the package rather than from pyproject.toml: a pip-installed copy
-    shadowing the working tree is exactly the mix-up this is here to surface.
+    importlib.metadata reads the *installed distribution*, which a stale
+    editable install makes a lie: the first real run recorded 0.2.0 while the
+    0.3.0 working tree was the code under test. safeagentdb.__version__ lives in
+    the package that got imported, so it cannot drift from it. The installed
+    metadata is still reported when it disagrees, because a mismatch is worth
+    seeing.
     """
     import safeagentdb
+
+    actual = getattr(safeagentdb, "__version__", "unknown")
+    location = Path(safeagentdb.__file__).parent
 
     try:
         from importlib.metadata import version
 
         installed = version("safeagentdb")
-    except Exception:  # noqa: BLE001 -- editable install without metadata
-        installed = "unknown"
-    return f"{installed} from {Path(safeagentdb.__file__).parent}"
+    except Exception:  # noqa: BLE001 -- not installed at all
+        installed = None
+
+    if installed and installed != actual:
+        return (
+            f"{actual} from {location} "
+            f"(installed distribution metadata says {installed}; stale)"
+        )
+    return f"{actual} from {location}"
 
 
 def _library_commit() -> str:

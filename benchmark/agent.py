@@ -39,8 +39,12 @@ _CREDENTIAL_PATTERN = re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}")
 REDACTED = "[redacted]"
 
 DEFAULT_MODEL = "claude-opus-5-5"
-DEFAULT_EFFORT = "medium"
 DEFAULT_MAX_TOKENS = 16000
+
+# Not every model accepts output_config.effort -- Haiku 4.5 rejects it with a
+# 400 -- so it is sent only when asked for. A default of "medium" cost a whole
+# 68-task run to find that out.
+OMIT_EFFORT = "none"
 
 TOOL_NAME = "submit_sql"
 
@@ -103,15 +107,27 @@ class AgentConfig:
     """Everything that could change the agent's output, recorded with results."""
 
     model: str = DEFAULT_MODEL
-    effort: str | None = DEFAULT_EFFORT
+    effort: str | None = None
     temperature: float | None = None
     max_tokens: int = DEFAULT_MAX_TOKENS
 
+    @property
+    def sends_effort(self) -> bool:
+        """Whether output_config.effort goes on the request at all."""
+        return bool(self.effort) and self.effort != OMIT_EFFORT
+
     def as_dict(self) -> dict[str, Any]:
+        """What was asked for and what was actually sent, recorded separately.
+
+        The results file previously said effort=medium for a run in which every
+        request was rejected for sending it, which read as though the parameter
+        had been accepted.
+        """
         return {
             "model": self.model,
-            "effort": self.effort,
-            "temperature": self.temperature,
+            "effort_requested": self.effort,
+            "effort_sent": self.effort if self.sends_effort else None,
+            "temperature_sent": self.temperature,
             "max_tokens": self.max_tokens,
         }
 
@@ -148,6 +164,10 @@ class AgentResult:
 
 class TemperatureNotSupported(RuntimeError):
     """Raised when the chosen model rejects an explicit temperature."""
+
+
+class EffortNotSupported(RuntimeError):
+    """Raised when the chosen model rejects output_config.effort."""
 
 
 def redact(text: str | None) -> str | None:
@@ -239,7 +259,7 @@ def generate_sql(
         "tool_choice": {"type": "auto"},
     }
 
-    if config.effort:
+    if config.sends_effort:
         request["output_config"] = {"effort": config.effort}
     if config.temperature is not None:
         request["temperature"] = config.temperature
@@ -251,6 +271,13 @@ def generate_sql(
     except anthropic.BadRequestError as exc:
         result.seconds = time.perf_counter() - started
         message = redact(str(exc))
+        if "effort" in message.lower() and config.sends_effort:
+            raise EffortNotSupported(
+                f"{config.model} rejected the effort parameter. Not every model "
+                f"accepts output_config.effort -- Haiku 4.5 does not. Re-run with "
+                f"--effort {OMIT_EFFORT} to omit it, or choose a model that "
+                f"supports it. Original error: {message}"
+            ) from exc
         if "temperature" in message.lower():
             raise TemperatureNotSupported(
                 f"{config.model} rejected an explicit temperature. Sampling "
@@ -306,7 +333,7 @@ def main() -> None:
     parser.add_argument("--tasks", default="benchmark/tasks.yaml")
     parser.add_argument("--task-id", help="which task to run; default is the first")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--effort", default=DEFAULT_EFFORT)
+    parser.add_argument("--effort", default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     args = parser.parse_args()
