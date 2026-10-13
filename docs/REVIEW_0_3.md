@@ -19,6 +19,44 @@ the agent might reach another tenant's rows). The claims audit below found no
 reproduced finding that crosses the tenant boundary, but that is not the same as
 having looked for one.
 
+## Status after the fixes
+
+Added after the review, on `hardening-2`. Each finding's reproduction became a
+test in `tests/test_review_0_3.py` that failed first, then was fixed; the
+server-dependent findings also have PostgreSQL tests in
+`tests/test_server_backed.py`. The reproduction scripts below are kept exactly
+as they were run, so a few now stop on the new, intended errors (for example
+`p3a/a1_api_usage.py` step 6, `diff()` after a commit, now raises `UsageError`).
+
+| ID | Status | Resolution |
+|----|--------|------------|
+| P1-1 | Fixed | Key changes are logged by `TEMP` triggers in the sandbox and refused in `diff()` and at commit. Independently, a referential action on rows the diff does not show raises `CascadeError` unless `allow_cascades=True`. |
+| P1-2 | Fixed | Unit-of-work order: INSERTs parents first, UPDATEs, DELETEs children first; rows ordered by their references. |
+| P1-3 | Fixed | Change detection and `changed_columns()` use a type-tagged canonical form. |
+| P1-4 | Fixed (SQLite) | Referential actions read from `PRAGMA foreign_key_list` and carried into the sandbox. |
+| P1-5 | Fixed | Generated keys tracked, not detected by value. |
+| P1-6 | Fixed | Type-tagged fingerprint; bind-time errors wrapped. |
+| P2-1 | Fixed (SQLite, by exclusion) | `DATETIME`, `DATE`, `TIME`, `BOOLEAN` left out of the guard on SQLite production; documented as a known limit. A conflict with no drifted column no longer blames another writer. |
+| P2-2 | Fixed | JSON values held as their JSON encoding, scalars included. |
+| P2-3 | Fixed | Datetimes held as ISO 8601 text with their offset; SQLite production read and written as text; `timestamptz` tested on PostgreSQL. |
+| A1 | Fixed | `SchemaError`, driver error as `__cause__`. |
+| A2 | Fixed | Every database error during a commit is a `SyncError`. |
+| A3 | Fixed | See P1-6. |
+| A4 | Fixed | Agent DDL raises `SchemaError` from `diff()` and the commit. |
+| A5 | Fixed | `AgentSQLError`; no bind parsing without `params`; `Decimal` supported. |
+| A6 | Fixed | `UsageError` (also a `RuntimeError`); commit-time validation is `RowValidationError`. |
+| B1 | Fixed | `tenant_id` normalised to the tenant column's type at `__enter__`. |
+| B2 | Fixed | See P1-2; a real row cycle is refused in `diff()`. |
+| B3–B6, B8 | Fixed | Aliases, resolved with their targets. |
+| B7 | Fixed | Every failing field with pydantic's reason and the value. |
+| C1 | Fixed | `diff()` after a commit raises `UsageError`. |
+| C2 | Fixed | Entering an open sandbox raises `UsageError` and leaves it intact. |
+| C3 | Fixed, documented | Re-entry allowed until a commit, refused after. |
+| Suspected: MySQL cascade quoting | Fixed | Cascade check built from SQLAlchemy Core. |
+| Suspected: MySQL `TINYINT` | Fixed | Mapped to an integer. |
+| Suspected: custom `row_key` with a generated PK | Fixed | Refused with a message naming the re-insert. |
+| Suspected: P1-1/P1-2 and `timestamptz` on PostgreSQL | Tested | Covered by the server-backed suite. |
+
 ## Running the reproductions
 
 ```bash

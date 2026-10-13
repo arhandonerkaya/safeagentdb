@@ -5,17 +5,80 @@ All notable changes to SafeAgentDB are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-10-10
+## [0.3.0] - 2026-10-13
 
-A second safety release. An independent review of 0.2.0 found six further
-issues; all six were reproduced against the published package before anything
-was changed, and each is written up in [docs/AUDIT.md](docs/AUDIT.md) with a
-failing-first test in `tests/test_review_findings.py`.
+A second safety release, built from two reviews.
 
-Two of them could destroy or leak production data silently, so upgrade if you
-use a custom `row_key` or have cascading foreign keys.
+An independent review of 0.2.0 found six issues; all six were reproduced
+against the published package before anything was changed, and each is written
+up in [docs/AUDIT.md](docs/AUDIT.md) with a failing-first test in
+`tests/test_review_findings.py`.
 
-### Breaking changes
+A pre-release review of 0.3.0 itself found 20 more
+([docs/REVIEW_0_3.md](docs/REVIEW_0_3.md)), each with a runnable reproduction in
+`docs/review-repros/`. Every reproduction became a failing test in
+`tests/test_review_0_3.py` before it was fixed, and the server-dependent ones
+also run against PostgreSQL in `tests/test_server_backed.py`. The rule applied
+throughout: where emulating database semantics correctly is hard, refuse
+clearly rather than write something other than what was reviewed.
+
+Several of these could destroy or misstate production data silently, so
+upgrade if you use a custom `row_key`, have cascading foreign keys, change
+primary keys, or store JSON or time-zoned timestamps.
+
+**Supported databases are now stated plainly:** PostgreSQL is the first-class
+production target, tested in CI. SQLite production is best-effort, with its
+known limits documented in the README. MySQL is untested.
+
+### Breaking changes (pre-0.3.0 review)
+
+- **A row key changed with `UPDATE` is refused.** It used to be committed as a
+  `DELETE` plus an `INSERT`, which ran production's `ON DELETE` actions instead
+  of `ON UPDATE` ones: a routine key change deleted the tenant's child rows
+  behind a SAFE banner. It is now a blocking error in `diff()` and a `SyncError`
+  at commit. Change keys through the application.
+- **A referential action on rows the diff does not show is refused by
+  default.** A `DELETE` (or an `UPDATE` of a referenced column) that would make
+  production run `CASCADE`, `SET NULL` or `SET DEFAULT` on existing rows raises
+  `CascadeError`, even when those rows belong to the acting tenant. Pass
+  `ShadowDB(..., allow_cascades=True)` to allow it within the tenant. A cascade
+  the diff already shows, because the child table is cloned, needs no opt-in.
+- **Statement order is unit-of-work order**: INSERTs parents first, then
+  UPDATEs, then DELETEs children first, with rows ordered by their references.
+  DELETEs used to run first, so re-pointing a child and then deleting its old
+  parent never committed. A cycle between tables is no longer refused outright;
+  only rows that really reference each other in a cycle are.
+- **`commit_to_production()` raises `RowValidationError`** (a `SyncError`) for a
+  row that fails its `SafeModel`, instead of pydantic's `ValidationError`, which
+  is kept as `__cause__`. `except pydantic.ValidationError` around a commit
+  must become `except RowValidationError`. `safeagentdb.models.validate_row()`
+  still raises pydantic's error.
+- **`execute()` and `query()` raise `AgentSQLError`** for a failing statement,
+  instead of the raw SQLAlchemy error (kept as `__cause__`). `query()` on a
+  statement that returns no rows raises it too.
+- **`execute()` without `params` sends the SQL to SQLite as written**, with no
+  `text()` bind-parameter parsing, so `'{"a":1}'` is a literal. With `params`
+  it still uses `text()`.
+- **Misuse raises `UsageError`**, which subclasses `RuntimeError` (what most of
+  these cases raised before). A bad `on_conflict` used to raise `ValueError`,
+  and `changeset=` that is not a `ChangeSet` raised `AttributeError`. New
+  `UsageError` cases: `diff()` after a successful commit, entering a sandbox
+  that is open, and entering one that has committed.
+- **JSON values are held as their JSON encoding in the sandbox**, scalars
+  included. Text an agent writes into a JSON column must be JSON (`'"hello"'`
+  for a string); text that is not is refused, where it used to be written as a
+  string.
+- **Datetimes are held as ISO 8601 text in the sandbox**, keeping a UTC offset.
+  `RowDiff.old`/`new` hold that text; `RowDiff.logical_row()` gives the
+  `datetime`.
+- **`tenant_id` is converted to the tenant column's type at `__enter__`**, so
+  `ShadowDB.tenant_id` may differ from what you passed (`"42"` becomes `42`). A
+  value that does not convert exactly raises `UsageError`.
+- **On a SQLite production, `DATETIME`, `DATE`, `TIME` and `BOOLEAN` columns are
+  no longer part of the compare-and-swap guard**, so a concurrent edit confined
+  to one is not detected there.
+
+### Breaking changes (second review)
 
 - **`ChangeSet.is_valid` is stricter.** A tenant breach, a row key that no
   longer identifies a single row, or a write to a reference table now make it
@@ -62,9 +125,72 @@ use a custom `row_key` or have cascading foreign keys.
 - `sync.table_write_order()`, the topological table sort, which raises on a
   dependency cycle.
 - Eight more server-backed tests, bringing that suite to 20 against PostgreSQL
-  in CI. 208 local tests.
+  in CI.
+- From the pre-0.3.0 review: `ShadowDB(allow_cascades=...)`; `AgentSQLError`,
+  `RowValidationError` and `UsageError`; `ChangeSet.blocking_errors` entries for
+  key changes and row cycles; `diff.canonical_value()`, the type-tagged form
+  behind change detection and the fingerprint; `models.format_validation_error()`.
+  72 tests in `tests/test_review_0_3.py` and 9 more server-backed tests: 280
+  local tests and 29 against PostgreSQL.
 
-### Fixed
+### Fixed (pre-0.3.0 review)
+
+Ids refer to [docs/REVIEW_0_3.md](docs/REVIEW_0_3.md).
+
+- **P1-1** A primary-key change was committed as `DELETE` + `INSERT`. Refused,
+  and same-tenant referential actions need `allow_cascades=True` (see above).
+- **P1-2 / B2 / B3** All DELETEs ran before any UPDATE, and a self-referencing
+  table was written in key order, so valid changesets failed with messages that
+  blamed a concurrent writer or a rule the sandbox "could not evaluate". Now
+  unit-of-work order with row-level ordering, and neither message is used for
+  an ordering failure.
+- **P1-3** A JSON change Python considers equal (`1` to `true`) was shown as an
+  UPDATE and never written, and a formatting-only rewrite showed as an empty
+  UPDATE. Changes are compared in a type-tagged canonical form.
+- **P1-4** With SQLite production the sandbox dropped `ON DELETE`/`ON UPDATE`
+  actions, refusing deletes production accepts. They are read from
+  `PRAGMA foreign_key_list` and carried into the sandbox.
+- **P1-5 / B5** Any integer at or above 2^52 in any column was treated as a
+  placeholder key. Generated keys are now tracked; only keys the sandbox
+  generated are placeholders. Also fixed: a row deleted and re-inserted under a
+  custom `row_key` could write a placeholder into a real id.
+- **P1-6 / A3** The fingerprint collided across value types, and a bind-time
+  error at commit escaped as a raw `StatementError`. Type-tagged fingerprint;
+  every commit error is wrapped.
+- **P2-1 / B6** False `ConflictError` on a SQLite production for a datetime or
+  boolean stored in another text format, blaming a writer that did not exist.
+  Those types are left out of the guard on SQLite, and a conflict with no
+  drifted column no longer claims another writer.
+- **P2-2** JSON scalars changed type in the sandbox (`"123"` became `123`,
+  `true` became `1`, `"null"` became `null`).
+- **P2-3** A datetime's UTC offset was dropped in the sandbox and written back
+  without it. Offsets survive, including PostgreSQL `timestamptz`.
+- **A1** Errors while `__enter__` read the schema (unknown table, unreachable
+  database) escaped unwrapped. They are `SchemaError` now -- which the entry
+  below already claimed for this release, and is now true.
+- **A2** Commit-time database errors were wrapped only for some changesets.
+  Every database error during a commit is a `SyncError`.
+- **A4** Schema changes by the agent made `diff()` and the commit fail with raw
+  driver errors. They raise `SchemaError`.
+- **A5** `execute()`/`query()` failed on valid input (`Decimal` parameters,
+  `'{"a":1}'` literals) and passed driver errors through.
+- **A6** Misuse raised plain `RuntimeError`/`ValueError`/`AttributeError`.
+- **B1** A string `tenant_id` for an integer column made every write a "tenant
+  breach".
+- **B4** An error named a `DELETE` the agent never issued (the P1-1 key change).
+- **B7** The validation message named only the field; it now gives every
+  failing field, pydantic's reason and the value.
+- **B8 / C1** `diff()` after a commit showed the committed changes as SAFE TO
+  COMMIT.
+- **C2** Entering an open sandbox discarded the agent's work and leaked the
+  engine.
+- **C3** Re-entering a committed sandbox opened one that could never commit.
+  Re-entry is now documented: allowed until a commit, refused after.
+- The cascade check is built from SQLAlchemy Core rather than f-string SQL, so
+  it no longer double-quotes identifiers (suspected to fail on MySQL).
+- MySQL `TINYINT` is an integer in the sandbox, not a string.
+
+### Fixed (second review)
 
 - **A duplicate custom row key overwrote a production row.** Two sandbox rows
   sharing a `row_key` were folded into one diff entry by a dict comprehension,
@@ -90,8 +216,9 @@ use a custom `row_key` or have cascading foreign keys.
 - **The changeset a reviewer approved was not necessarily the one committed.**
   See `commit_to_production(changeset=...)` above.
 - **Statement order ignored foreign-key dependencies**, so a child could be
-  inserted before its parent and rejected. Ordering is topological now, and a
-  cycle raises `SchemaError` rather than being attempted.
+  inserted before its parent and rejected. Ordering follows foreign keys now
+  (refined to row level by the pre-0.3.0 review, above), and rows that
+  reference each other in a cycle are refused rather than attempted.
 
 ## [0.2.0] - 2026-09-20
 
