@@ -118,9 +118,9 @@ another finding are marked *alias*.
 
 **Code path.** `compute_diff()` keys rows on the primary key, so
 `UPDATE parent SET id = 5 WHERE id = 1` becomes a DELETE of key 1 and an INSERT
-of key 5 ([diff.py:688-712](../safeagentdb/diff.py#L688-L712)). At commit,
+of key 5 ([diff.py:688-712](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L688-L712)). At commit,
 `_refuse_cross_tenant_cascade()` allows a cascade confined to the acting tenant
-([sync.py:319](../safeagentdb/sync.py#L319)), and production runs a real DELETE,
+([sync.py:319](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L319)), and production runs a real DELETE,
 firing the child's `ON DELETE` action. The `ON UPDATE` action the agent's
 statement would have triggered never runs.
 
@@ -151,7 +151,7 @@ action is `RESTRICT`, a legal change cannot be committed at all.
 ### P1-2 · High · All DELETEs run before any UPDATE
 
 **Code path.** `_PHASE = {DELETE: 0, INSERT: 1, UPDATE: 2}` in
-`_order_diffs()` ([sync.py:544-573](../safeagentdb/sync.py#L544-L573)). The
+`_order_diffs()` ([sync.py:544-573](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L544-L573)). The
 topological fix for finding 10 orders tables within a phase, but nothing orders
 an UPDATE ahead of a DELETE that depends on it.
 
@@ -185,11 +185,11 @@ destroyed.
 ### P1-3 · Medium · A JSON change Python considers equal is never written
 
 **Code path.** `compute_diff()` detects a changed row by comparing raw sandbox
-text ([diff.py:715](../safeagentdb/diff.py#L715)); `changed_columns()` compares
+text ([diff.py:715](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L715)); `changed_columns()` compares
 parsed JSON with `==`, where `1 == True == 1.0`
-([diff.py:99-101](../safeagentdb/diff.py#L99-L101)). With no changed columns,
+([diff.py:99-101](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L99-L101)). With no changed columns,
 sync reaches `continue` and writes nothing
-([sync.py:219-220](../safeagentdb/sync.py#L219-L220)).
+([sync.py:219-220](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L219-L220)).
 
 **Repro.** [p1/f4_json_logical_equality.py](review-repros/p1/f4_json_logical_equality.py)
 
@@ -208,10 +208,10 @@ formatting-only rewrite shows up as an update with nothing in it.
 ### P1-4 · Medium · With SQLite production, the sandbox drops FK referential actions
 
 **Code path.** The sandbox is built with `table.to_metadata()` from reflection
-([engine.py:669](../safeagentdb/engine.py#L669)). SQLAlchemy's SQLite inspector
+([engine.py:669](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L669)). SQLAlchemy's SQLite inspector
 does not report `ON DELETE`/`ON UPDATE`. `find_cascade_references()` works around
 this with `PRAGMA foreign_key_list`
-([engine.py:563-569](../safeagentdb/engine.py#L563-L569)), but nothing applies the
+([engine.py:563-569](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L563-L569)), but nothing applies the
 actions to the sandbox's own foreign keys, and the loss is not listed in
 `unsupported_constraints`.
 
@@ -236,8 +236,8 @@ the child table is cloned.
 ### P1-5 · Medium · Any integer ≥ 2^52 is treated as a placeholder key
 
 **Code path.** `provisional_reference_columns()`
-([diff.py:152-167](../safeagentdb/diff.py#L152-L167)) decides by value alone
-(`_is_provisional`, [diff.py:614-620](../safeagentdb/diff.py#L614-L620)). It runs
+([diff.py:152-167](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L152-L167)) decides by value alone
+(`_is_provisional`, [diff.py:614-620](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L614-L620)). It runs
 on UPDATEs as well as INSERTs, over every column, whether or not the table has a
 provisional key.
 
@@ -259,9 +259,9 @@ cause that does not apply.
 ### P1-6 · Low · The fingerprint collides across types; the commit then escapes the hierarchy
 
 **Code path.** `ChangeSet.fingerprint` serialises values with
-`json.dumps(..., default=str)` ([diff.py:261-272](../safeagentdb/diff.py#L261-L272)).
+`json.dumps(..., default=str)` ([diff.py:261-272](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L261-L272)).
 `_execute()` catches only `IntegrityError` and `DBAPIError`
-([sync.py:656-676](../safeagentdb/sync.py#L656-L676)), so a bind-time error
+([sync.py:656-676](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L656-L676)), so a bind-time error
 arrives as a raw `StatementError`. (This is also A3.)
 
 **Repro.** [p1/f6_fingerprint_type_collision.py](review-repros/p1/f6_fingerprint_type_collision.py):
@@ -285,12 +285,12 @@ lands. The failure gets past `except SafeAgentDBError`.
 ### P2-1 · High · False `ConflictError` when a value is stored in another text format
 
 **Code path.** `_guard_columns()` treats `DateTime` and `Boolean` as safe to
-compare ([sync.py:594-628](../safeagentdb/sync.py#L594-L628)). `_matches()`
+compare ([sync.py:594-628](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L594-L628)). `_matches()`
 binds the clone-time Python value through the production column type, so the
 WHERE clause compares `'2024-01-01 10:00:00.000000'` or `1` with the stored text,
 and SQLite compares text literally. `_diagnose_conflict()` re-reads the row,
 finds the Python values equal, and reports a generic "changed in production"
-with no column named ([sync.py:728-736](../safeagentdb/sync.py#L728-L736)).
+with no column named ([sync.py:728-736](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L728-L736)).
 
 **Repro.** [p2/t1_untouched_and_delete.py](review-repros/p2/t1_untouched_and_delete.py)
 (DELETE) and [p2/t2_changed_values.py](review-repros/p2/t2_changed_values.py)
@@ -314,10 +314,10 @@ the rows are skipped with a misleading warning.
 ### P2-2 · Medium · JSON scalars change type in the sandbox
 
 **Code path.** `to_sandbox_value()` leaves any value SQLite can bind as it is
-([engine.py:103-104](../safeagentdb/engine.py#L103-L104)): the JSON string `"123"`
+([engine.py:103-104](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L103-L104)): the JSON string `"123"`
 arrives as the plain text `123`, and JSON `true` as `1` (`bool` is an `int`).
 `to_production_value()` runs `json.loads` on every string
-([engine.py:114-119](../safeagentdb/engine.py#L114-L119)), turning `'123'` into
+([engine.py:114-119](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L114-L119)), turning `'123'` into
 `123` and `'null'` into `None`. The same helper feeds `RowDiff.logical_row()`,
 so validation and the commit both see the wrong type.
 
@@ -348,7 +348,7 @@ legitimate edits to unrelated columns of the same row.
 
 **Code path.** `fetch_rows()` reads through the reflected `DATETIME` type, which
 parses `+02:00`/`Z` and discards the offset
-([engine.py:722-724](../safeagentdb/engine.py#L722-L724)). The sandbox holds a
+([engine.py:722-724](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L722-L724)). The sandbox holds a
 naive time, and a naive time is what is written back.
 
 **Repro.** [p2/t4_tz.py](review-repros/p2/t4_tz.py) and
@@ -377,7 +377,7 @@ All from [p3a/e1_escapes.py](review-repros/p3a/e1_escapes.py) unless stated.
 #### A1 · Medium · Errors raised while `__enter__` reads the schema are not wrapped
 
 **Code path.** `reflect_tables()` runs at
-[sandbox.py:130-132](../safeagentdb/sandbox.py#L130-L132), before the `try`
+[sandbox.py:130-132](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L130-L132), before the `try`
 that converts `SQLAlchemyError` into `SchemaError`. The CHANGELOG says "any
 `SQLAlchemyError` during `__enter__` is now wrapped in `SchemaError`".
 
@@ -393,13 +393,13 @@ unreachable database, get past `except SafeAgentDBError`.
 #### A2 · Medium · Commit-time database errors are wrapped only for some changesets
 
 **Code path.** Only statements sent through `_execute()` are wrapped
-([sync.py:644-676](../safeagentdb/sync.py#L644-L676)). These go straight to
+([sync.py:644-676](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L644-L676)). These go straight to
 `conn.execute` and are not:
 
-- `engine.begin()` ([sync.py:123](../safeagentdb/sync.py#L123))
-- `_refuse_existing_key()` ([sync.py:425](../safeagentdb/sync.py#L425)), before every INSERT
-- `_referencing_rows()` ([sync.py:369-384](../safeagentdb/sync.py#L369-L384)), the cascade check
-- `_diagnose_conflict()` ([sync.py:702](../safeagentdb/sync.py#L702))
+- `engine.begin()` ([sync.py:123](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L123))
+- `_refuse_existing_key()` ([sync.py:425](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L425)), before every INSERT
+- `_referencing_rows()` ([sync.py:369-384](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L369-L384)), the cascade check
+- `_diagnose_conflict()` ([sync.py:702](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L702))
 
 Production was held under `BEGIN EXCLUSIVE` by another connection:
 
@@ -416,7 +416,7 @@ while applying a changeset is wrapped". Nothing is written either way.
 #### A4 · Low · Raw errors after the agent changes the sandbox schema
 
 **Code path.** `_take_snapshot()` selects through the clone-time `Table` objects
-([sandbox.py:449-455](../safeagentdb/sandbox.py#L449-L455)).
+([sandbox.py:449-455](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L449-L455)).
 
 ```
 diff, after RENAME COLUMN: ESCAPES sqlalchemy.exc.OperationalError: no such column: tasks.title
@@ -430,7 +430,7 @@ unexplained driver error instead of a clear refusal.
 <a id="a5"></a>
 #### A5 · Low · `execute()`/`query()` pass driver errors through unwrapped
 
-**Code path.** [sandbox.py:214-228](../safeagentdb/sandbox.py#L214-L228) wraps the
+**Code path.** [sandbox.py:214-228](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L214-L228) wraps the
 string in an untyped `text()` and does not catch anything.
 
 ```
@@ -449,7 +449,7 @@ after a word character is not affected: `'12:30'` works.
 #### A6 · Low · Misuse errors are plain Python exceptions
 
 `RuntimeError` when used before `__enter__` or after exit
-([sandbox.py:445-447](../safeagentdb/sandbox.py#L445-L447)), `ValueError` for a
+([sandbox.py:445-447](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L445-L447)), `ValueError` for a
 bad `on_conflict`, `AttributeError` when `changeset=` is not a `ChangeSet`.
 Reasonable for programmer errors, but `RuntimeError` is easy to hit at runtime
 and is not documented.
@@ -463,9 +463,9 @@ documents it.
 #### B1 · Medium · A string `tenant_id` makes every write a "Tenant breach"
 
 **Code path.** The clone filter compares in SQL, where SQLite's type affinity makes
-`'42'` match `42` ([engine.py:716-717](../safeagentdb/engine.py#L716-L717)).
+`'42'` match `42` ([engine.py:716-717](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L716-L717)).
 `tenant_breach()` compares in Python with `!=`
-([diff.py:596-611](../safeagentdb/diff.py#L596-L611)).
+([diff.py:596-611](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L596-L611)).
 
 **Repro.** [p3a/m1_string_tenant.py](review-repros/p3a/m1_string_tenant.py)
 
@@ -485,8 +485,8 @@ when the real cause is a type mismatch. It fails closed.
 #### B2 · Medium · A self-referencing table is written in key order
 
 **Code path.** `_dependencies()` skips self-edges
-([sync.py:535](../safeagentdb/sync.py#L535)), and within one table rows are
-ordered by key ([sync.py:566-571](../safeagentdb/sync.py#L566-L571)).
+([sync.py:535](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L535)), and within one table rows are
+ordered by key ([sync.py:566-571](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L566-L571)).
 
 **Repro.** [p3a/m2_self_reference.py](review-repros/p3a/m2_self_reference.py):
 `emp.manager_id REFERENCES emp(id)`.
@@ -507,7 +507,7 @@ sandbox could not evaluate a rule it did evaluate.
 #### B7 · Low · The validation message names only the field
 
 **Code path.** `RowDiff.validate()` keeps the second line of the pydantic error
-([diff.py:227-229](../safeagentdb/diff.py#L227-L229)), which is the field name.
+([diff.py:227-229](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L227-L229)), which is the field name.
 
 **Repro.** [p3a/m3_validation_message.py](review-repros/p3a/m3_validation_message.py):
 `status = 'yolo'` against `Literal["todo", "done"]` gives the message `'status'`.
@@ -522,7 +522,7 @@ All from [p3a/a1_api_usage.py](review-repros/p3a/a1_api_usage.py).
 #### C1 · Low · `diff()` after a commit shows the committed changes as SAFE TO COMMIT
 
 **Code path.** `diff()` does not check `_committed`, and the comparison snapshot
-is not advanced after a commit ([sandbox.py:232-274](../safeagentdb/sandbox.py#L232-L274)).
+is not advanced after a commit ([sandbox.py:232-274](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L232-L274)).
 
 ```
 4. commit without diff first: 1
@@ -537,7 +537,7 @@ twice.
 #### C2 · Low · `__enter__` on an open sandbox discards the agent's work
 
 **Code path.** No "already open" guard at
-[sandbox.py:129](../safeagentdb/sandbox.py#L129).
+[sandbox.py:129](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L129).
 
 ```
 13. nested enter: earlier edit still visible: [{'title': 'one'}] | old engine replaced: True
@@ -567,8 +567,8 @@ harmful, but the README does not say whether re-entry is supported.
 | `timestamptz` on PostgreSQL shifts the instant | The driver returns aware datetimes; the sandbox stores them naive (`p2/t1` row 2 shows the offset gone in the sandbox even for an aware Python value). Writing one back into `timestamptz` would be read in the session time zone. |
 | P2-1 does not affect PostgreSQL or MySQL | They compare typed values rather than text. Not verified. |
 | A custom `row_key` with a generated PK gives a wrong-cause message | Deleting and re-inserting a row under the same `row_key` should produce an UPDATE whose `id` is a placeholder; `provisional_reference_columns()` would then say "references a row that is itself new". From reading the code only. |
-| The cascade check fails on MySQL | `_referencing_rows()` builds SQL with double-quoted identifiers ([sync.py:361-381](../safeagentdb/sync.py#L361-L381)). Without `ANSI_QUOTES`, MySQL reads `"child"` as a string literal, so every cascade check would raise a raw `ProgrammingError` (see A2). Fails closed. |
-| MySQL `TINYINT` columns fail strict validation | `TINYINT` maps to `String(255)` with a text conversion that never converts back ([engine.py:76](../safeagentdb/engine.py#L76), [engine.py:110-120](../safeagentdb/engine.py#L110-L120)). A strict `int` validator would see `'1'` and block every edit to the row. SQLite reflects `TINYINT` as `INTEGER`, so [p3b/c1_tinyint.py](review-repros/p3b/c1_tinyint.py) cannot reach this path. |
+| The cascade check fails on MySQL | `_referencing_rows()` builds SQL with double-quoted identifiers ([sync.py:361-381](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L361-L381)). Without `ANSI_QUOTES`, MySQL reads `"child"` as a string literal, so every cascade check would raise a raw `ProgrammingError` (see A2). Fails closed. |
+| MySQL `TINYINT` columns fail strict validation | `TINYINT` maps to `String(255)` with a text conversion that never converts back ([engine.py:76](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L76), [engine.py:110-120](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L110-L120)). A strict `int` validator would see `'1'` and block every edit to the row. SQLite reflects `TINYINT` as `INTEGER`, so [p3b/c1_tinyint.py](review-repros/p3b/c1_tinyint.py) cannot reach this path. |
 | The provisional-key commit path | Leaving the column out of the INSERT and reading the real key back was not run: a SQLite production table cannot usefully keep a `nextval()` default. The diff side was verified; `tests/test_server_backed.py` covers the commit side against PostgreSQL. |
 | Compare-and-swap at "any isolation level" | Follows from the single-statement design; verified only by CI on PostgreSQL. |
 
@@ -585,15 +585,15 @@ changed, and 1 groups disclaimers that are accurate.
 
 | When | Check | Code |
 |------|-------|------|
-| Clone | Rows read with `WHERE tenant_column = tenant_id`; a table with no tenant column reads nothing unless listed in `reference_tables` | [engine.py:713-724](../safeagentdb/engine.py#L713-L724) |
-| Diff | `tenant_breach()` on every diff (INSERT/UPDATE new row, DELETE old row) → `blocking_errors` → `is_valid` false | [sandbox.py:457-477](../safeagentdb/sandbox.py#L457-L477), [diff.py:581-611](../safeagentdb/diff.py#L581-L611) |
-| Diff | Any change to a reference table raises `SyncError` | [sandbox.py:518-531](../safeagentdb/sandbox.py#L518-L531) |
-| Commit | Diff recomputed; `blocking_errors` raise `SyncError` | [sandbox.py:320-338](../safeagentdb/sandbox.py#L320-L338) |
-| Commit | `tenant_breach()` again inside the transaction | [sync.py:132-134](../safeagentdb/sync.py#L132-L134) |
-| Commit | `AND tenant_column = tenant_id` on every UPDATE/DELETE | [sync.py:205-207](../safeagentdb/sync.py#L205-L207) |
-| Commit | Empty, unknown or mismatched row key refused, so a WHERE clause is never the tenant alone | [sync.py:749-786](../safeagentdb/sync.py#L749-L786) |
-| Commit | Existing-key check for an INSERT scoped to the tenant | [sync.py:419-423](../safeagentdb/sync.py#L419-L423) |
-| Commit | Cascading FKs checked in every production table; another tenant or no determinable owner → `CascadeError` | [sync.py:253-388](../safeagentdb/sync.py#L253-L388); `tests/test_review_findings.py:212-409` |
+| Clone | Rows read with `WHERE tenant_column = tenant_id`; a table with no tenant column reads nothing unless listed in `reference_tables` | [engine.py:713-724](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L713-L724) |
+| Diff | `tenant_breach()` on every diff (INSERT/UPDATE new row, DELETE old row) → `blocking_errors` → `is_valid` false | [sandbox.py:457-477](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L457-L477), [diff.py:581-611](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L581-L611) |
+| Diff | Any change to a reference table raises `SyncError` | [sandbox.py:518-531](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L518-L531) |
+| Commit | Diff recomputed; `blocking_errors` raise `SyncError` | [sandbox.py:320-338](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L320-L338) |
+| Commit | `tenant_breach()` again inside the transaction | [sync.py:132-134](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L132-L134) |
+| Commit | `AND tenant_column = tenant_id` on every UPDATE/DELETE | [sync.py:205-207](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L205-L207) |
+| Commit | Empty, unknown or mismatched row key refused, so a WHERE clause is never the tenant alone | [sync.py:749-786](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L749-L786) |
+| Commit | Existing-key check for an INSERT scoped to the tenant | [sync.py:419-423](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L419-L423) |
+| Commit | Cascading FKs checked in every production table; another tenant or no determinable owner → `CascadeError` | [sync.py:253-388](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L253-L388); `tests/test_review_findings.py:212-409` |
 
 No reproduced finding writes to, or changes, another tenant's rows. P1-1
 deletes rows through a cascade, but the cascade check works as designed: those
@@ -603,34 +603,34 @@ rows belong to the acting tenant. B1 blocks too much rather than too little.
 
 | Claim | Verdict | Evidence |
 |-------|---------|----------|
-| Gate 1: only tenant rows cloned; "other tenants' data never enters memory. Ever." | Partial | Filter confirmed. `reference_tables` loads whole tables (documented); the cascade check reads other tenants' tenant-column values into memory ([sync.py:379-388](../safeagentdb/sync.py#L379-L388)) |
-| Gate 2: explicit INSERT/UPDATE/DELETE per row key; unidentifiable tables refused | Partial | Refusal confirmed ([sandbox.py:557-565](../safeagentdb/sandbox.py#L557-L565)); key change becomes DELETE + INSERT (P1-1) |
+| Gate 1: only tenant rows cloned; "other tenants' data never enters memory. Ever." | Partial | Filter confirmed. `reference_tables` loads whole tables (documented); the cascade check reads other tenants' tenant-column values into memory ([sync.py:379-388](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L379-L388)) |
+| Gate 2: explicit INSERT/UPDATE/DELETE per row key; unidentifiable tables refused | Partial | Refusal confirmed ([sandbox.py:557-565](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L557-L565)); key change becomes DELETE + INSERT (P1-1) |
 | Gate 3: every row validated, strict, no coercion | Partial | INSERT/UPDATE only; validator sees converted types (P2-2); terse message (B7) |
-| Gate 4: row key + tenant in every WHERE; tenant-only WHERE refused | Confirmed | [sync.py:190](../safeagentdb/sync.py#L190), [sync.py:205-207](../safeagentdb/sync.py#L205-L207), [sync.py:764-770](../safeagentdb/sync.py#L764-L770) |
+| Gate 4: row key + tenant in every WHERE; tenant-only WHERE refused | Confirmed | [sync.py:190](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L190), [sync.py:205-207](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L205-L207), [sync.py:764-770](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L764-L770) |
 | Gate 5: compare-and-swap; `ConflictError` names drifted columns | Partial | Mechanism confirmed, real drift named correctly (p3a/a1 #16); false conflicts (P2-1, P1-2) |
 | Gate 6: one transaction, deterministic order, changed columns only | Partial | Order deterministic but not always valid (P1-2, B2) |
 | "Every gate that does not need production also runs inside `diff()` … cannot disagree" | Not delivered | FK ordering is checkable without production but is commit-only (P1-2, B2); banner and commit disagree in P1-1, P1-3, C1 |
 | `__enter__` carries constraints, unique indexes and defaults | Partial | `tests/test_weaknesses.py:200,275`, `tests/test_hardening.py:231-278`; FK actions lost on SQLite production (P1-4) |
-| `__enter__` raises `SchemaError` without a row key | Confirmed | [sandbox.py:557-565](../safeagentdb/sandbox.py#L557-L565) |
-| `__exit__` destroys in-memory data | Confirmed | [sandbox.py:203-210](../safeagentdb/sandbox.py#L203-L210); p3a/a1 #14 |
-| `row_key` must exist and be unique | Confirmed | [sandbox.py:545-555](../safeagentdb/sandbox.py#L545-L555), [sandbox.py:570-591](../safeagentdb/sandbox.py#L570-L591) |
+| `__enter__` raises `SchemaError` without a row key | Confirmed | [sandbox.py:557-565](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L557-L565) |
+| `__exit__` destroys in-memory data | Confirmed | [sandbox.py:203-210](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L203-L210); p3a/a1 #14 |
+| `row_key` must exist and be unique | Confirmed | [sandbox.py:545-555](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L545-L555), [sandbox.py:570-591](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L570-L591) |
 | `on_conflict="ignore"` skips, records, warns | Confirmed | p1/f1b (the conflict itself was false, see P1-2) |
-| `require_validators` policy matches between diff and commit | Confirmed | [diff.py:218-222](../safeagentdb/diff.py#L218-L222), [models.py:87-97](../safeagentdb/models.py#L87-L97) |
-| Generated keys: placeholder, omitted at INSERT, real key read back | Confirmed by code | Diff side reproduced (p1/s_sound_checks); commit side [sync.py:172-185](../safeagentdb/sync.py#L172-L185), server-backed tests |
+| `require_validators` policy matches between diff and commit | Confirmed | [diff.py:218-222](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L218-L222), [models.py:87-97](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/models.py#L87-L97) |
+| Generated keys: placeholder, omitted at INSERT, real key read back | Confirmed by code | Diff side reproduced (p1/s_sound_checks); commit side [sync.py:172-185](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L172-L185), server-backed tests |
 | Supplied key or placeholder reference → `GeneratedValueError` | Partial | Works; over-broad (P1-5) |
-| Reference tables: full clone, FK restored, read-only | Confirmed | [sandbox.py:518-531](../safeagentdb/sandbox.py#L518-L531); `tests/test_audit_followups.py:125-193` |
+| Reference tables: full clone, FK restored, read-only | Confirmed | [sandbox.py:518-531](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L518-L531); `tests/test_audit_followups.py:125-193` |
 | `unsupported_constraints` lists everything not reproduced | Partial | Lost FK actions not listed (P1-4) |
 | `execute()` wraps SQL in `text()` | Confirmed | Side effect: `"a":1` parsed as a bind parameter (A5) |
 | Commit returns rows actually written | Partial | Cascaded rows not counted (P1-1) |
 | Commit's list of exceptions it raises | Partial | Omits `SchemaError` (FK cycle) and the raw exceptions in A2/P1-6 |
-| Commit callable once | Confirmed | [sandbox.py:316-317](../safeagentdb/sandbox.py#L316-L317); p3a/a1 #5, #9 |
+| Commit callable once | Confirmed | [sandbox.py:316-317](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sandbox.py#L316-L317); p3a/a1 #5, #9 |
 | `is_valid` true when nothing checkable without production is wrong | Not delivered | P1-2, B2, P1-3, C1 |
 | `fingerprint` hashes exactly what would be written | Partial | Type collision (P1-6); counts a dropped change (P1-3) |
-| Plain-text output off a TTY | Confirmed | [diff.py:297-312](../safeagentdb/diff.py#L297-L312); `tests/test_mega.py:632-651` |
+| Plain-text output off a TTY | Confirmed | [diff.py:297-312](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/diff.py#L297-L312); `tests/test_mega.py:632-651` |
 | "Every one derives from `SafeAgentDBError` … a single `except`" | Not delivered | A1, A2, A4, A5, A6, P1-6 |
 | "Every database error raised while applying a changeset is wrapped" | Not delivered | A2, P1-6 |
 | `ConflictError` / `IntegrityViolationError` meanings | Partial | Also raised for causes they do not describe (P2-1, P1-2, B2) |
-| `CascadeError` attributes; `ConflictWarning` per skip; `MissingValidatorError` is a `KeyError` | Confirmed | [sync.py:300-333](../safeagentdb/sync.py#L300-L333), [sync.py:474-491](../safeagentdb/sync.py#L474-L491), [errors.py:196](../safeagentdb/errors.py#L196) |
+| `CascadeError` attributes; `ConflictWarning` per skip; `MissingValidatorError` is a `KeyError` | Confirmed | [sync.py:300-333](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L300-L333), [sync.py:474-491](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L474-L491), [errors.py:196](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/errors.py#L196) |
 | Tenant scenarios 1–3 | Confirmed | Message wording differs slightly from the README |
 | Any SQLAlchemy-supported database | Partial | SQLite and PostgreSQL (CI) only; MySQL suspected issues above |
 | "Zero fidelity loss" | Not delivered | P2-2, P2-3, P1-3 |
@@ -642,10 +642,10 @@ rows belong to the acting tenant. B1 blocks too much rather than too little.
 | Remapped columns: "Round-tripping is lossless" | Not delivered | P2-2, P1-3 |
 | Unreliable-equality columns excluded from the guard | Partial | List incomplete: `DateTime`/`Boolean` on SQLite (P2-1) |
 | Other "cannot catch" disclaimers | Accurate | Nothing contradicts them |
-| FK enforcement suspended only during load | Confirmed | [engine.py:745-767](../safeagentdb/engine.py#L745-L767) |
-| "ordered by table, row key, operation" | Out of date | Now phase, then topological table order, then key ([sync.py:541-573](../safeagentdb/sync.py#L541-L573)) |
+| FK enforcement suspended only during load | Confirmed | [engine.py:745-767](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/engine.py#L745-L767) |
+| "ordered by table, row key, operation" | Out of date | Now phase, then topological table order, then key ([sync.py:541-573](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L541-L573)) |
 | Any failure → full rollback | Confirmed | Every failed commit in this review left production untouched (`ignore` excepted, as documented) |
-| "No raw SQL strings are generated" | Not delivered | The cascade check builds SQL with f-strings ([sync.py:361-381](../safeagentdb/sync.py#L361-L381)). Values are bound and the identifiers come from the schema, so not an injection risk |
+| "No raw SQL strings are generated" | Not delivered | The cascade check builds SQL with f-strings ([sync.py:361-381](https://github.com/arhandonerkaya/safeagentdb/blob/f5043f59abc417cadb63635017ad5336b0bf98ef/safeagentdb/sync.py#L361-L381)). Values are bound and the identifiers come from the schema, so not an injection risk |
 | Architecture test list | Out of date | Omits `test_review_findings.py` and `test_server_backed.py` |
 
 ---
@@ -772,10 +772,10 @@ that it will.
 ### R4-1 · Medium · The cascade check counts another tenant's rows as the acting tenant's
 
 **Code path.** `_referencing_rows()` classifies each referencing row with
-`same_tenant()` ([sync.py:631](../safeagentdb/sync.py#L631)). That converts the
+`same_tenant()` ([sync.py:631](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/sync.py#L631)). That converts the
 row's value to the tenant id's type with `normalise_tenant_id()`, which for an
 integer tenant id is `int(value.strip())`
-([diff.py:815](../safeagentdb/diff.py#L815)). So in a TEXT tenant column of a
+([diff.py:815](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/diff.py#L815)). So in a TEXT tenant column of a
 table that is not cloned, `'042'`, `'+42'` and `' 42'` all count as tenant 42.
 
 **Repro.** [p4/r9_text_tenant_overmatch.py](review-repros/p4/r9_text_tenant_overmatch.py):
@@ -807,7 +807,7 @@ boundary.
 ### R4-2 · Medium · A NUMERIC/DECIMAL tenant column refuses an integer `tenant_id`
 
 **Code path.** `_normalised_tenant_id()`
-([sandbox.py:602](../safeagentdb/sandbox.py#L602)) takes the tenant column's
+([sandbox.py:602](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/sandbox.py#L602)) takes the tenant column's
 `python_type`, which is `Decimal` for `NUMERIC` and `DECIMAL`.
 `normalise_tenant_id()` has no conversion from `int` or `str` to `Decimal`, so
 `__enter__` raises `UsageError`.
@@ -832,7 +832,7 @@ upgrade to 0.3.0, even though an exact conversion from an integer always exists.
 
 **Code path.** `_order_diffs()` orders rows inside the INSERT and DELETE phases,
 but sorts the UPDATE phase only by table rank and key
-([sync.py:855](../safeagentdb/sync.py#L855)). Primary-key changes are now
+([sync.py:855](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/sync.py#L855)). Primary-key changes are now
 refused, so this matters when a foreign key references a UNIQUE column that is
 not the primary key.
 
@@ -865,11 +865,11 @@ Nothing is written.
 ### R4-4 · Low · A key set by UPDATE on the agent's own new row is treated as sandbox-generated
 
 **Code path.** The explicit-key trigger fires only `BEFORE INSERT`
-([engine.py:1050](../safeagentdb/engine.py#L1050)). The key-change log does see
+([engine.py:1050](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/engine.py#L1050)). The key-change log does see
 the UPDATE, but `_key_change_errors()` skips rows the agent inserted itself
-([sandbox.py:724](../safeagentdb/sandbox.py#L724)). `compute_diff()` then treats
+([sandbox.py:724](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/sandbox.py#L724)). `compute_diff()` then treats
 any value of 2^52 or more that is not in the explicit log as generated
-([diff.py:908](../safeagentdb/diff.py#L908)).
+([diff.py:908](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/diff.py#L908)).
 
 **Repro.** [p4/r3_insert_then_update_key.py](review-repros/p4/r3_insert_then_update_key.py),
 with `prod_serial()`.
@@ -917,7 +917,7 @@ wrong cause.
 map from each key now in use to the original key it came from. A DELETE is not
 logged, so a deleted original stays in `holder`. A later move of a new row that
 reuses that key is then blamed on the original
-([sandbox.py:698-742](../safeagentdb/sandbox.py#L698-L742)).
+([sandbox.py:698-742](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/sandbox.py#L698-L742)).
 
 **Repro.** [p4/r6_key_change_false_positive.py](review-repros/p4/r6_key_change_false_positive.py):
 DELETE row 1, INSERT a new row 1, UPDATE it to id 7.
@@ -934,7 +934,7 @@ control diffs: [('DELETE', {'id': 1}), ('INSERT', {'id': 7})] is_valid: True
 <a id="r4-7"></a>
 ### R4-7 · Low · Inserting a forged log row hides a key change
 
-**Code path.** `_make_read_only()` ([engine.py:1064](../safeagentdb/engine.py#L1064))
+**Code path.** `_make_read_only()` ([engine.py:1064](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/engine.py#L1064))
 protects the log tables from UPDATE and DELETE, but not from INSERT.
 `tracking_problems()` only checks that the TEMP objects still exist unchanged.
 
@@ -955,7 +955,7 @@ that were dropped or altered. It does not cover rows inserted into the log.
 <a id="r4-8"></a>
 ### R4-8 · Low · `ANALYZE` is refused as a schema change
 
-**Code path.** `schema_signature()` ([engine.py:1118](../safeagentdb/engine.py#L1118))
+**Code path.** `schema_signature()` ([engine.py:1118](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/engine.py#L1118))
 compares the whole of `sqlite_master`, and `ANALYZE` creates `sqlite_stat1`.
 
 **Repro.** [p4/r5_benign_statements_schema_error.py](review-repros/p4/r5_benign_statements_schema_error.py)
@@ -974,7 +974,7 @@ impossible to commit.
 ### R4-9 · Low · `AgentSQLError` says earlier changes are kept after `OR ROLLBACK` discarded them
 
 **Code path.** `execute()` always appends "Earlier changes are kept"
-([sandbox.py:316](../safeagentdb/sandbox.py#L316)). A statement with `OR ROLLBACK`
+([sandbox.py:316](https://github.com/arhandonerkaya/safeagentdb/blob/bd4fda3cb1025afbcb56bcc8889e16e7fc3ed6de/safeagentdb/sandbox.py#L316)). A statement with `OR ROLLBACK`
 conflict resolution, or a trigger's `RAISE(ROLLBACK)`, rolls back the agent's
 whole open transaction.
 
@@ -1065,24 +1065,26 @@ this one bug.
 <a id="b-1"></a>
 ### B-1 · High · A sandbox-assigned key collides with a row the clone never saw
 
+Status: fixed in 0.3.1, see Status after the fix below.
+
 **Code path.** The provisional-key machinery is reached only through a lost
 server default. `clone_schema_to_sandbox()` calls `_adapt_server_defaults()`
-([engine.py:838](../safeagentdb/engine.py#L838)) and offers *only the columns it
+([engine.py:838](https://github.com/arhandonerkaya/safeagentdb/blob/9417b126cd0be74f70bd665c123a6eaddc09c78d/safeagentdb/engine.py#L838)) and offers *only the columns it
 returns* to `_enable_provisional_key()`
-([engine.py:841](../safeagentdb/engine.py#L841), defined at
-[engine.py:488](../safeagentdb/engine.py#L488)). A PostgreSQL `serial` reflects
+([engine.py:841](https://github.com/arhandonerkaya/safeagentdb/blob/9417b126cd0be74f70bd665c123a6eaddc09c78d/safeagentdb/engine.py#L841), defined at
+[engine.py:488](https://github.com/arhandonerkaya/safeagentdb/blob/9417b126cd0be74f70bd665c123a6eaddc09c78d/safeagentdb/engine.py#L488)). A PostgreSQL `serial` reflects
 as a `nextval(...)` server default, cannot be reproduced on SQLite, and so
 qualifies. A SQLite `id INTEGER PRIMARY KEY` is a rowid alias with **no server
 default at all**: `_adapt_server_defaults()` returns nothing for it,
 `provisional_key_columns` stays empty, `seed_provisional_keys()`
-([engine.py:519](../safeagentdb/engine.py#L519)) returns `{}` without moving any
+([engine.py:519](https://github.com/arhandonerkaya/safeagentdb/blob/9417b126cd0be74f70bd665c123a6eaddc09c78d/safeagentdb/engine.py#L519)) returns `{}` without moving any
 counter, and the sandbox's rowid counter starts where the *cloned* rows end.
 
 The clone holds one tenant. So the sandbox assigns `max(ids of this tenant) + 1`
 while production needs `max(ids of every tenant) + 1`. For every tenant except
 the one holding the highest ids, the two differ and the key is already taken.
 Because the key is below `PROVISIONAL_KEY_BASE` it is not recognised as
-sandbox-assigned ([diff.py:965](../safeagentdb/diff.py#L965)), so it is written
+sandbox-assigned ([diff.py:965](https://github.com/arhandonerkaya/safeagentdb/blob/9417b126cd0be74f70bd665c123a6eaddc09c78d/safeagentdb/diff.py#L965)), so it is written
 to production verbatim instead of being left for production to assign.
 
 **Repro.** [b/b1_rowid_key_collision.py](review-repros/b/b1_rowid_key_collision.py).

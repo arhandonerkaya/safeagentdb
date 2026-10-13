@@ -25,11 +25,11 @@ fixed, prompting removal of the marker so they become regression guards. Run
 
 ## 1. Schema fidelity — CONFIRMED for non-SQLite production, NOT CONFIRMED for SQLite
 
-**Code path.** [engine.py:127-151](../safeagentdb/engine.py#L127-L151)
+**Code path.** [engine.py:127-151](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/engine.py#L127-L151)
 `clone_schema_to_sandbox()` branches on
-[`_detect_dialect()`](../safeagentdb/engine.py#L193-L202):
+[`_detect_dialect()`](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/engine.py#L193-L202):
 
-- dialect ≠ `sqlite` → [`_clone_table_for_sqlite()`](../safeagentdb/engine.py#L92-L106),
+- dialect ≠ `sqlite` → [`_clone_table_for_sqlite()`](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/engine.py#L92-L106),
   which rebuilds each table from `Column(name, type, primary_key, nullable)` only;
 - dialect = `sqlite` → `table.to_metadata()`, which copies the table whole.
 
@@ -89,10 +89,10 @@ but may hit the reflection crash instead.
 
 ## 2. Lost update — CONFIRMED
 
-**Code path.** [sandbox.py:86](../safeagentdb/sandbox.py#L86) takes
-`_original_snapshot` at clone time; [`commit_to_production()`](../safeagentdb/sandbox.py#L130-L158)
+**Code path.** [sandbox.py:86](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/sandbox.py#L86) takes
+`_original_snapshot` at clone time; [`commit_to_production()`](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/sandbox.py#L130-L158)
 diffs against that snapshot and hands the result to
-[`sync.apply_changeset()`](../safeagentdb/sync.py#L86-L91), which issues
+[`sync.apply_changeset()`](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/sync.py#L86-L91), which issues
 `UPDATE … SET <every column of diff.new> WHERE pk AND tenant`. Nothing compares
 the production row against `diff.old`.
 
@@ -106,7 +106,7 @@ four columns, so after the commit `title == 'Ship v2'`: the human's rename is
 gone. No warning, no error, `commit_to_production()` returns `1`.
 
 **Related, same code path.** `apply_changeset` does `affected += 1` per diff
-([sync.py:100](../safeagentdb/sync.py#L100)) without consulting `rowcount`. If
+([sync.py:100](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/sync.py#L100)) without consulting `rowcount`. If
 the concurrent process *deletes* the row instead, the `UPDATE` matches nothing,
 yet `commit_to_production()` still returns `1`. The return value cannot be used
 to detect that a write was silently dropped.
@@ -124,11 +124,11 @@ that data was lost.
 
 ## 3. Validator inconsistency — CONFIRMED
 
-**Code path.** [diff.py:69-71](../safeagentdb/diff.py#L69-L71) —
+**Code path.** [diff.py:69-71](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/diff.py#L69-L71) —
 `RowDiff.validate()` returns `(True, "No validator")` when
-`get_validator()` is `None`. [models.py:59-64](../safeagentdb/models.py#L59-L64) —
+`get_validator()` is `None`. [models.py:59-64](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/models.py#L59-L64) —
 `validate_row()` raises `KeyError` for exactly the same condition, and
-[sync.py:73](../safeagentdb/sync.py#L73) calls it unguarded.
+[sync.py:73](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/sync.py#L73) calls it unguarded.
 
 **What the test does.** With an empty registry, an agent updates a `tasks` row;
 the test inspects the changeset, then commits.
@@ -157,12 +157,12 @@ also non-obvious: a table quietly dropped out of the registry (a typo in
 
 ## 4. Tables without a primary key — CONFIRMED (found during review)
 
-**Code path.** [sandbox.py:191-195](../safeagentdb/sandbox.py#L191-L195)
+**Code path.** [sandbox.py:191-195](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/sandbox.py#L191-L195)
 `_pk_columns()` returns `[]` for a table with no primary key.
-[diff.py:392-393](../safeagentdb/diff.py#L392-L393) `_pk_key(row, [])` then
+[diff.py:392-393](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/diff.py#L392-L393) `_pk_key(row, [])` then
 returns `()` for **every** row, so
-[`compute_diff()`](../safeagentdb/diff.py#L345-L389) collapses the table into a
-single dict entry (last row wins). [sync.py:86-98](../safeagentdb/sync.py#L86-L98)
+[`compute_diff()`](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/diff.py#L345-L389) collapses the table into a
+single dict entry (last row wins). [sync.py:86-98](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/sync.py#L86-L98)
 builds `update(table)` / `delete(table)` by iterating `diff.pk`, which is `{}`,
 leaving the tenant column as the **only** predicate.
 
@@ -212,7 +212,7 @@ Two smaller observations, not filed above:
   registers three validators into the process-global `_model_registry` and never
   clears them, and would call `sys.exit(1)` on failure.
 - `safeagentdb/engine.py` imports a dozen dialect type names
-  ([lines 36-76](../safeagentdb/engine.py#L36-L76)) that are never referenced —
+  ([lines 36-76](https://github.com/arhandonerkaya/safeagentdb/blob/90b153d2359f64aefeb7ac5ccda1667824b39a98/safeagentdb/engine.py#L36-L76)) that are never referenced —
   `_SQLITE_TYPE_MAP` is keyed by string. `_sqlite_safe_type()` matches on class
   name only, so generic `sqlalchemy.ARRAY` and `sqlalchemy.JSON` also hit the
   Postgres entries, and MySQL `TINYINT` is mapped to `String(255)`.
