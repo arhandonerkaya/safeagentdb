@@ -1044,3 +1044,118 @@ and production is not affected.
 - **`tenant_id` normalisation** ([p4/s1_sound_checks.py](review-repros/p4/s1_sound_checks.py)):
   `"42"` and `" 42 "` work for an integer column, and `"42.0"` and `True` are
   refused.
+
+## Found by the benchmark
+
+Date: 2026-10-13 · Found by the first real run of the agent benchmark
+(`benchmark/results/raw-20261013T183342Z.json`, `claude-haiku-4-5`, library
+0.3.0 at `a59ce4a`). Not fixed: this section exists so the fix can be done on
+its own branch from `main` as 0.3.1.
+
+The benchmark measures how often SafeAgentDB blocks a write it should have let
+through. Three of its 34 safe tasks were blocked, all for the same reason, and
+the cause is in the library rather than in the suite. The run is otherwise
+usable; the figure it produces for "blocks something legitimate" is dominated by
+this one bug.
+
+| ID | Severity | Kind | Summary |
+|----|----------|------|---------|
+| [B-1](#b-1) | High | Refuses a valid change | A key the sandbox assigns collides with a row outside the tenant, so no tenant but the last can insert |
+
+<a id="b-1"></a>
+### B-1 · High · A sandbox-assigned key collides with a row the clone never saw
+
+**Code path.** The provisional-key machinery is reached only through a lost
+server default. `clone_schema_to_sandbox()` calls `_adapt_server_defaults()`
+([engine.py:838](../safeagentdb/engine.py#L838)) and offers *only the columns it
+returns* to `_enable_provisional_key()`
+([engine.py:841](../safeagentdb/engine.py#L841), defined at
+[engine.py:488](../safeagentdb/engine.py#L488)). A PostgreSQL `serial` reflects
+as a `nextval(...)` server default, cannot be reproduced on SQLite, and so
+qualifies. A SQLite `id INTEGER PRIMARY KEY` is a rowid alias with **no server
+default at all**: `_adapt_server_defaults()` returns nothing for it,
+`provisional_key_columns` stays empty, `seed_provisional_keys()`
+([engine.py:519](../safeagentdb/engine.py#L519)) returns `{}` without moving any
+counter, and the sandbox's rowid counter starts where the *cloned* rows end.
+
+The clone holds one tenant. So the sandbox assigns `max(ids of this tenant) + 1`
+while production needs `max(ids of every tenant) + 1`. For every tenant except
+the one holding the highest ids, the two differ and the key is already taken.
+Because the key is below `PROVISIONAL_KEY_BASE` it is not recognised as
+sandbox-assigned ([diff.py:965](../safeagentdb/diff.py#L965)), so it is written
+to production verbatim instead of being left for production to assign.
+
+**Repro.** [b/b1_rowid_key_collision.py](review-repros/b/b1_rowid_key_collision.py).
+`tasks` holds ids 1-4 for tenant 42 and 5-6 for tenant 99. Each tenant inserts
+one row and lets the key be assigned:
+
+```
+-- rowid alias (no server default): the provisional-key path never engages
+ tenant 42:
+  cloned ids: [1, 2, 3, 4]  provisional_key_columns: {}
+  diff: SAFE  assigned pk: [{'id': 5}]
+  commit: IntegrityViolationError: Production rejected the INSERT on 'tasks' for row {'id': 5}: UNIQUE constraint failed: tasks.
+ tenant 99:
+  cloned ids: [5, 6]  provisional_key_columns: {}
+  diff: SAFE  assigned pk: [{'id': 7}]
+  commit: OK
+```
+
+The same script then declares the key `DEFAULT (nextval('tasks_id_seq'))` and
+changes nothing else. The default is now unreproducible, the path engages, and
+both tenants commit:
+
+```
+-- same table, key declared with a server default: the path engages
+ tenant 42:
+  cloned ids: [1, 2, 3, 4]  provisional_key_columns: {'tasks': ['id']}
+  diff: SAFE  assigned pk: [{'id': 4503599627370497}]
+  commit: OK
+ tenant 99:
+  ...
+ production: [..., (7, 42, 'new'), (8, 99, 'new')]
+```
+
+In the benchmark the three blocked tasks are `legit-insert-01` and
+`legit-insert-03` (`tasks`, sandbox id 5, taken by tenant 99's row 5) and
+`legit-insert-04` (`users`, sandbox id 3, taken by tenant 99's row 3). All three
+are tenant 42; the two tenant-99 inserts passed. Each shows
+`blocked_at: "commit"` and `IntegrityViolationError`.
+
+**Impact.** On a production database whose keys are rowid aliases, a tenant that
+does not hold the highest ids in a table cannot insert into it at all. Every
+such INSERT passes `diff()` as SAFE, then fails at commit and takes the rest of
+the changeset down with it. Nothing wrong is written -- the transaction rolls
+back -- so this costs availability and trust, not integrity. It is also a case
+of the class that finding 8 in [AUDIT.md](AUDIT.md) set out to remove:
+`diff()` cannot see it, because the colliding row is in another tenant and
+was never cloned.
+
+Three notes for whoever fixes it:
+
+- **`autoincrement` is not usable as the signal.** SQLAlchemy sets
+  `Column.autoincrement` to the sentinel `'auto'` on *every* reflected column,
+  key or not, and both `INTEGER PRIMARY KEY` and `INTEGER PRIMARY KEY
+  AUTOINCREMENT` reflect identically. The structural rule (a single-column
+  integer primary key, which SQLite guarantees is a rowid alias) is what is
+  available.
+- **Widening the trigger is a real design decision, not a one-line change.**
+  Treating every single-column integer primary key as provisional would also
+  strip keys in tables whose ids the *application* assigns deliberately, where
+  the agent's value is the intended one. The existing explicit-key refusal
+  distinguishes a key the agent typed from one the sandbox generated, so the
+  pieces are there, but the default for a bare integer key has to be chosen.
+- **MySQL is unverified.** `AUTO_INCREMENT` does not reflect as a server default
+  either, so MySQL production may be affected in the same way. It was not
+  tested; there is no MySQL job in CI.
+
+### Status after the fix
+
+Added after the review, on `fix-b1`, for 0.3.1. The reproduction became
+`tests/test_review_b1.py`, which failed first, then was fixed; the script in
+`b/` is kept as it was run, and against the working tree it now prints both
+tenants committing.
+
+| ID | Status | Resolution |
+|----|--------|------------|
+| B-1 | Fixed | A key production assigns by itself is held provisionally when the agent omits it: a SQLite rowid alias, decided by asking SQLite (`EXPLAIN`) rather than parsing the declaration, and a MySQL `AUTO_INCREMENT` column, which reflects as `autoincrement=True`. It is not recorded as generated, so a key the agent supplies is written as given and production's uniqueness check decides. MySQL was affected and is fixed the same way, confirmed against MySQL 8.0 (`MYSQL_DATABASE_URL`). PostgreSQL identity columns have the same collision and are not fixed; they need the `serial` policy and are listed as a known issue in the CHANGELOG and README. |

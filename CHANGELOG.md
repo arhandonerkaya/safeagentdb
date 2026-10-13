@@ -5,6 +5,47 @@ All notable changes to SafeAgentDB are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-13
+
+A fix for the one library bug the first benchmark run found
+([B-1 in docs/REVIEW_0_3.md](docs/REVIEW_0_3.md#b-1)). Its reproduction,
+`docs/review-repros/b/b1_rowid_key_collision.py`, became
+`tests/test_review_b1.py` and failed before the fix.
+
+### Fixed
+
+- **A key the sandbox assigned could collide with another tenant's row.** On a
+  SQLite production whose key is a rowid alias (`id INTEGER PRIMARY KEY`), the
+  sandbox counted on from the highest *cloned* id, which is only the tenant's
+  own. Every tenant but the one holding the highest ids had its INSERTs pass
+  `diff()` as SAFE and then fail at commit with `IntegrityViolationError`,
+  taking the rest of the changeset with them. Nothing wrong was written.
+  - An INSERT that **omits** the key is now held provisionally, exactly like a
+    `serial` key: a placeholder that cannot collide, left out of the INSERT at
+    commit, assigned by production and reported in `assigned_keys`.
+  - An INSERT that **supplies** the key writes it as given. Applications
+    assign these ids themselves, so production's uniqueness check decides, and
+    a key another tenant holds is still `IntegrityViolationError`. Unlike a
+    `serial` key, this is not refused with `GeneratedValueError`.
+  - Whether a column is a rowid alias is asked of SQLite (`EXPLAIN`, which
+    compiles but does not run), so `INT PRIMARY KEY`, `INTEGER PRIMARY KEY
+    DESC`, `WITHOUT ROWID` and composite keys keep their old behaviour.
+- **MySQL `AUTO_INCREMENT` had the same collision**, confirmed on MySQL 8.0, and
+  gets the same policy: its reflection reports `autoincrement=True`, and like a
+  rowid alias it accepts an explicit key. The three MySQL tests in
+  `tests/test_review_b1.py` run when `MYSQL_DATABASE_URL` is set; CI has no
+  MySQL job, so MySQL as a whole remains untested.
+
+### Known issues
+
+- **PostgreSQL identity columns** (`GENERATED ... AS IDENTITY`) have the same
+  collision and are not fixed here. They reflect without the `nextval()`
+  default a `serial` has, so they never reach the provisional-key path. A
+  tenant without the highest ids gets `IntegrityViolationError` at commit (`BY
+  DEFAULT`) or `SyncError` (`ALWAYS`); nothing wrong is written. The README no
+  longer says identity keys are handled. They need the `serial` policy, not
+  this one, since an explicit key bypasses the sequence.
+
 ## [0.3.0] - 2026-10-13
 
 A second safety release, built from two reviews.

@@ -1,3 +1,5 @@
+__version__ = "0.3.1"
+
 from safeagentdb.diff import ChangeSet, DiffType, RowDiff
 from safeagentdb.errors import (
     AgentSQLError,
