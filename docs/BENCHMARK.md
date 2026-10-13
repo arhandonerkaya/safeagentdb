@@ -140,8 +140,8 @@ the model.
 
 ## What a run costs
 
-One API call per task per run: `calls = tasks × runs`. 20 tasks over 3 runs is
-**60 calls**.
+One API call per task per run: `calls = tasks × runs`. The 68-task suite over
+3 runs is **204 calls**.
 
 The system prompt — instructions plus schema plus seed rows, about 1.5k tokens —
 is identical for every task and marked for caching, so after the first call it
@@ -149,13 +149,14 @@ is a cache read. Per-task input is ~150 tokens. Output dominates the bill
 because thinking is on by default: budget roughly 600–1,000 output tokens per
 call at `--effort medium`, less at `low`, considerably more at `high`.
 
-Estimated cost for **20 tasks × 3 runs = 60 calls**, at ~800 output tokens each:
+Estimated cost for **68 tasks × 3 runs = 204 calls**, at ~800 output tokens
+each:
 
 | Model | Input $/MTok | Output $/MTok | Estimated run |
 |---|---|---|---|
-| `claude-opus-5-5` (default) | $4.00 | $20.00 | **~$1.05** |
-| `claude-sonnet-5-5` | $2.00 | $10.00 | **~$0.55** |
-| `claude-haiku-4-5` | $1.00 | $5.00 | **~$0.27** |
+| `claude-opus-5-5` (default) | $4.00 | $20.00 | **~$3.50** |
+| `claude-sonnet-5-5` | $2.00 | $10.00 | **~$1.80** |
+| `claude-haiku-4-5` | $1.00 | $5.00 | **~$0.90** |
 
 Scale linearly with task count. These are arithmetic from the published rates,
 not measured — `report.py` prints the actual token counts from each run, so
@@ -171,7 +172,7 @@ Not yet run.
 - Effort: _not yet run_
 - Date: _not yet run_
 - SafeAgentDB version: _not yet run_
-- Tasks: _not yet written_ · Runs: _not yet run_
+- Tasks: 68 (34 safe, 34 unsafe) · Runs: _not yet run_
 
 | Metric | Mean ± SD | Denominator |
 |---|---|---|
@@ -259,12 +260,20 @@ letting it read would show it different data in each arm and break
 comparability. Real agents iterate, and an iterating agent would likely make
 different — plausibly fewer — mistakes. This measures one-shot SQL authoring.
 
-**The task suite is written by the library's author.** Both the tasks and the
-ground-truth labels come from the same person who wants the library to look
-good. There is no way to remove that bias from inside the repository. What is
-done instead: prompts and labels live in one separate file, the auditor shares
-no code with the library, and the raw per-task JSON is published so anyone can
-re-label a row they disagree with and recompute.
+**Task authorship.** The 68 tasks in `benchmark/tasks.yaml` were written
+jointly by the author and an AI assistant. The assistant drafted prompts and
+expected effects; the author reviewed every task against the seed data, edited
+where needed, and set every safe/unsafe label. Because the agent under test is
+also a language model, some prompts may be phrased in ways a model finds
+unusually easy or hard to interpret. Running the suite against more than one
+model family reduces this risk.
+
+**The suite is written by the party with an interest in the result.** The
+labels are set by the same person who wants the library to look good, and there
+is no way to remove that bias from inside the repository. What is done instead:
+prompts and labels live in one separate file, the auditor shares no code with
+the library, and the raw per-task JSON is published so anyone can re-label a
+row they disagree with and recompute.
 
 **The auditor encodes one person's invariants.** `tenant_table_emptied` is the
 clearest judgement call: if an agent deletes every one of a tenant's own tasks

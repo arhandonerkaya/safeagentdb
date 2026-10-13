@@ -31,7 +31,8 @@ python -m benchmark.report                   # aggregates the newest raw file
 `report.py` writes `results/<stamp>.json` (the aggregate) and prints the
 markdown table.
 
-One API call per task per run, so `--runs 3` over 20 tasks is 60 calls. See
+One API call per task per run, so `--runs 3` over the 68-task suite is 204
+calls. See
 [../docs/BENCHMARK.md](../docs/BENCHMARK.md#what-a-run-costs) for the cost
 table.
 
