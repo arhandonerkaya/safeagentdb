@@ -22,6 +22,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 from safeagentdb import (
+    AgentSQLError,
     ConflictError,
     ConflictWarning,
     GeneratedValueError,
@@ -146,12 +147,13 @@ class TestForeignKeysVsTenantCloning:
             sandbox.session.commit()
 
             # ...and a genuinely dangling reference is now caught in the sandbox.
-            with pytest.raises(IntegrityError):
+            with pytest.raises(AgentSQLError) as agent_error:
                 sandbox.execute(
                     "INSERT INTO tasks (id, user_id, status_id, title) "
                     "VALUES (12, 42, 999, 'bad reference')"
                 )
                 sandbox.session.commit()
+            assert isinstance(agent_error.value.__cause__, IntegrityError)
             sandbox.session.rollback()
 
             assert sandbox.commit_to_production() == 1
@@ -287,12 +289,13 @@ class TestForeignKeysVsTenantCloning:
         with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
             assert sandbox.clone_stats["projects"] == 1
             assert sandbox.unsupported_constraints == []
-            with pytest.raises(IntegrityError):
+            with pytest.raises(AgentSQLError) as agent_error:
                 sandbox.execute(
                     "INSERT INTO tasks (id, user_id, project_id, title) "
                     "VALUES (11, 42, 999, 'dangling')"
                 )
                 sandbox.session.commit()
+            assert isinstance(agent_error.value.__cause__, IntegrityError)
 
 
 # ============================================================
@@ -689,7 +692,7 @@ class TestDatabaseErrorsAreWrapped:
         # Reports what production rejected, and says the sandbox could not
         # evaluate the rule, without claiming to know which rule it was.
         assert "UNIQUE constraint failed" in str(error)
-        assert "could not evaluate" in str(error)
+        assert "could not check" in str(error)
 
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT id, email FROM users ORDER BY id")).fetchall()
@@ -1033,8 +1036,8 @@ class TestCompareAndSwap:
             for d in _order_diffs(ChangeSet(diffs=list(reversed(diffs))), meta)
         ]
 
-        # The DELETE goes first, then the updates; the reverse input agrees.
-        assert forwards[0] == ("tasks", 2)
+        # Unit-of-work order: the updates, then the DELETE; the reverse input agrees.
+        assert forwards[-1] == ("tasks", 2)
         assert forwards == backwards
         assert sorted(forwards) == [
             ("tasks", 1),

@@ -36,6 +36,7 @@ from safeagentdb import (
     ChangeSet,
     DiffType,
     RowDiff,
+    RowValidationError,
     SafeModel,
     ShadowDB,
     SyncError,
@@ -544,7 +545,7 @@ class TestValidationGate:
         _register_task_validator()
         with ShadowDB(prod_engine, tables=["tasks"], tenant_id=42) as sb:
             sb.execute("UPDATE tasks SET status = 'yolo' WHERE id = 1")
-            with pytest.raises(ValidationError):
+            with pytest.raises(RowValidationError):
                 sb.commit_to_production()
 
     def test_production_untouched_after_rejection(self, prod_engine):
@@ -553,7 +554,7 @@ class TestValidationGate:
             sb.execute("UPDATE tasks SET status = 'yolo' WHERE id = 1")
             try:
                 sb.commit_to_production()
-            except ValidationError:
+            except RowValidationError:
                 pass
 
         with prod_engine.connect() as conn:
@@ -600,7 +601,7 @@ class TestAtomicRollback:
             sb.execute("UPDATE tasks SET status = 'garbage' WHERE id = 2")    # invalid
             try:
                 sb.commit_to_production()
-            except ValidationError:
+            except RowValidationError:
                 pass
 
         with prod_engine.connect() as conn:

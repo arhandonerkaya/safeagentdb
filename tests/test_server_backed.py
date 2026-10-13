@@ -364,6 +364,8 @@ class TestForeignKeysOnServer:
 
         from sqlalchemy.exc import IntegrityError
 
+        from safeagentdb import AgentSQLError
+
         with ShadowDB(
             engine, tables=["items"], tenant_id=42, reference_tables=["statuses"]
         ) as sandbox:
@@ -380,12 +382,13 @@ class TestForeignKeysOnServer:
             assert all("nextval" in item for item in reported), reported
             assert sandbox.provisional_key_columns == {"items": ["id"]}
 
-            with pytest.raises(IntegrityError):
+            with pytest.raises(AgentSQLError) as agent_error:
                 sandbox.execute(
                     "INSERT INTO items (id, user_id, status_id, title) "
                     "VALUES (500, 42, 999, 'dangling')"
                 )
                 sandbox.session.commit()
+            assert isinstance(agent_error.value.__cause__, IntegrityError)
 
     def test_production_rejects_what_the_sandbox_could_not_see(self, make_tables):
         """A real foreign key violation production catches and we wrap."""
@@ -686,3 +689,245 @@ class TestStatementOrderOnServer:
         with engine.connect() as conn:
             assert conn.execute(text("SELECT COUNT(*) FROM zparent")).scalar_one() == 0
             assert conn.execute(text("SELECT COUNT(*) FROM achild")).scalar_one() == 0
+
+
+# ============================================================
+# Pre-0.3.0 review (docs/REVIEW_0_3.md), against PostgreSQL
+# ============================================================
+
+
+def _validator(table: str, **fields):
+    """Register a SafeModel for ``table`` with the given field annotations."""
+    namespace = {"__table_name__": table, "__annotations__": fields}
+    return type(f"V_{table}", (SafeModel,), namespace)
+
+
+R3_PARENT_CHILD = [
+    "CREATE TABLE r3_parent (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)",
+    "CREATE TABLE r3_child (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,"
+    " parent_id INTEGER NOT NULL REFERENCES r3_parent(id) {actions})",
+]
+
+
+def _r3_parent_child(make_tables, actions: str, rows: list[str]):
+    ddl = [R3_PARENT_CHILD[0], R3_PARENT_CHILD[1].format(actions=actions), *rows]
+    engine = make_tables(ddl, ["r3_child", "r3_parent"])
+    _validator("r3_parent", id=int, user_id=int)
+    _validator("r3_child", id=int, user_id=int, parent_id=int)
+    return engine
+
+
+def _scalar(engine, sql: str):
+    with engine.connect() as conn:
+        return conn.execute(text(sql)).scalar_one()
+
+
+class TestReviewKeyChangesOnServer:
+    """P1-1: suspected in the review to occur on PostgreSQL as on SQLite."""
+
+    def test_a_key_change_is_refused(self, make_tables):
+        from safeagentdb import SyncError
+
+        engine = _r3_parent_child(
+            make_tables,
+            "ON UPDATE CASCADE ON DELETE CASCADE",
+            [
+                "INSERT INTO r3_parent VALUES (1, 42)",
+                "INSERT INTO r3_child VALUES (10, 42, 1), (11, 42, 1)",
+            ],
+        )
+        with ShadowDB(engine, tables=["r3_parent"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE r3_parent SET id = 5 WHERE id = 1")
+            assert sandbox.diff().is_valid is False
+            with pytest.raises(SyncError, match="row key"):
+                sandbox.commit_to_production()
+
+        assert _scalar(engine, "SELECT COUNT(*) FROM r3_child WHERE parent_id = 1") == 2
+
+    def test_a_same_tenant_cascade_needs_allow_cascades(self, make_tables):
+        from safeagentdb import CascadeError
+
+        rows = [
+            "INSERT INTO r3_parent VALUES (1, 42)",
+            "INSERT INTO r3_child VALUES (10, 42, 1)",
+        ]
+        engine = _r3_parent_child(make_tables, "ON DELETE CASCADE", rows)
+
+        with ShadowDB(engine, tables=["r3_parent"], tenant_id=42) as sandbox:
+            sandbox.execute("DELETE FROM r3_parent WHERE id = 1")
+            with pytest.raises(CascadeError, match="allow_cascades"):
+                sandbox.commit_to_production()
+        assert _scalar(engine, "SELECT COUNT(*) FROM r3_child") == 1
+
+        with ShadowDB(
+            engine, tables=["r3_parent"], tenant_id=42, allow_cascades=True
+        ) as sandbox:
+            sandbox.execute("DELETE FROM r3_parent WHERE id = 1")
+            assert sandbox.commit_to_production() == 1
+        assert _scalar(engine, "SELECT COUNT(*) FROM r3_child") == 0
+
+
+class TestReviewStatementOrderOnServer:
+    """P1-2 and B2. PostgreSQL checks a NOT DEFERRABLE foreign key per
+    statement, so the order is what decides."""
+
+    def test_reparent_then_delete(self, make_tables):
+        engine = _r3_parent_child(
+            make_tables,
+            "ON DELETE CASCADE",
+            [
+                "INSERT INTO r3_parent VALUES (1, 42), (2, 42)",
+                "INSERT INTO r3_child VALUES (10, 42, 1)",
+            ],
+        )
+        with ShadowDB(engine, tables=["r3_parent", "r3_child"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE r3_child SET parent_id = 2 WHERE id = 10")
+            sandbox.execute("DELETE FROM r3_parent WHERE id = 1")
+            assert sandbox.commit_to_production() == 2
+
+        assert _scalar(engine, "SELECT parent_id FROM r3_child WHERE id = 10") == 2
+
+    EMP = [
+        "CREATE TABLE r3_emp (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,"
+        " manager_id INTEGER REFERENCES r3_emp(id))",
+        "INSERT INTO r3_emp VALUES (1, 42, NULL), (2, 42, 1)",
+    ]
+
+    def test_a_self_referencing_table(self, make_tables):
+        engine = make_tables(self.EMP, ["r3_emp"])
+        _validator("r3_emp", id=int, user_id=int, manager_id=int | None)
+
+        with ShadowDB(engine, tables=["r3_emp"], tenant_id=42) as sandbox:
+            sandbox.execute("INSERT INTO r3_emp VALUES (20, 42, NULL)")
+            sandbox.execute("INSERT INTO r3_emp VALUES (10, 42, 20)")
+            sandbox.execute("DELETE FROM r3_emp WHERE id = 2")
+            sandbox.execute("DELETE FROM r3_emp WHERE id = 1")
+            assert sandbox.commit_to_production() == 4
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT id, manager_id FROM r3_emp ORDER BY id")
+            ).fetchall()
+        assert [tuple(r) for r in rows] == [(10, 20), (20, None)]
+
+
+class TestReviewTypesOnServer:
+    """P2-2, P2-3 (timestamptz, suspected in the review), P1-5 and B1."""
+
+    EVENTS = [
+        "CREATE TABLE r3_ev (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,"
+        " note TEXT NOT NULL, at TIMESTAMPTZ, code JSONB, external_id BIGINT)",
+        "INSERT INTO r3_ev VALUES (1, 42, 'n', '2024-01-01 10:00:00+02:00',"
+        " '\"123\"', 1234567890123456789)",
+        "INSERT INTO r3_ev VALUES (2, 42, 'n', '2024-01-01 10:00:00+00:00',"
+        " 'true', NULL)",
+    ]
+
+    def _engine(self, make_tables):
+        import datetime as dt
+        from typing import Any
+
+        engine = make_tables(self.EVENTS, ["r3_ev"])
+        _validator(
+            "r3_ev",
+            id=int,
+            user_id=int,
+            note=str,
+            at=dt.datetime | None,
+            code=Any,
+            external_id=int | None,
+        )
+        return engine
+
+    def test_a_copied_row_keeps_its_instant_and_json_types(self, make_tables):
+        engine = self._engine(make_tables)
+        with ShadowDB(engine, tables=["r3_ev"], tenant_id=42) as sandbox:
+            sandbox.execute(
+                "INSERT INTO r3_ev"
+                " SELECT id + 10, user_id, note, at, code, external_id FROM r3_ev"
+            )
+            changeset = sandbox.diff()
+            assert changeset.is_valid is True, changeset.validate_all()
+            assert sandbox.commit_to_production(changeset=changeset) == 2
+
+        matching = _scalar(
+            engine,
+            "SELECT COUNT(*) FROM r3_ev a JOIN r3_ev b ON b.id = a.id + 10"
+            " WHERE a.at = b.at AND a.code = b.code"
+            " AND jsonb_typeof(a.code) = jsonb_typeof(b.code)",
+        )
+        assert matching == 2
+        assert _scalar(engine, "SELECT jsonb_typeof(code) FROM r3_ev WHERE id = 11") == "string"
+        assert _scalar(engine, "SELECT jsonb_typeof(code) FROM r3_ev WHERE id = 12") == "boolean"
+
+    def test_an_agent_written_offset_is_the_instant_stored(self, make_tables):
+        engine = self._engine(make_tables)
+        with ShadowDB(engine, tables=["r3_ev"], tenant_id=42) as sandbox:
+            sandbox.execute(
+                "UPDATE r3_ev SET at = '2025-06-01 12:00:00-05:00' WHERE id = 1"
+            )
+            assert sandbox.commit_to_production() == 1
+
+        stored = _scalar(
+            engine,
+            "SELECT COUNT(*) FROM r3_ev WHERE id = 1"
+            " AND at = TIMESTAMPTZ '2025-06-01 17:00:00+00:00'",
+        )
+        assert stored == 1
+
+    def test_a_concurrent_change_to_a_timestamp_is_still_detected(
+        self, make_tables, database_url
+    ):
+        """On PostgreSQL a datetime stays in the compare-and-swap guard."""
+        engine = self._engine(make_tables)
+        with ShadowDB(engine, tables=["r3_ev"], tenant_id=42) as sandbox:
+            sandbox.execute(
+                "UPDATE r3_ev SET at = '2030-01-01 00:00:00+00:00' WHERE id = 1"
+            )
+            other = create_engine(database_url)
+            try:
+                with other.begin() as conn:
+                    conn.execute(
+                        text("UPDATE r3_ev SET at = at + INTERVAL '1 hour' WHERE id = 1")
+                    )
+            finally:
+                other.dispose()
+            with pytest.raises(ConflictError) as excinfo:
+                sandbox.commit_to_production()
+        assert excinfo.value.columns == ["at"]
+
+    def test_json_one_to_true_is_written(self, make_tables):
+        engine = make_tables(
+            [
+                "CREATE TABLE r3_docs (id INTEGER PRIMARY KEY,"
+                " user_id INTEGER NOT NULL, data JSONB)",
+                "INSERT INTO r3_docs VALUES (1, 42, '{\"enabled\": 1}')",
+            ],
+            ["r3_docs"],
+        )
+        _validator("r3_docs", id=int, user_id=int, data=dict | None)
+        with ShadowDB(engine, tables=["r3_docs"], tenant_id=42) as sandbox:
+            sandbox.execute(
+                "UPDATE r3_docs SET data = '{\"enabled\": true}' WHERE id = 1"
+            )
+            assert sandbox.commit_to_production() == 1
+
+        kind = _scalar(engine, "SELECT jsonb_typeof(data->'enabled') FROM r3_docs WHERE id = 1")
+        assert kind == "boolean"
+
+    def test_a_large_integer_and_a_string_tenant_id(self, make_tables):
+        engine = self._engine(make_tables)
+        with ShadowDB(engine, tables=["r3_ev"], tenant_id="42") as sandbox:
+            assert sandbox.tenant_id == 42
+            sandbox.execute("UPDATE r3_ev SET note = 'edited' WHERE id = 1")
+            sandbox.execute("DELETE FROM r3_ev WHERE id = 2")
+            changeset = sandbox.diff()
+            assert changeset.is_valid is True, (
+                changeset.blocking_errors,
+                changeset.validate_all(),
+            )
+            assert sandbox.commit_to_production(changeset=changeset) == 2
+
+        external = _scalar(engine, "SELECT external_id FROM r3_ev WHERE id = 1")
+        assert external == 1234567890123456789
+        assert _scalar(engine, "SELECT COUNT(*) FROM r3_ev") == 1

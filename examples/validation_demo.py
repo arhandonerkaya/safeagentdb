@@ -5,11 +5,10 @@ Shows the Rich visual diff with FAIL status on invalid rows.
 
 from typing import Literal
 
-from pydantic import ValidationError
 from rich.console import Console
 from sqlalchemy import create_engine, text
 
-from safeagentdb import SafeModel, ShadowDB
+from safeagentdb import RowValidationError, SafeModel, ShadowDB
 
 console = Console()
 
@@ -48,7 +47,7 @@ with ShadowDB(prod_engine, tables=["tasks"], tenant_id=42) as sandbox:
 
     try:
         sandbox.commit_to_production()
-    except ValidationError as e:
+    except RowValidationError as e:
         console.print("\n  [bold red]Sync BLOCKED by Pydantic validation:[/bold red]")
         console.print(f"  [red]{e}[/red]")
         console.print("\n  [green]Production DB is untouched. Crisis averted.[/green]\n")

@@ -250,7 +250,10 @@ class TestCascadeCrossesTenants:
             assert conn.execute(text("SELECT COUNT(*) FROM child")).scalar_one() == 1
 
     def test_a_delete_whose_cascade_stays_inside_the_tenant_is_allowed(self, tmp_path):
-        """The guard must not refuse a cascade confined to the acting tenant."""
+        """With allow_cascades=True the guard must not refuse a cascade confined
+        to the acting tenant. Without it, the cascade is refused because its
+        effect is not in the diff (docs/REVIEW_0_3.md P1-1; see
+        tests/test_review_0_3.py)."""
         engine, _ = _prod(
             tmp_path,
             "cascade_same.db",
@@ -264,7 +267,11 @@ class TestCascadeCrossesTenants:
         _register_parent_validator()
 
         with ShadowDB(
-            engine, tables=["parent"], tenant_id=42, tenant_column="tenant_id"
+            engine,
+            tables=["parent"],
+            tenant_id=42,
+            tenant_column="tenant_id",
+            allow_cascades=True,
         ) as sandbox:
             sandbox.execute("DELETE FROM parent WHERE id=1")
             assert sandbox.commit_to_production() == 1
@@ -813,7 +820,7 @@ class TestStatementOrder:
     def test_a_dangling_reference_is_caught_in_the_sandbox(self, tmp_path):
         """With the parent cloned, the sandbox enforces the foreign key itself,
         so an orphan never reaches the commit at all."""
-        from sqlalchemy.exc import IntegrityError
+        from safeagentdb import AgentSQLError
 
         engine, _ = _prod(
             tmp_path,
@@ -828,7 +835,7 @@ class TestStatementOrder:
             tenant_id=42,
             tenant_column="tenant_id",
         ) as sandbox:
-            with pytest.raises(IntegrityError):
+            with pytest.raises(AgentSQLError):
                 sandbox.execute(
                     "INSERT INTO a_child (id, tenant_id, parent_id, note) "
                     "VALUES (10, 42, 999, 'orphan')"

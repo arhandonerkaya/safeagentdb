@@ -5,10 +5,19 @@ Every error the library raises derives from SafeAgentDBError, so a caller can
 wrap a whole agent session in a single ``except SafeAgentDBError``.
 
     SafeAgentDBError
-    |-- SchemaError            production schema cannot be sandboxed safely
-    |-- SyncError              a changeset was rejected or could not be applied
-    |   +-- ConflictError      production drifted between clone and commit
-    +-- MissingValidatorError  no SafeModel registered and one is required
+    |-- SchemaError              production schema cannot be sandboxed safely,
+    |                            or the agent changed the sandbox schema
+    |-- SyncError                a changeset was rejected or could not be applied
+    |   |-- ConflictError        production drifted between clone and commit
+    |   |-- IntegrityViolationError  production rejected a row
+    |   |-- CascadeError         a referential action would reach unseen rows
+    |   |-- ChangesetMismatchError   the sandbox changed since the review
+    |   |-- DuplicateRowKeyError     a row key does not identify one row
+    |   |-- GeneratedValueError  a value only production can generate
+    |   +-- RowValidationError   a row failed its SafeModel at commit
+    |-- AgentSQLError            a statement the agent ran failed
+    |-- UsageError               the API was misused (also a RuntimeError)
+    +-- MissingValidatorError    no SafeModel registered and one is required
 """
 
 from __future__ import annotations
@@ -193,6 +202,50 @@ class GeneratedValueError(SyncError):
         self.columns = list(columns or [])
 
 
+class RowValidationError(SyncError):
+    """Raised at commit when a row fails its SafeModel.
+
+    ``diff()`` reports the same failure as a failed row, so a commit reaches
+    this only when it was attempted anyway. The pydantic error is kept as
+    ``__cause__``.
+
+    Attributes:
+        table: Name of the table the row belongs to.
+        row_key: The row-identifying key of the row.
+        errors: pydantic's structured errors, one dict per failing field.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        table: str | None = None,
+        row_key: dict[str, Any] | None = None,
+        errors: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.table = table
+        self.row_key = dict(row_key or {})
+        self.errors = list(errors or [])
+
+
+class UsageError(SafeAgentDBError, RuntimeError):
+    """Raised when the API is used in a way it does not support.
+
+    Calling a method outside the ``with`` block, entering a sandbox that is
+    already open, passing an argument of the wrong kind. Also subclasses
+    RuntimeError, which is what these cases raised before 0.3.0.
+    """
+
+
+class AgentSQLError(SafeAgentDBError):
+    """Raised when a statement the agent ran in the sandbox fails.
+
+    The sandbox is unchanged by the failed statement; earlier work is kept.
+    The driver's exception is kept as ``__cause__``.
+    """
+
+
 class MissingValidatorError(SafeAgentDBError, KeyError):
     """Raised when no SafeModel is registered for a table and one is required.
 
@@ -263,8 +316,11 @@ __all__ = [
     "IntegrityViolationError",
     "MissingValidatorError",
     "MissingValidatorWarning",
+    "RowValidationError",
     "SafeAgentDBError",
     "SchemaError",
     "SkippedConflict",
     "SyncError",
+    "UsageError",
+    "AgentSQLError",
 ]
