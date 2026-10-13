@@ -37,6 +37,7 @@ from safeagentdb.engine import (
     reflect_tables,
     schema_signature,
     seed_provisional_keys,
+    self_assigned_keys,
     tracking_problems,
 )
 from safeagentdb.errors import (
@@ -234,6 +235,7 @@ class ShadowDB:
             actions=referential_actions(
                 self.prod_engine, [t.name for t in self._prod_metadata.tables.values()]
             ),
+            self_assigned=self_assigned_keys(self.prod_engine, self._prod_metadata),
         )
         self._unsupported = list(
             self._sandbox_metadata.info.get("unsupported_constraints", [])

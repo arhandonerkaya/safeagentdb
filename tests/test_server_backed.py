@@ -296,6 +296,90 @@ class TestGeneratedKeysOnServer:
 
 
 # ============================================================
+# Identity keys: the serial policy, and B-1's collision
+# ============================================================
+
+
+def _identity_tasks(kind: str) -> list[str]:
+    """Tenant 42 holds ids 1-4, tenant 99 ids 5-6, as in B-1.
+
+    Seeded without explicit ids, so GENERATED ALWAYS accepts the rows and the
+    identity sequence is in step with them.
+    """
+    return [
+        f"""
+        CREATE TABLE tasks (
+            id INTEGER GENERATED {kind} AS IDENTITY PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'todo',
+            assignee TEXT
+        )
+        """,
+        "INSERT INTO tasks (user_id, title) VALUES "
+        "(42, 'a'), (42, 'b'), (42, 'c'), (42, 'd'), (99, 'e'), (99, 'f')",
+    ]
+
+
+@pytest.mark.parametrize("kind", ["BY DEFAULT", "ALWAYS"])
+class TestIdentityKeysOnServer:
+    def test_the_tenant_without_the_highest_ids_can_insert(self, make_tables, kind):
+        engine = make_tables(_identity_tasks(kind), ["tasks"])
+        _register_task_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            assert sandbox.provisional_key_columns == {"tasks": ["id"]}
+            sandbox.execute("INSERT INTO tasks (user_id, title) VALUES (42, 'new')")
+            changeset = sandbox.diff()
+            (diff,) = changeset.diffs
+            assert diff.new["id"] >= PROVISIONAL_KEY_BASE
+            assert changeset.is_valid is True
+
+            assert sandbox.commit_to_production() == 1
+            (assignment,) = sandbox.assigned_keys
+            assert assignment.provisional == {"id": diff.new["id"]}
+            assert assignment.assigned == {"id": 7}
+
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT user_id, title FROM tasks WHERE id = 7")).one()
+        assert tuple(row) == (42, "new")
+
+    def test_both_tenants_insert_and_the_sequence_stays_in_step(self, make_tables, kind):
+        engine = make_tables(_identity_tasks(kind), ["tasks"])
+        _register_task_validator()
+
+        for tenant in (42, 99):
+            with ShadowDB(engine, tables=["tasks"], tenant_id=tenant) as sandbox:
+                sandbox.execute(
+                    "INSERT INTO tasks (user_id, title) VALUES (:t, 'new')", {"t": tenant}
+                )
+                sandbox.commit_to_production()
+
+        # The application inserts as it always would.
+        with engine.begin() as conn:
+            conn.execute(text("INSERT INTO tasks (user_id, title) VALUES (42, 'app row')"))
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT id, user_id FROM tasks WHERE id > 6 ORDER BY id")
+            ).fetchall()
+        assert [tuple(r) for r in rows] == [(7, 42), (8, 99), (9, 42)]
+
+    def test_an_explicit_key_is_refused(self, make_tables, kind):
+        engine = make_tables(_identity_tasks(kind), ["tasks"])
+        _register_task_validator()
+
+        with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
+            sandbox.execute("INSERT INTO tasks (id, user_id, title) VALUES (9999, 42, 'explicit')")
+            assert sandbox.diff().is_valid is False
+            with pytest.raises(GeneratedValueError, match="supplies a value"):
+                sandbox.commit_to_production()
+
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 6
+
+
+# ============================================================
 # Foreign keys against a real server
 # ============================================================
 

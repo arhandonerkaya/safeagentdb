@@ -387,6 +387,20 @@ def _adapt_server_defaults(table: Table, unsupported: list[str]) -> list[str]:
     """Translate server defaults, returning the columns whose default was lost."""
     dropped: list[str] = []
     for col in table.columns:
+        if col.identity is not None:
+            # An identity column is filled by a sequence in production, like a
+            # serial, but reflects with the Identity itself as its default
+            # rather than a nextval() expression, so it is detected here.
+            kind = "ALWAYS" if col.identity.always else "BY DEFAULT"
+            col.identity = None
+            col.server_default = None
+            dropped.append(col.name)
+            unsupported.append(
+                f"{table.name}.{col.name}: GENERATED {kind} AS IDENTITY has no "
+                f"SQLite equivalent"
+            )
+            continue
+
         default = col.server_default
         if default is None:
             continue
@@ -489,8 +503,9 @@ def _enable_provisional_key(table: Table, generated: list[str]) -> str | None:
     """Let the sandbox stand in for a production sequence on this table.
 
     Returns the key column the sandbox will fill provisionally, or None when the
-    table does not qualify. Qualifying means the lost default belongs to a single
-    integer primary key column -- exactly the ``serial``/identity shape.
+    table does not qualify. Qualifying means the column -- one whose default was
+    lost, or one production fills by itself (``self_assigned_keys``) -- is a
+    single integer primary key: the ``serial``/identity/rowid shape.
 
     SQLite is switched to AUTOINCREMENT for the table so its counter persists in
     ``sqlite_sequence``, which ``seed_provisional_keys`` then moves above
@@ -682,6 +697,60 @@ def referential_actions(
     return {name: _sqlite_referential_actions(source_engine, name) for name in tables}
 
 
+def self_assigned_keys(source_engine: Engine, source_metadata: MetaData) -> dict[str, str]:
+    """{table: key column} for keys production fills by itself when one is omitted.
+
+    They carry no server default, so the lost-default path that makes a key
+    provisional never reaches them. Yet the sandbox cannot count on from the
+    cloned rows: the clone holds one tenant, production holds every tenant, so
+    the next key here is often one another tenant already has.
+
+    * SQLite: a rowid alias. SQLite's rule is narrower than it looks -- only the
+      exact type INTEGER, not ``INTEGER PRIMARY KEY DESC`` as a column
+      constraint, not a WITHOUT ROWID table -- so SQLite is asked how it reads
+      the column instead of the declaration being parsed. EXPLAIN only
+      compiles the query.
+    * MySQL and MariaDB: AUTO_INCREMENT, which their reflection reports as
+      ``autoincrement=True``. Elsewhere that attribute is the sentinel 'auto'
+      on every column and means nothing.
+
+    Unlike a sequence default, both take an explicit key as readily as they
+    generate one, so a key the agent supplies is written as given.
+    """
+    dialect = source_engine.dialect.name
+    if dialect not in ("sqlite", "mysql", "mariadb"):
+        return {}
+
+    candidates: dict[str, str] = {}
+    for table in source_metadata.tables.values():
+        pk_columns = list(table.primary_key.columns)
+        if len(pk_columns) == 1 and isinstance(pk_columns[0].type, Integer):
+            candidates[table.name] = pk_columns[0].name
+
+    if dialect != "sqlite":
+        return {
+            name: column
+            for name, column in candidates.items()
+            if source_metadata.tables[name].c[column].autoincrement is True
+        }
+
+    quote = source_engine.dialect.identifier_preparer.quote
+    found: dict[str, str] = {}
+    with source_engine.connect() as conn:
+        for name, column in candidates.items():
+            opcodes = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    f"EXPLAIN SELECT {quote(column)} FROM {quote(name)} NOT INDEXED"
+                )
+            }
+            # A rowid alias is read as the rowid, any other column as a column.
+            # Anything else is left alone rather than guessed at.
+            if "Rowid" in opcodes and "Column" not in opcodes:
+                found[name] = column
+    return found
+
+
 def find_cascade_references(
     source_engine: Engine,
     parent_tables: Sequence[str],
@@ -787,6 +856,7 @@ def clone_schema_to_sandbox(
     *,
     empty_tables: Sequence[str] | None = None,
     actions: dict[str, dict[tuple[str, ...], tuple[str | None, str | None]]] | None = None,
+    self_assigned: dict[str, str] | None = None,
 ) -> MetaData:
     """Recreate reflected table schemas in the sandbox engine.
 
@@ -806,6 +876,8 @@ def clone_schema_to_sandbox(
             pointing at them are dropped, since nothing could ever satisfy them.
         actions: Referential actions per table, from ``referential_actions()``,
             for a production whose reflection does not report them (SQLite).
+        self_assigned: Keys production fills by itself when omitted, from
+            ``self_assigned_keys()``. They are held provisionally too.
 
     Returns a new MetaData bound to the sandbox.
     """
@@ -816,6 +888,7 @@ def clone_schema_to_sandbox(
     converted: dict[str, dict[str, str]] = {}
     naive: dict[str, list[str]] = {}
     empty = set(empty_tables or ())
+    self_assigned = self_assigned or {}
 
     # .tables rather than .sorted_tables: sorting resolves foreign keys, which
     # raises if a target table was not reflected. Sorting happens after the
@@ -836,11 +909,19 @@ def clone_schema_to_sandbox(
         if conversions:
             converted[sandbox_table.name] = conversions
         dropped = _adapt_server_defaults(sandbox_table, unsupported)
+        delegated = None
         if dropped:
             generated[sandbox_table.name] = dropped
             delegated = _enable_provisional_key(sandbox_table, dropped)
-            if delegated:
-                provisional[sandbox_table.name] = [delegated]
+        if delegated is None and sandbox_table.name in self_assigned:
+            # Held provisionally like a lost sequence, but not recorded as
+            # generated: the key was not lost, so a value the agent supplies
+            # is still allowed.
+            delegated = _enable_provisional_key(
+                sandbox_table, [self_assigned[sandbox_table.name]]
+            )
+        if delegated:
+            provisional[sandbox_table.name] = [delegated]
         _drop_unenforceable_foreign_keys(
             sandbox_table, known_tables, empty, unsupported
         )

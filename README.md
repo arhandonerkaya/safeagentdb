@@ -276,10 +276,9 @@ raises `SchemaError`.
 
 #### Generated keys
 
-A `serial` or identity primary key is filled by a sequence that lives in
-production. SQLite has no equivalent, so the sandbox fills the column with a
-**placeholder** and the diff says so rather than showing an id that will not
-survive:
+A `serial` or identity (`GENERATED ... AS IDENTITY`) primary key is filled by a
+sequence that lives in production. SQLite has no equivalent, so the sandbox fills the column with a **placeholder** and
+the diff says so rather than showing an id that will not survive:
 
 ```
  + | tasks | INSERT | pending | id      | -- | (assigned by production)
@@ -320,6 +319,18 @@ Three things are still refused, with `GeneratedValueError`:
 
 A generated **non-key** column (a `gen_random_uuid()` default, say) is refused
 only when the agent leaves it empty; supplying a value is fine.
+
+A key production assigns by itself without a sequence -- a SQLite rowid alias
+(`id INTEGER PRIMARY KEY`, with or without `AUTOINCREMENT`) or a MySQL
+`AUTO_INCREMENT` column -- gets a placeholder too when the agent leaves it out,
+and is assigned and reported the same way. The clone holds one tenant, so the
+next id the sandbox would count to is often one another tenant already has.
+Unlike a sequence, these accept an explicit key, and applications assign them
+deliberately, so **a key the agent supplies is written as given**: production's
+own uniqueness check decides, and a key another tenant holds fails the commit
+with `IntegrityViolationError`. Whether a SQLite column is a rowid alias is
+asked of SQLite rather than read off the declaration, since `INT PRIMARY KEY`,
+`INTEGER PRIMARY KEY DESC` and `WITHOUT ROWID` tables are not.
 
 #### Reference tables
 
@@ -648,7 +659,7 @@ The sandbox is always in-memory SQLite. What differs is how well each
 |------------|---------|-----------------|
 | **PostgreSQL** | **First-class** | The production target SafeAgentDB is designed and tested for. CI runs the server-backed suite (`tests/test_server_backed.py`) against PostgreSQL 16: tenant isolation, compare-and-swap against a concurrent transaction, sequences, foreign keys and their order, cascades, key changes, `JSONB`/`ARRAY` and `timestamptz` round-trips. `JSONB`, `JSON`, `ARRAY` and `HSTORE` are carried as JSON text; `UUID`, `INET`, `CIDR`, `MACADDR`, `CITEXT`, `TSVECTOR` as text. |
 | **SQLite** | **Best-effort** | Exercised by most of the suite, which uses SQLite as the stand-in production, and the issues that were cheap to fix are fixed. The known limits are listed under [SQLite production](#sqlite-production). |
-| **MySQL / MariaDB** | **Untested** | Nothing in the library is MySQL-specific and every production statement is built from SQLAlchemy Core, so identifiers are quoted by the dialect. `TINYINT`/`MEDIUMINT` are integers in the sandbox; `ENUM`, `SET` and `YEAR` are carried as text. No test runs against a MySQL server, so treat this as unverified. |
+| **MySQL / MariaDB** | **Untested** | Nothing in the library is MySQL-specific and every production statement is built from SQLAlchemy Core, so identifiers are quoted by the dialect. `TINYINT`/`MEDIUMINT` are integers in the sandbox; `ENUM`, `SET` and `YEAR` are carried as text. `AUTO_INCREMENT` keys are held provisionally (see [Generated keys](#generated-keys)); the three tests for that in `tests/test_review_b1.py` were run against MySQL 8.0 and run when `MYSQL_DATABASE_URL` is set, but CI has no MySQL job and nothing else is tested against a MySQL server, so treat the rest as unverified. |
 | Others | Not supported | Other SQLAlchemy dialects may work, but nothing is known about them. |
 
 The production sync always uses the original production metadata; the type
@@ -849,7 +860,9 @@ container. They are skipped locally unless you set `DATABASE_URL`:
 DATABASE_URL=postgresql+psycopg2://user:pass@localhost/db python -m pytest -m requires_db
 ```
 
-MySQL is not covered; see [Supported Databases](#supported-databases).
+MySQL is not covered beyond the `AUTO_INCREMENT` tests in `tests/test_review_b1.py`,
+which run when `MYSQL_DATABASE_URL` is set; see
+[Supported Databases](#supported-databases).
 
 ### Operational notes
 
@@ -965,6 +978,7 @@ tests/
 |-- test_review_findings.py  The six findings of the second review (docs/AUDIT.md)
 |-- test_review_0_3.py       The findings of the pre-0.3.0 review (docs/REVIEW_0_3.md)
 |-- test_review_round4.py    Round 4 of that review: the findings in its fixes
+|-- test_review_b1.py        B-1, found by the benchmark: keys production assigns by itself
 '-- test_server_backed.py    Claims only a real server can settle (PostgreSQL in CI)
 
 docs/
