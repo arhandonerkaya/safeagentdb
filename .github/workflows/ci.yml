@@ -32,6 +32,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
+          # So tests/test_benchmark_harness.py runs instead of skipping. It
+          # needs pyyaml, and anthropic because benchmark.agent imports it; no
+          # test calls the API. CI-only: neither is a runtime dependency of
+          # the package, and the package job checks the wheel says so.
+          python -m pip install -r benchmark/requirements.txt
 
       - name: Run tests
         run: python -m pytest -q --junitxml=junit.xml
