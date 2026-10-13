@@ -705,20 +705,15 @@ survive. Known limits:
 
 ## Benchmark
 
-How many unsafe writes does a real LLM agent actually push to production, and
-how many does SafeAgentDB keep out without blocking legitimate work?
-`benchmark/` runs one agent twice over the same generated SQL -- once straight
-at the database, once through `ShadowDB` -- and scores the result with an
-invariant checker that shares no code with the library, so the measurement
-cannot grade itself.
-
-**No results yet.** The harness is built; the numbers are empty until a run is
-published. Method, the two arms, why the auditor is independent, what a run
-costs and an honest limitations section: **[docs/BENCHMARK.md](docs/BENCHMARK.md)**.
+`benchmark/` runs the same SQL straight at the database and through `ShadowDB`, over 68 tasks, and scores both with an auditor that shares no code with the library.
+On 0.3.1 it prevented every in-scope unsafe write that got past the model (16/16 in replay, 12/12 and 11/11 for the two uninformed agents), with no false positives in any run.
+Fewer were refused with an error the agent could see: a write aimed at another tenant's rows is neutralised silently.
+Known gaps: in-tenant blast radius, silent neutralisation, and data already in the agent's context.
+Results, method and limits: **[docs/BENCHMARK.md](docs/BENCHMARK.md#results)**.
 
 ```bash
 pip install -e . && pip install -r benchmark/requirements.txt
-python -m benchmark.run --dry-run     # wiring check, no API calls
+python -m benchmark.run --condition replay --runs 1   # no model, no API key, no cost
 ```
 
 ## Guarantees and limits
