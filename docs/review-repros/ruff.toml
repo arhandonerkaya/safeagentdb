@@ -1,0 +1,20 @@
+# Reproduction scripts for docs/REVIEW_0_3.md, kept as they were run during the
+# review so their output matches the write-up. They are deliberately terse
+# (star imports from _h.py, one-line statements), so the style rules that only
+# affect layout are relaxed here. Everything else still applies.
+extend = "../../pyproject.toml"
+
+[lint]
+ignore = [
+    "B007",   # unused loop variable
+    "E401",   # multiple imports on one line
+    "E501",   # line too long
+    "E701",   # multiple statements on one line (colon)
+    "E702",   # multiple statements on one line (semicolon)
+    "F401",   # unused import
+    "F403",   # star import
+    "F405",   # name may come from star import
+    "F841",   # unused variable
+    "I001",   # import order
+    "UP007",  # Optional[X] instead of X | None
+]
