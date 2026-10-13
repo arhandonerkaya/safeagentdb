@@ -691,3 +691,334 @@ generated-key, duplicate-key, changeset-mismatch and dependency-cycle errors.
 in the sandbox, and an agent-written `NULL` reaches production as JSON `'null'`.
 That matches SQLAlchemy's own `JSON` default (the control in `p2/t2` does the
 same), so it is noted rather than filed.
+
+---
+
+## Round 4 — review of the fixes
+
+Date: 2026-10-13 · Range: `1e18b73..bd4fda3` on `hardening-2` · Python 3.11.9,
+Windows. No library code was changed.
+
+A review of the 20 fixes above that looked only for correctness problems the
+fixes themselves introduced. It covered:
+
+- the sandbox key-change triggers;
+- the new statement order: INSERTs parents first, then UPDATEs, then DELETEs
+  children first, with rows ordered inside self-referencing tables;
+- the JSON and datetime round-trip;
+- the tracking of sandbox-generated keys;
+- `tenant_id` normalisation at `__enter__`;
+- whether every new exception path leaves production untouched.
+
+Every finding was reproduced against a local SQLite file database. The scripts
+are in [review-repros/p4/](review-repros/p4/). By default they run the working
+tree. To compare with the library as it was before the fixes, extract
+`1e18b73` and point `SAFEAGENTDB_ROOT` at it:
+
+```bash
+git archive 1e18b73 safeagentdb | tar -x -C /tmp/base
+SAFEAGENTDB_ROOT=/tmp/base python docs/review-repros/p4/r2_numeric_tenant.py
+```
+
+`prod_serial()` in `p4/_h.py` stands in for a PostgreSQL serial on SQLite. The
+key column is declared `DEFAULT (nextval('...'))`, which the sandbox cannot
+reproduce, so the key becomes provisional. A registered `nextval()` returns
+NULL, so production assigns the next rowid. Every script exits 0.
+`r9b_baseline_variant.py` is `r9` without `allow_cascades`, for running against
+`1e18b73`.
+
+### Index
+
+9 findings: **3 medium, 6 low**. Five of the six low findings either refuse a
+valid change or report the wrong cause. None of the six writes wrong data to
+production; R4-4 writes a different key from the one the agent set, and shows
+that it will.
+
+| ID | Severity | Kind | Summary |
+|----|----------|------|---------|
+| [R4-1](#r4-1) | Medium | Regression | The cascade check counts another tenant's rows (`'042'`) as the acting tenant's |
+| [R4-2](#r4-2) | Medium | Regression | A NUMERIC/DECIMAL tenant column refuses an integer `tenant_id` |
+| [R4-3](#r4-3) | Medium | Incomplete fix | UPDATEs are not ordered by row references |
+| [R4-4](#r4-4) | Low | Incomplete fix | A key set by UPDATE on the agent's own new row is treated as sandbox-generated |
+| [R4-5](#r4-5) | Low | Fails safe | An upsert on the agent's own new row blocks it |
+| [R4-6](#r4-6) | Low | Fails safe | A deleted key reused by a new row, then moved, is reported as a key change |
+| [R4-7](#r4-7) | Low | Limited | Inserting a forged log row hides a key change |
+| [R4-8](#r4-8) | Low | Fails safe | `ANALYZE` is refused as a schema change |
+| [R4-9](#r4-9) | Low | Message | `AgentSQLError` says earlier changes are kept after `OR ROLLBACK` discarded them |
+
+<a id="r4-1"></a>
+### R4-1 · Medium · The cascade check counts another tenant's rows as the acting tenant's
+
+**Code path.** `_referencing_rows()` classifies each referencing row with
+`same_tenant()` ([sync.py:631](../safeagentdb/sync.py#L631)). That converts the
+row's value to the tenant id's type with `normalise_tenant_id()`, which for an
+integer tenant id is `int(value.strip())`
+([diff.py:815](../safeagentdb/diff.py#L815)). So in a TEXT tenant column of a
+table that is not cloned, `'042'`, `'+42'` and `' 42'` all count as tenant 42.
+
+**Repro.** [p4/r9_text_tenant_overmatch.py](review-repros/p4/r9_text_tenant_overmatch.py):
+`parent.user_id INTEGER` is cloned. `share.user_id TEXT` is not cloned and holds
+a row for tenant `'042'` that references our parent `ON DELETE CASCADE`. The
+agent deletes the parent.
+
+```
+allow_cascades=False: CascadeError -> ... production would also act on 1 row(s) there that this changeset does n...
+   prod share: [(100, '042', 1)]
+allow_cascades=True: commit wrote 1
+   prod share: []
+```
+
+At `1e18b73` ([p4/r9b_baseline_variant.py](review-repros/p4/r9b_baseline_variant.py))
+the same row is refused as another tenant's:
+
+```
+CascadeError -> ... act on rows there belonging to 1 other tenant(s)
+```
+
+**Impact.** With `allow_cascades=True`, production deletes another tenant's row,
+which `allow_cascades` is documented to refuse in every case. The schema is
+unusual (integer tenant ids in the cloned tables, text ones in a referencing
+table), but this is the only finding in this round that crosses the tenant
+boundary.
+
+<a id="r4-2"></a>
+### R4-2 · Medium · A NUMERIC/DECIMAL tenant column refuses an integer `tenant_id`
+
+**Code path.** `_normalised_tenant_id()`
+([sandbox.py:602](../safeagentdb/sandbox.py#L602)) takes the tenant column's
+`python_type`, which is `Decimal` for `NUMERIC` and `DECIMAL`.
+`normalise_tenant_id()` has no conversion from `int` or `str` to `Decimal`, so
+`__enter__` raises `UsageError`.
+
+**Repro.** [p4/r2_numeric_tenant.py](review-repros/p4/r2_numeric_tenant.py):
+`tasks.user_id NUMERIC(10,0)`.
+
+```
+tenant_id=42: raised UsageError -> tenant_id 42 cannot be used for 'user_id', which holds Decimal values: 42 (int) does not convert exactly to Decimal. Pass the tenant id as Decimal.
+tenant_id='42': raised UsageError -> ...
+tenant_id=Decimal('42'): cloned [{'id': 1}] ... commit wrote 1
+```
+
+At `1e18b73`, `tenant_id=42` cloned and committed normally. `'42'` already
+failed there, as a tenant breach.
+
+**Impact.** A deployment whose tenant column is `NUMERIC` or `DECIMAL` breaks on
+upgrade to 0.3.0, even though an exact conversion from an integer always exists.
+
+<a id="r4-3"></a>
+### R4-3 · Medium · UPDATEs are not ordered by row references
+
+**Code path.** `_order_diffs()` orders rows inside the INSERT and DELETE phases,
+but sorts the UPDATE phase only by table rank and key
+([sync.py:855](../safeagentdb/sync.py#L855)). Primary-key changes are now
+refused, so this matters when a foreign key references a UNIQUE column that is
+not the primary key.
+
+**Repro.** [p4/r1_update_phase_unordered.py](review-repros/p4/r1_update_phase_unordered.py):
+`child.pcode REFERENCES parent(code)`, plain NO ACTION. The agent re-points the
+child from `'A'` to `'C'`, then renames parent `'A'` to `'Z'`. The same two
+statements run directly in production succeed.
+
+```
+control, same statements in prod: [(1, 42, 'Z'), (2, 42, 'C')] [(10, 42, 'C')]
+diff: [('child', 'UPDATE', {'id': 10}), ('parent', 'UPDATE', {'id': 1})] is_valid: True
+commit raised IntegrityViolationError -> Production rejected the UPDATE on 'parent' for row {'id': 1}: FOREIGN KEY constraint failed. ...
+```
+
+A variant in the same script changes a parent's code, then inserts a child that
+references the new code. The INSERT runs first and is rejected:
+
+```
+variant commit raised IntegrityViolationError -> Production rejected the INSERT on 'child' for row {'id': 11}: FOREIGN KEY constraint failed.
+```
+
+Both fail the same way at `1e18b73`, so this is not a regression. However, the
+CHANGELOG says "rows ordered by their references", and the README's list of
+changesets the unit-of-work order does not suit leaves this case out.
+
+**Impact.** A valid changeset that the diff calls SAFE cannot be committed.
+Nothing is written.
+
+<a id="r4-4"></a>
+### R4-4 · Low · A key set by UPDATE on the agent's own new row is treated as sandbox-generated
+
+**Code path.** The explicit-key trigger fires only `BEFORE INSERT`
+([engine.py:1050](../safeagentdb/engine.py#L1050)). The key-change log does see
+the UPDATE, but `_key_change_errors()` skips rows the agent inserted itself
+([sandbox.py:724](../safeagentdb/sandbox.py#L724)). `compute_diff()` then treats
+any value of 2^52 or more that is not in the explicit log as generated
+([diff.py:908](../safeagentdb/diff.py#L908)).
+
+**Repro.** [p4/r3_insert_then_update_key.py](review-repros/p4/r3_insert_then_update_key.py),
+with `prod_serial()`.
+
+```
+[explicit INSERT]        is_valid=False
+[explicit INSERT]        commit raised GeneratedValueError -> column(s) id in 'accounts' are assigned by production ..., but this row supplies a value.
+[INSERT then UPDATE id]  INSERT new={'id': 1234567890123456789, ...} pending=['id']
+[INSERT then UPDATE id]  is_valid=True
+[INSERT then UPDATE id]  commit wrote 1 assigned: [('accounts', {'id': 1234567890123456789}, {'id': 2})]
+[INSERT then UPDATE id]  prod: [(1, 42, 'existing'), (2, 42, 'new')]
+[with child]  notes INSERT False column(s) account_id in 'notes' reference a key that production has not assigned yet ...
+```
+
+**Impact.** The same end state is refused when reached one way and quietly
+rewritten when reached another, and production gets a different id from the
+one the agent set. It is visible: the dashboard shows "(assigned by
+production)" and `assigned_keys` records the new id. For values of 2^52 or more,
+P1-5's rule "decided by membership, never by size" does not hold on this path.
+
+<a id="r4-5"></a>
+### R4-5 · Low · An upsert on the agent's own new row blocks it
+
+**Code path.** The same `BEFORE INSERT ... WHEN NEW.id >= 2^52` trigger fires
+for an `INSERT ... ON CONFLICT DO UPDATE` or `INSERT OR IGNORE` that names an
+existing generated key, before the conflict is resolved. That generated key is
+then logged as explicit.
+
+**Repro.** [p4/r4_upsert_own_row.py](review-repros/p4/r4_upsert_own_row.py),
+with `prod_serial()`.
+
+```
+[plain UPDATE (control)]  is_valid=True []        commit wrote 1
+[ON CONFLICT DO UPDATE]   is_valid=False ["column(s) id in 'accounts' are assigned by production ..., but this row supplies a"]
+[INSERT OR IGNORE dup]    is_valid=False [same]
+```
+
+**Impact.** Fails safe. A valid change is refused, with a message that names the
+wrong cause.
+
+<a id="r4-6"></a>
+### R4-6 · Low · A deleted key reused by a new row, then moved, is reported as a key change
+
+**Code path.** `_key_change_errors()` replays the key log against `holder`, a
+map from each key now in use to the original key it came from. A DELETE is not
+logged, so a deleted original stays in `holder`. A later move of a new row that
+reuses that key is then blamed on the original
+([sandbox.py:698-742](../safeagentdb/sandbox.py#L698-L742)).
+
+**Repro.** [p4/r6_key_change_false_positive.py](review-repros/p4/r6_key_change_false_positive.py):
+DELETE row 1, INSERT a new row 1, UPDATE it to id 7.
+
+```
+diffs: [('DELETE', {'id': 1}), ('INSERT', {'id': 7})]
+is_valid: False
+blocking: ["Row {'id': 1} in 'tasks' had its row key changed to {'id': 7}. ..."]
+control diffs: [('DELETE', {'id': 1}), ('INSERT', {'id': 7})] is_valid: True
+```
+
+**Impact.** Fails safe. The same DELETE + INSERT, reached directly, is valid.
+
+<a id="r4-7"></a>
+### R4-7 · Low · Inserting a forged log row hides a key change
+
+**Code path.** `_make_read_only()` ([engine.py:1064](../safeagentdb/engine.py#L1064))
+protects the log tables from UPDATE and DELETE, but not from INSERT.
+`tracking_problems()` only checks that the TEMP objects still exist unchanged.
+
+**Repro.** [p4/s2_log_tamper.py](review-repros/p4/s2_log_tamper.py): after
+`UPDATE emp SET id = 5 WHERE id = 1`:
+
+```
+DELETE log: refused (...); key change still reported: True
+UPDATE log: refused (...); key change still reported: True
+INSERT reverse move: accepted; key change still reported: False; diffs=[('DELETE', {'id': 1}), ('INSERT', {'id': 5})]
+```
+
+**Impact.** Limited. What remains is a DELETE + INSERT that the diff shows
+truthfully, and a referential action on rows outside the diff is still refused
+unless `allow_cascades=True`. But tamper detection only covers tracking objects
+that were dropped or altered. It does not cover rows inserted into the log.
+
+<a id="r4-8"></a>
+### R4-8 · Low · `ANALYZE` is refused as a schema change
+
+**Code path.** `schema_signature()` ([engine.py:1118](../safeagentdb/engine.py#L1118))
+compares the whole of `sqlite_master`, and `ANALYZE` creates `sqlite_stat1`.
+
+**Repro.** [p4/r5_benign_statements_schema_error.py](review-repros/p4/r5_benign_statements_schema_error.py)
+
+```
+'ANALYZE': SchemaError -> The agent changed the sandbox schema (table 'sqlite_stat1' was created). ...
+'CREATE TEMP TABLE scratch AS SELECT * FROM tasks': diff ok, is_valid=True
+```
+
+`CREATE INDEX` and `CREATE VIEW` are refused as well, which is intended.
+
+**Impact.** Fails safe. A statement that changes no data makes the session
+impossible to commit.
+
+<a id="r4-9"></a>
+### R4-9 · Low · `AgentSQLError` says earlier changes are kept after `OR ROLLBACK` discarded them
+
+**Code path.** `execute()` always appends "Earlier changes are kept"
+([sandbox.py:316](../safeagentdb/sandbox.py#L316)). A statement with `OR ROLLBACK`
+conflict resolution, or a trigger's `RAISE(ROLLBACK)`, rolls back the agent's
+whole open transaction.
+
+**Repro.** [p4/r7_or_rollback.py](review-repros/p4/r7_or_rollback.py)
+
+```
+AgentSQLError -> The agent's statement failed in the sandbox: UNIQUE constraint failed: tasks.id. Earlier changes are kept.
+sandbox now: [{'id': 1, 'user_id': 42, 'title': 'a'}]
+diff: []
+```
+
+**Impact.** Message only. The diff correctly reflects the rolled-back sandbox,
+and production is not affected.
+
+### Suspected, not reproduced
+
+- **A PostgreSQL `numeric` tenant column on a referencing table that is not
+  cloned.** The driver returns `Decimal('42')`, which `same_tenant()` cannot
+  convert to an integer tenant id. The row would then count as another
+  tenant's, and the write would be refused with a false cross-tenant
+  `CascadeError` (fails safe). On SQLite the cascade check reads the driver's
+  plain `int`, so this could not be shown here.
+- **A PostgreSQL naive `timestamp` column.** An offset the agent writes, such as
+  `'2024-01-01 10:00:00+02:00'`, is decoded to an aware datetime and bound as
+  one. PostgreSQL would convert it by the session `TimeZone` and drop the offset
+  without saying so. Confirming this needs a PostgreSQL server.
+
+### Already documented, not counted
+
+- Deleting a row and inserting a new one with the same UNIQUE value now fails
+  with `IntegrityViolationError`, and nothing is written. At `1e18b73` the same
+  changeset committed
+  ([p4/d1_documented_unique_move.py](review-repros/p4/d1_documented_unique_move.py)).
+  The new order caused this change, but the README lists it as a known limit.
+- An `ON UPDATE` action on a cloned child ends in a `ConflictError` with
+  `allow_cascades=True` and in a `CascadeError` without it. The README lists
+  this too.
+
+### Checked and found sound
+
+- **Every new exception path leaves production untouched**
+  ([p4/r10_midway_errors_atomic.py](review-repros/p4/r10_midway_errors_atomic.py)).
+  Checked for `CascadeError`, `ConflictError`, a database error wrapped as
+  `SyncError`, and a `ConflictWarning` raised as an error, each thrown after
+  earlier INSERTs and UPDATEs had run.
+- **Key-change triggers** ([p4/s1_sound_checks.py](review-repros/p4/s1_sound_checks.py),
+  [p4/r8_rowid_key_change.py](review-repros/p4/r8_rowid_key_change.py),
+  [p4/s2_log_tamper.py](review-repros/p4/s2_log_tamper.py)):
+  - a change through the `rowid` alias is caught;
+  - a key changed and changed back is not reported;
+  - a two-row swap is reported for both rows;
+  - a change rolled back to a savepoint leaves no log entry;
+  - `INSERT ... RETURNING` works with the triggers installed;
+  - a dropped trigger raises `SchemaError`;
+  - DELETE and UPDATE on a non-empty log are refused.
+- **Row-level ordering** ([p4/s1_sound_checks.py](review-repros/p4/s1_sound_checks.py)):
+  a self-referencing chain inserted with descending keys commits. Deletes from
+  it commit under no action, `ON DELETE CASCADE` and `ON DELETE SET NULL`. A
+  real cycle between rows is blocked in `diff()`.
+- **JSON and datetimes** ([p4/s1_sound_checks.py](review-repros/p4/s1_sound_checks.py)):
+  - the JSON values `"123"`, `true` and `"null"` keep their type when copied;
+  - `1` → `true` is detected and written;
+  - a rewrite that only changes formatting is not a change;
+  - `+02:00` and `Z` offsets survive a copy;
+  - rows with datetimes in the `CURRENT_TIMESTAMP` format or as `T…Z` delete
+    without a false conflict.
+- **`tenant_id` normalisation** ([p4/s1_sound_checks.py](review-repros/p4/s1_sound_checks.py)):
+  `"42"` and `" 42 "` work for an integer column, and `"42.0"` and `True` are
+  refused.
