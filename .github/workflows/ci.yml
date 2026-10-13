@@ -101,9 +101,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,pg]"
+          # Without these tests/test_benchmark_harness.py is skipped at module
+          # level, and the guard below counts that as a skipped test.
+          python -m pip install -r benchmark/requirements.txt
 
+      # The MySQL tests are server-backed too, but need MYSQL_DATABASE_URL and a
+      # MySQL server this job does not have; they would only ever skip here.
       - name: Run the server-backed tests
-        run: python -m pytest -q -m requires_db --junitxml=junit.xml
+        run: >-
+          python -m pytest -q -m requires_db --junitxml=junit.xml
+          --deselect tests/test_review_b1.py::TestB1_MySQLAutoIncrement
 
       # A mis-set DATABASE_URL would skip every test and leave the job green,
       # which would be worse than no job at all.
