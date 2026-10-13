@@ -38,6 +38,8 @@ from sqlalchemy import create_engine
 from benchmark import audit as audit_module
 from benchmark import validators  # noqa: F401 -- importing registers the SafeModels
 from benchmark.agent import (
+    API_REFUSAL,
+    EMPTY_STATEMENTS,
     AgentConfig,
     AgentResult,
     EffortNotSupported,
@@ -220,12 +222,29 @@ class AgentFailing(RuntimeError):
     """
 
 
-def _agent_failure(agent: AgentResult) -> str | None:
-    """A short reason this call produced no SQL, or None if it worked."""
-    if agent.error:
-        return agent.error
+def _agent_error(agent: AgentResult) -> str | None:
+    """The call itself failed: API or transport. Nothing to measure, and
+    nothing about the model to read from it."""
+    return agent.error or None
+
+
+def _agent_decline(agent: AgentResult) -> str | None:
+    """The call worked and the model chose not to write SQL.
+
+    An outcome, not a failure: for an unsafe request it is the correct one. It
+    still leaves nothing for the two arms to execute, so the arms are skipped
+    and the record carries the model's own words instead.
+
+    Decided on the shape of the result rather than on the marker alone, so that
+    an empty statement list can never reach the arms and be reported as a task
+    that ran cleanly.
+    """
+    if agent.declined:
+        return agent.declined
     if agent.refusal:
-        return f"model refused ({agent.refusal})"
+        return API_REFUSAL
+    if not agent.statements:
+        return EMPTY_STATEMENTS
     return None
 
 
@@ -241,6 +260,9 @@ def run_once(
     client = None if dry_run else build_client()
     records: list[dict[str, Any]] = []
     opening_failures: list[str] = []
+    # Set once a task has actually been through the two arms, which proves the
+    # run can produce a measurement and turns the fail-fast guard off.
+    measured_any = False
 
     for task in tasks:
         tenant_id = int(task.get("tenant_id", TENANT_A))
@@ -253,13 +275,15 @@ def run_once(
         else:
             agent = generate_sql(client, config, task["prompt"], tenant_id)
 
-        failure = _agent_failure(agent)
+        error = _agent_error(agent)
+        declined = None if error else _agent_decline(agent)
         status = "unsafe" if task["expected"] == "unsafe" else "safe "
 
-        if failure is not None:
-            # No SQL means nothing to measure. Running the arms anyway produced
-            # "A:0v B:0v applied" -- indistinguishable from a clean task, which
-            # is how 68 failed calls looked like a successful run.
+        if error is not None or declined is not None:
+            # No SQL either way, so there is nothing for the arms to execute.
+            # Running them anyway produced "A:0v B:0v applied" -- indistinguishable
+            # from a clean task, which is how 68 failed calls looked like a
+            # successful run.
             records.append(
                 {
                     "run": run_index,
@@ -268,29 +292,39 @@ def run_once(
                     "expected": task["expected"],
                     "expected_effect": task["expected_effect"],
                     "tenant_id": tenant_id,
-                    "agent_error": failure,
+                    "agent_error": error,
+                    "agent_declined": declined,
                     "agent": agent.as_dict(),
                     "arm_a": None,
                     "arm_b": None,
                 }
             )
-            print(
-                f"  run {run_index} {task['id']:<28} {status} "
-                f"AGENT ERROR: {_short(failure)}"
-            )
+            if error is not None:
+                print(
+                    f"  run {run_index} {task['id']:<28} {status} "
+                    f"AGENT ERROR: {_short(error)}"
+                )
+            else:
+                print(
+                    f"  run {run_index} {task['id']:<28} {status} "
+                    f"DECLINED ({declined}): {_short(agent.answer, 60)}"
+                )
 
-            # Fail fast: three identical failures at the start means the rest of
-            # the suite will fail the same way and cost the same money.
-            if len(records) == len(opening_failures) + 1:
-                opening_failures.append(failure)
+            # Fail fast: the same failure every time, with nothing having worked
+            # yet, means the rest of the suite will fail the same way and cost
+            # the same money. Declines are not counted but do not clear the
+            # streak either: a model that declines still says nothing about
+            # whether the next call will be accepted.
+            if error is not None and not measured_any:
+                opening_failures.append(error)
                 if len(opening_failures) >= FAIL_FAST_AFTER and len(
                     set(opening_failures)
                 ) == 1:
                     raise AgentFailing(
-                        f"The first {FAIL_FAST_AFTER} agent calls all failed with "
-                        f"the same error, so the remaining "
+                        f"{FAIL_FAST_AFTER} agent calls failed with the same "
+                        f"error and nothing has run yet, so the remaining "
                         f"{len(tasks) - len(records)} would too. Stopping before "
-                        f"they are paid for.\n\n  {failure}"
+                        f"they are paid for.\n\n  {error}"
                     )
             continue
 
@@ -312,6 +346,7 @@ def run_once(
                 "expected_effect": task["expected_effect"],
                 "tenant_id": tenant_id,
                 "agent_error": None,
+                "agent_declined": None,
                 "agent": agent.as_dict(),
                 "arm_a": {
                     **arm_a,
@@ -325,6 +360,8 @@ def run_once(
                 },
             }
         )
+
+        measured_any = True
 
         print(
             f"  run {run_index} {task['id']:<28} {status} "
@@ -412,7 +449,8 @@ def main() -> None:
 
     finished = datetime.now(timezone.utc)
     raw = {
-        "schema_version": 1,
+        # 2 added agent_declined per record and agent_declines per file.
+        "schema_version": 2,
         "started_at": started.isoformat(),
         "finished_at": finished.isoformat(),
         "dry_run": args.dry_run,
@@ -422,6 +460,7 @@ def main() -> None:
         "agent_config": config.as_dict(),
         "stopped_early": stopped_early,
         "agent_errors": sum(1 for r in records if r.get("agent_error")),
+        "agent_declines": sum(1 for r in records if r.get("agent_declined")),
         "safeagentdb_version": _library_version(),
         "safeagentdb_commit": _library_commit(),
         "records": records,
@@ -440,6 +479,14 @@ def main() -> None:
         print(
             f"\n{failed} of {len(records)} agent call(s) failed and were "
             f"recorded as agent_error. They are excluded from every metric."
+        )
+
+    declines = raw["agent_declines"]
+    if declines:
+        print(
+            f"\n{declines} of {len(records)} agent call(s) declined to write SQL. "
+            f"That is an outcome, not a failure, and the report counts it as one. "
+            f"Each record keeps the model's answer under agent.answer."
         )
 
     print(f"\nraw results -> {out}")

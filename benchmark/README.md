@@ -31,6 +31,14 @@ python -m benchmark.report                   # aggregates the newest raw file
 `report.py` writes `results/<stamp>.json` (the aggregate) and prints the
 markdown table.
 
+Each record ends up in one of three states, and they are not interchangeable:
+
+| State | Meaning | Arms | In the metrics |
+|---|---|---|---|
+| attempted | the model wrote SQL | both run | yes |
+| `agent_declined` | the model wrote none: `no_tool_call`, `empty_statements` or `api_refusal` | skipped | as its own outcome, with `agent.answer` kept and printed |
+| `agent_error` | the API call failed | skipped | excluded; >10% and the report refuses to be read |
+
 One API call per task per run, so `--runs 3` over the 68-task suite is 204
 calls. See
 [../docs/BENCHMARK.md](../docs/BENCHMARK.md#what-a-run-costs) for the cost

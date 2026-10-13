@@ -132,6 +132,14 @@ class AgentConfig:
         }
 
 
+# The model produced no SQL, but the call itself worked. Kept apart from an
+# API error: for an unsafe request this is the correct outcome, and the first
+# real run threw 24 of them away as failures.
+NO_TOOL_CALL = "no_tool_call"
+EMPTY_STATEMENTS = "empty_statements"
+API_REFUSAL = "api_refusal"
+
+
 @dataclass
 class AgentResult:
     """What the agent produced for one task."""
@@ -141,6 +149,13 @@ class AgentResult:
     served_by: str | None = None
     stop_reason: str | None = None
     refusal: str | None = None
+    #: Why no SQL came back, when the call itself worked: one of
+    #: NO_TOOL_CALL, EMPTY_STATEMENTS, API_REFUSAL. A judgement by the model,
+    #: not a failure -- declining an unsafe request is the right answer.
+    declined: str | None = None
+    #: The model's own words for a declined call, kept so a human can read why.
+    answer: str = ""
+    #: An API or transport failure. Nothing about the model can be read from it.
     error: str | None = None
     seconds: float = 0.0
     usage: dict[str, int] = field(default_factory=dict)
@@ -156,6 +171,8 @@ class AgentResult:
             "served_by": self.served_by,
             "stop_reason": self.stop_reason,
             "refusal": self.refusal,
+            "declined": self.declined,
+            "answer": self.answer,
             "error": self.error,
             "seconds": round(self.seconds, 3),
             "usage": dict(self.usage),
@@ -309,6 +326,8 @@ def generate_sql(
     if response.stop_reason == "refusal":
         details = response.stop_details
         result.refusal = getattr(details, "category", None) or "refusal"
+        result.declined = API_REFUSAL
+        result.answer = _texts(response)
         return result
 
     for block in response.content:
@@ -319,13 +338,35 @@ def generate_sql(
                 str(s).strip().rstrip(";") for s in statements if str(s).strip()
             ]
             result.rationale = str(payload.get("rationale") or "")
+            if not result.statements:
+                # The sanctioned way to decline: the system prompt asks for an
+                # empty array with the reason in the rationale.
+                result.declined = EMPTY_STATEMENTS
+                result.answer = result.rationale or _texts(response)
             break
     else:
-        texts = [b.text for b in response.content if b.type == "text" and b.text]
-        result.error = "no tool call"
-        result.rationale = " ".join(texts)[:500]
+        # No tool call at all. The model answered in prose instead, which is
+        # how it usually declines an unsafe request.
+        result.declined = NO_TOOL_CALL
+        result.answer = _texts(response)
 
     return result
+
+
+def _texts(response: Any) -> str:
+    """The model's prose, kept whole: it is the record of why it declined.
+
+    Redacted on the way in, like the error messages. It is free text that ends
+    up in a results file, and the check before the file is written should stay
+    a backstop rather than the only guard.
+    """
+    return redact(
+        "\n\n".join(
+            block.text.strip()
+            for block in response.content
+            if block.type == "text" and block.text and block.text.strip()
+        )
+    )
 
 
 def main() -> None:
