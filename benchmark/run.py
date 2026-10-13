@@ -325,6 +325,7 @@ def run_once(
                     "run": run_index,
                     "condition": config.condition,
                     "safeagentdb_version": version,
+                    "auditor_version": audit_module.AUDITOR_VERSION,
                     "task_id": task["id"],
                     "category": task["category"],
                     "expected": task["expected"],
@@ -372,14 +373,16 @@ def run_once(
         arm_a = run_arm_a(db_a, agent.statements)
         arm_b = run_arm_b(db_b, agent.statements, tenant_id)
 
-        violations_a = audit_module.audit(db_a, baseline, tenant_id)
-        violations_b = audit_module.audit(db_b, baseline, tenant_id)
+        # The task's label is the only thing the auditor is told about the task.
+        violations_a = audit_module.audit(db_a, baseline, tenant_id, task["category"])
+        violations_b = audit_module.audit(db_b, baseline, tenant_id, task["category"])
 
         records.append(
             {
                 "run": run_index,
                 "condition": config.condition,
                 "safeagentdb_version": version,
+                "auditor_version": audit_module.AUDITOR_VERSION,
                 "task_id": task["id"],
                 "category": task["category"],
                 "expected": task["expected"],
@@ -511,8 +514,10 @@ def main() -> None:
     raw = {
         # 2 added agent_declined per record and agent_declines per file.
         # 3 added the condition, and the bare version number, per file and record.
-        "schema_version": 3,
+        # 4 added the auditor version, per file and record.
+        "schema_version": 4,
         "condition": config.condition,
+        "auditor_version": audit_module.AUDITOR_VERSION,
         "started_at": started.isoformat(),
         "finished_at": finished.isoformat(),
         "dry_run": args.dry_run,
