@@ -441,7 +441,7 @@ exception is kept as `__cause__`.
 | `IntegrityViolationError` | Production rejected a row the sandbox accepted, most often a `UNIQUE` collision with a row belonging to another tenant. Carries `.table` and `.row_key`, and the driver's `IntegrityError` as `__cause__`. |
 | `MissingValidatorError` | A table has no registered `SafeModel` and `require_validators` is `True`. Also subclasses `KeyError`, so 0.1.x handlers keep working. |
 | `DuplicateRowKeyError` | A row key does not identify a single row: two sandbox rows share it, or an INSERT carries a key production already holds. Carries `.table` and `.row_key`. |
-| `CascadeError` | A `DELETE`, or an `UPDATE` to a referenced column, would make production act on rows belonging to another tenant through a cascading foreign key. Carries `.table`, `.referencing_table`, `.tenants` and `.action`. |
+| `CascadeError` | A `DELETE`, or an `UPDATE` to a referenced column, would make production act on rows through a cascading foreign key that are not this tenant's to touch. Carries `.table`, `.referencing_table`, `.action`, and either `.tenants` (the other tenants that own them) or `.unattributed_rows` (how many rows had no determinable owner, because the referencing table has no tenant column). |
 | `ChangesetMismatchError` | `commit_to_production(changeset=...)` was given a changeset the sandbox no longer matches. Carries `.reviewed` and `.current` fingerprints. |
 | `MissingValidatorWarning` | Not an error: warned when `require_validators=False` and a row is written unvalidated. |
 | `ConflictWarning` | Not an error: warned once per row skipped under `on_conflict="ignore"`. |
@@ -607,9 +607,13 @@ honest version of what that means.
   pointing into a cloned table is now found at `__enter__` -- across all of
   production, not just the cloned tables -- reported in
   `unsupported_constraints`, and checked at commit: if the propagated effect
-  would reach another tenant, `CascadeError` rolls the changeset back. The
-  sandbox still cannot *preview* the effect, because the referencing table is
-  usually not cloned.
+  would reach another tenant, `CascadeError` rolls the changeset back.
+  **A referencing table with no tenant column blocks the write too**: its rows
+  cannot be attributed to anyone, and an unknown owner is not treated as the
+  acting tenant. An audit log keyed only on `task_id` is the usual shape, and
+  deleting such a parent has to go through the application. The sandbox still
+  cannot *preview* the effect, because the referencing table is usually not
+  cloned.
 - **Exactly what was reviewed**: `commit_to_production(changeset=...)` compares
   the changeset's fingerprint against a freshly computed diff and refuses if the
   sandbox moved on, so an approval cannot be widened after the fact.

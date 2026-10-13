@@ -118,7 +118,12 @@ class CascadeError(SyncError):
     Attributes:
         table: The table being written to.
         referencing_table: The table whose rows the database would also touch.
-        tenants: The other tenants whose rows would be affected.
+        tenants: The other tenants whose rows would be affected. Empty when the
+            referencing table has no tenant column -- see unattributed_rows.
+        unattributed_rows: How many referencing rows could not be attributed to
+            any tenant, because the referencing table has no tenant column. An
+            unknown owner is not treated as the acting tenant, so a non-zero
+            count blocks the write exactly as a known other tenant would.
         action: The referential action, e.g. "CASCADE".
     """
 
@@ -129,12 +134,14 @@ class CascadeError(SyncError):
         table: str | None = None,
         referencing_table: str | None = None,
         tenants: list[Any] | None = None,
+        unattributed_rows: int = 0,
         action: str | None = None,
     ) -> None:
         super().__init__(message)
         self.table = table
         self.referencing_table = referencing_table
         self.tenants = list(tenants or [])
+        self.unattributed_rows = unattributed_rows
         self.action = action
 
 

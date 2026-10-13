@@ -55,13 +55,14 @@ use a custom `row_key` or have cascading foreign keys.
   and plain output.
 - `ShadowDB.cascade_references` — the cascading foreign keys that point into the
   cloned tables.
-- `CascadeError`, `ChangesetMismatchError` and `DuplicateRowKeyError`.
+- `CascadeError` (with `.tenants` and `.unattributed_rows`),
+  `ChangesetMismatchError` and `DuplicateRowKeyError`.
 - `diff.tenant_breach()` and `RowDiff.logical_row()`, the shared helpers that
   keep `diff()` and the commit from disagreeing.
 - `sync.table_write_order()`, the topological table sort, which raises on a
   dependency cycle.
-- Seven more server-backed tests, bringing that suite to 19 against PostgreSQL
-  in CI. 203 local tests.
+- Eight more server-backed tests, bringing that suite to 20 against PostgreSQL
+  in CI. 208 local tests.
 
 ### Fixed
 
@@ -74,8 +75,11 @@ use a custom `row_key` or have cascading foreign keys.
 - **`ON DELETE CASCADE` crossed the tenant boundary.** Deleting a parent owned by
   one tenant also deleted another tenant's child, with nothing recorded or
   warned. Cascading keys across *all* of production are now found at open and
-  checked at commit. SQLAlchemy's SQLite inspector does not report referential
-  actions, so `PRAGMA foreign_key_list` is used there.
+  checked at commit. A referencing table with no tenant column blocks the write
+  too, reported as `CascadeError.unattributed_rows`, since an owner that cannot
+  be determined must not be read as the acting tenant. SQLAlchemy's SQLite
+  inspector does not report referential actions, so `PRAGMA foreign_key_list`
+  is used there.
 - **A populated `JSON` column crashed the sandbox open** with
   `sqlite3.ProgrammingError: type 'dict' is not supported`. Remapped columns now
   carry a conversion in each direction, and any `SQLAlchemyError` during

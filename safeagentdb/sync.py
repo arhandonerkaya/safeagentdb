@@ -21,6 +21,7 @@ hacks. Works identically on PostgreSQL, MySQL, and SQLite.
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from sqlalchemy import (
@@ -292,40 +293,69 @@ def _refuse_cross_tenant_cascade(
         if any(value is None for value in values):
             continue
 
-        affected = _referencing_tenants(
+        found = _referencing_rows(
             conn, reference, values, tenant_column, tenant_id
         )
-        if affected is None:
-            continue
-        if affected:
-            tenants = sorted(str(t) for t in affected)
+
+        if found.unattributed:
+            # An owner we cannot determine is not an owner we may assume. An
+            # audit log keyed only on task_id is the common shape here.
             raise CascadeError(
                 f"Refusing to {diff.diff_type.value} row {key!r} in "
                 f"'{diff.table}': '{reference.child_table}' references it "
-                f"{action}, so production would also act on "
-                f"{len(affected)} other tenant(s) worth of rows there "
+                f"{action} and has no '{tenant_column}' column, so the "
+                f"{found.unattributed} row(s) it holds for this key cannot be "
+                f"attributed to any tenant. SafeAgentDB will not treat an "
+                f"unknown owner as this tenant, so the whole changeset was "
+                f"rolled back. If '{reference.child_table}' genuinely belongs "
+                f"to whichever row it references, the delete has to be made "
+                f"through the application.",
+                table=diff.table,
+                referencing_table=reference.child_table,
+                unattributed_rows=found.unattributed,
+                action=action,
+            )
+
+        if found.tenants:
+            tenants = sorted(str(t) for t in found.tenants)
+            raise CascadeError(
+                f"Refusing to {diff.diff_type.value} row {key!r} in "
+                f"'{diff.table}': '{reference.child_table}' references it "
+                f"{action}, so production would also act on rows there "
+                f"belonging to {len(found.tenants)} other tenant(s) "
                 f"({tenant_column} in {tenants}). That is outside the tenant "
                 f"scope SafeAgentDB can enforce, so the whole changeset was "
                 f"rolled back.",
                 table=diff.table,
                 referencing_table=reference.child_table,
-                tenants=sorted(affected, key=str),
+                tenants=sorted(found.tenants, key=str),
                 action=action,
             )
 
 
-def _referencing_tenants(
+@dataclass(frozen=True)
+class _ReferencingRows:
+    """What a propagating foreign key would reach, beyond our own statement."""
+
+    tenants: set[Any]
+    unattributed: int
+
+
+def _referencing_rows(
     conn: Connection,
     reference: CascadeReference,
     values: list[Any],
     tenant_column: str,
     tenant_id: Any,
-) -> set[Any] | None:
-    """Tenants other than ours holding rows that reference the given key.
+) -> _ReferencingRows:
+    """Rows referencing the given key that are not ours to touch.
 
-    Returns an empty set when every referencing row is ours, and None when the
-    question cannot be asked -- a child table with no tenant column, where a
-    non-empty result is reported as the sentinel below instead.
+    Two separate answers, because they mean different things. ``tenants`` holds
+    the other tenants that own referencing rows. ``unattributed`` counts
+    referencing rows whose owner cannot be established at all, because the
+    referencing table has no tenant column -- an audit log keyed only on
+    task_id, say. Both block the write; conflating them would report a row with
+    no owner as though it belonged to a tenant we could name.
     """
     child = reference.child_table
     predicates = " AND ".join(
@@ -341,11 +371,10 @@ def _referencing_tenants(
     )
 
     if tenant_column not in columns:
-        # No tenant column: any referencing row is outside the sandbox's scope.
         count = conn.execute(
             text(f'SELECT COUNT(*) FROM "{child}" WHERE {predicates}'), params
         ).scalar_one()
-        return {f"<no {tenant_column} column>"} if count else set()
+        return _ReferencingRows(tenants=set(), unattributed=int(count or 0))
 
     rows = conn.execute(
         text(
@@ -353,7 +382,10 @@ def _referencing_tenants(
         ),
         params,
     ).fetchall()
-    return {row[0] for row in rows if row[0] != tenant_id}
+    return _ReferencingRows(
+        tenants={row[0] for row in rows if row[0] != tenant_id},
+        unattributed=0,
+    )
 
 
 def _refuse_existing_key(

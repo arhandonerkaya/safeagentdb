@@ -476,6 +476,56 @@ class TestCascadeOnServer:
             assert conn.execute(text("SELECT COUNT(*) FROM cparent")).scalar_one() == 1
             assert conn.execute(text("SELECT COUNT(*) FROM cchild")).scalar_one() == 1
 
+    AUDIT = [
+        """
+        CREATE TABLE atasks (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE aaudit (
+            id SERIAL PRIMARY KEY,
+            task_id INTEGER NOT NULL REFERENCES atasks(id) ON DELETE CASCADE,
+            event TEXT NOT NULL
+        )
+        """,
+        "INSERT INTO atasks (id, user_id, title) VALUES (1, 42, 'mine')",
+        "INSERT INTO aaudit (task_id, event) VALUES (1, 'created')",
+    ]
+
+    def test_an_unattributable_cascade_is_refused_on_the_server(self, make_tables):
+        """aaudit has no user_id column, so its rows cannot be attributed to a
+        tenant. An unknown owner must not be read as the acting tenant."""
+        from safeagentdb import CascadeError
+
+        engine = make_tables(self.AUDIT, ["aaudit", "atasks"])
+
+        class ATaskValidator(SafeModel):
+            __table_name__ = "atasks"
+            id: int
+            user_id: int
+            title: str
+
+        with ShadowDB(engine, tables=["atasks"], tenant_id=42) as sandbox:
+            assert any(
+                "aaudit" in item and "never cloned" in item
+                for item in sandbox.unsupported_constraints
+            ), sandbox.unsupported_constraints
+
+            sandbox.execute("DELETE FROM atasks WHERE id=1")
+            with pytest.raises(CascadeError) as excinfo:
+                sandbox.commit_to_production()
+
+        assert excinfo.value.referencing_table == "aaudit"
+        assert excinfo.value.unattributed_rows == 1
+        assert excinfo.value.tenants == []
+
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM atasks")).scalar_one() == 1
+            assert conn.execute(text("SELECT COUNT(*) FROM aaudit")).scalar_one() == 1
+
 
 class TestJsonOnServer:
     """Finding 3. On PostgreSQL the driver really does hand back a dict and a

@@ -26,6 +26,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from safeagentdb import (
+    CascadeError,
     SafeAgentDBError,
     SafeModel,
     SchemaError,
@@ -272,6 +273,161 @@ class TestCascadeCrossesTenants:
             assert conn.execute(text("SELECT COUNT(*) FROM parent")).scalar_one() == 0
             # SQLite's own cascade removed the child, which is correct here.
             assert conn.execute(text("SELECT COUNT(*) FROM child")).scalar_one() == 0
+
+
+# ------------------------------------------------------------------
+# 2b. A cascading child with NO tenant column at all
+#
+# An audit log keyed only on task_id is the common shape. Counting rows per
+# tenant cannot work there, so the question is what "unknown owner" means. It
+# must not mean "same tenant".
+# ------------------------------------------------------------------
+
+
+AUDIT_DDL = [
+    "CREATE TABLE tasks (\n"
+    " id INTEGER PRIMARY KEY,\n"
+    " tenant_id INTEGER NOT NULL,\n"
+    " title TEXT NOT NULL\n"
+    ")",
+    # No tenant column. Rows belong to whichever task they reference.
+    "CREATE TABLE audit_log (\n"
+    " id INTEGER PRIMARY KEY,\n"
+    " task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n"
+    " event TEXT NOT NULL\n"
+    ")",
+    "INSERT INTO tasks VALUES (1, 42, 'mine')",
+    "INSERT INTO tasks VALUES (2, 42, 'also mine')",
+]
+
+
+def _register_plain_task_validator():
+    class TaskValidator(SafeModel):
+        __table_name__ = "tasks"
+        id: int
+        tenant_id: int
+        title: str
+
+    return TaskValidator
+
+
+class TestCascadeWithNoTenantColumn:
+    def test_the_reference_is_reported_at_open(self, tmp_path):
+        engine, _ = _prod(tmp_path, "audit_open.db", AUDIT_DDL)
+        _register_plain_task_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, tenant_column="tenant_id"
+        ) as sandbox:
+            reported = sandbox.unsupported_constraints
+            assert any("audit_log" in item for item in reported), reported
+            assert any("CASCADE" in item.upper() for item in reported), reported
+            # The sandbox cannot see the rows at all, and says so.
+            assert any("never cloned" in item for item in reported), reported
+
+    def test_unattributable_referencing_rows_block_the_delete(self, tmp_path):
+        """An owner we cannot determine is not an owner we may assume."""
+        engine, _ = _prod(
+            tmp_path,
+            "audit_block.db",
+            AUDIT_DDL
+            + [
+                "INSERT INTO audit_log VALUES (10, 1, 'created')",
+                "INSERT INTO audit_log VALUES (11, 1, 'edited')",
+            ],
+        )
+        _register_plain_task_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, tenant_column="tenant_id"
+        ) as sandbox:
+            sandbox.execute("DELETE FROM tasks WHERE id=1")
+
+            with pytest.raises(CascadeError) as excinfo:
+                sandbox.commit_to_production()
+
+        error = excinfo.value
+        assert error.table == "tasks"
+        assert error.referencing_table == "audit_log"
+        assert error.unattributed_rows == 2
+        # No tenant can be named, so none is claimed.
+        assert error.tenants == []
+
+        message = str(error)
+        assert "no 'tenant_id' column" in message
+        assert "cannot be attributed to any tenant" in message
+        assert "unknown owner" in message
+        # The old wording invented a tenant count for this case.
+        assert "other tenant(s)" not in message
+
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 2
+            assert conn.execute(text("SELECT COUNT(*) FROM audit_log")).scalar_one() == 2
+
+    def test_a_delete_with_no_referencing_rows_still_goes_through(self, tmp_path):
+        """Only rows that actually reference the key block it. Task 2 has no
+        audit rows, so deleting it cascades to nothing."""
+        engine, _ = _prod(
+            tmp_path,
+            "audit_clear.db",
+            AUDIT_DDL + ["INSERT INTO audit_log VALUES (10, 1, 'created')"],
+        )
+        _register_plain_task_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, tenant_column="tenant_id"
+        ) as sandbox:
+            sandbox.execute("DELETE FROM tasks WHERE id=2")
+            assert sandbox.commit_to_production() == 1
+
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT id FROM tasks")).fetchall() == [(1,)]
+            assert conn.execute(text("SELECT COUNT(*) FROM audit_log")).scalar_one() == 1
+
+    def test_an_unrelated_update_is_unaffected(self, tmp_path):
+        """ON DELETE CASCADE propagates on delete only, so an ordinary update
+        must not be blocked by it."""
+        engine, _ = _prod(
+            tmp_path,
+            "audit_update.db",
+            AUDIT_DDL + ["INSERT INTO audit_log VALUES (10, 1, 'created')"],
+        )
+        _register_plain_task_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, tenant_column="tenant_id"
+        ) as sandbox:
+            sandbox.execute("UPDATE tasks SET title='renamed' WHERE id=1")
+            assert sandbox.commit_to_production() == 1
+
+        with engine.connect() as conn:
+            assert (
+                conn.execute(text("SELECT title FROM tasks WHERE id=1")).scalar_one()
+                == "renamed"
+            )
+
+    def test_the_unattributed_count_is_per_key(self, tmp_path):
+        """Rows referencing a different key are not counted against this one."""
+        engine, _ = _prod(
+            tmp_path,
+            "audit_perkey.db",
+            AUDIT_DDL
+            + [
+                "INSERT INTO audit_log VALUES (10, 1, 'for task 1')",
+                "INSERT INTO audit_log VALUES (11, 2, 'for task 2')",
+                "INSERT INTO audit_log VALUES (12, 2, 'also task 2')",
+            ],
+        )
+        _register_plain_task_validator()
+
+        with ShadowDB(
+            engine, tables=["tasks"], tenant_id=42, tenant_column="tenant_id"
+        ) as sandbox:
+            sandbox.execute("DELETE FROM tasks WHERE id=2")
+            with pytest.raises(CascadeError) as excinfo:
+                sandbox.commit_to_production()
+
+        assert excinfo.value.unattributed_rows == 2
 
 
 # ============================================================

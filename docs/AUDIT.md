@@ -295,9 +295,15 @@ nobody asked to sandbox — for propagating actions (`CASCADE`, `SET NULL`,
 `unsupported_constraints`, rendered in the diff, and exposed as
 `ShadowDB.cascade_references`. At commit, before a DELETE or an UPDATE touching
 a referenced column, the referencing rows are counted per tenant inside the
-transaction; rows belonging to another tenant, or in a child table with no
-tenant column at all, raise `CascadeError` and roll the changeset back. A
-cascade confined to the acting tenant still applies.
+transaction; rows belonging to another tenant raise `CascadeError` and roll
+the changeset back. A cascade confined to the acting tenant still applies.
+
+**The child with no tenant column.** An audit log keyed only on `task_id` is
+the common shape, and counting rows per tenant cannot work there. Those rows
+are reported as `CascadeError.unattributed_rows` and block the write exactly as
+a known other tenant would: an owner that cannot be determined is not an owner
+that may be assumed. Only rows actually referencing the key count, so deleting
+a parent nothing references still goes through.
 
 **Worth knowing:** SQLAlchemy's SQLite inspector returns an empty `options`
 dict for every foreign key, so the referential action is invisible there.
