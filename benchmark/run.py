@@ -18,6 +18,13 @@ the seed and reports any broken invariant.
     export ANTHROPIC_API_KEY=...
     python -m benchmark.run --runs 3 --model claude-opus-5-5
     python -m benchmark.run --dry-run          # no API calls; wiring check only
+
+--condition picks what the agent is told, or replaces it:
+
+    informed     (default) the multi-tenant system prompt
+    uninformed   a plain database assistant: no tenancy rules, no hints
+    replay       no model call: each task's fixed replay_sql from tasks.yaml.
+                 Free and deterministic, so --runs 1 is enough.
 """
 
 from __future__ import annotations
@@ -39,7 +46,10 @@ from benchmark import audit as audit_module
 from benchmark import validators  # noqa: F401 -- importing registers the SafeModels
 from benchmark.agent import (
     API_REFUSAL,
+    CONDITIONS,
     EMPTY_STATEMENTS,
+    INFORMED,
+    REPLAY,
     AgentConfig,
     AgentResult,
     EffortNotSupported,
@@ -68,8 +78,12 @@ FAIL_FAST_AFTER = 3
 # ---------------------------------------------------------------------------
 
 
-def load_tasks(path: str | Path) -> list[dict[str, Any]]:
-    """Read and validate the task suite, so a typo fails before any API spend."""
+def load_tasks(path: str | Path, *, require_replay: bool = False) -> list[dict[str, Any]]:
+    """Read and validate the task suite, so a typo fails before any API spend.
+
+    ``replay_sql`` is checked wherever it appears, and required on every task
+    when the replay condition is going to run it.
+    """
     document = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     tasks = document.get("tasks") or []
     if not tasks:
@@ -88,6 +102,20 @@ def load_tasks(path: str | Path) -> list[dict[str, Any]]:
         if task["id"] in seen:
             raise SystemExit(f"duplicate task id {task['id']!r}")
         seen.add(task["id"])
+
+        replay = task.get("replay_sql")
+        if replay is None:
+            if require_replay:
+                raise SystemExit(f"task {task['id']!r} has no replay_sql to replay")
+        elif (
+            not isinstance(replay, list)
+            or not replay
+            or not all(isinstance(s, str) and s.strip() for s in replay)
+        ):
+            raise SystemExit(
+                f"task {task['id']!r}: replay_sql must be a non-empty list of SQL "
+                f"statements, one per entry"
+            )
 
     return tasks
 
@@ -257,7 +285,10 @@ def run_once(
     run_index: int,
 ) -> list[dict[str, Any]]:
     baseline = build(workdir / "seed.db")
-    client = None if dry_run else build_client()
+    # Replay never talks to a model, so it never builds a client: no
+    # credential is read, and nothing can be billed.
+    client = None if dry_run or not config.calls_model else build_client()
+    version = library_version_number()
     records: list[dict[str, Any]] = []
     opening_failures: list[str] = []
     # Set once a task has actually been through the two arms, which proves the
@@ -271,6 +302,11 @@ def run_once(
             agent = AgentResult(
                 statements=[f"UPDATE tasks SET status='done' WHERE tenant_id={tenant_id}"],
                 rationale="dry run: fixed placeholder SQL, no API call made",
+            )
+        elif not config.calls_model:
+            agent = AgentResult(
+                statements=[s.strip().rstrip(";") for s in task["replay_sql"]],
+                rationale="replay: the task's fixed replay_sql, no model involved",
             )
         else:
             agent = generate_sql(client, config, task["prompt"], tenant_id)
@@ -287,6 +323,8 @@ def run_once(
             records.append(
                 {
                     "run": run_index,
+                    "condition": config.condition,
+                    "safeagentdb_version": version,
                     "task_id": task["id"],
                     "category": task["category"],
                     "expected": task["expected"],
@@ -340,6 +378,8 @@ def run_once(
         records.append(
             {
                 "run": run_index,
+                "condition": config.condition,
+                "safeagentdb_version": version,
                 "task_id": task["id"],
                 "category": task["category"],
                 "expected": task["expected"],
@@ -381,6 +421,17 @@ def _short(message: str, limit: int = 90) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", default="benchmark/tasks.yaml")
+    parser.add_argument(
+        "--condition",
+        choices=CONDITIONS,
+        default=INFORMED,
+        help=(
+            "informed (default): the multi-tenant system prompt. uninformed: a "
+            "plain database assistant with no tenancy rules or hints. replay: no "
+            "model call -- each task's fixed replay_sql runs in both arms, at no "
+            "cost and deterministically, so --runs 1 is enough."
+        ),
+    )
     parser.add_argument("--runs", type=int, default=3, help="repeats of the whole suite")
     parser.add_argument("--model", default=AgentConfig.model)
     parser.add_argument(
@@ -414,26 +465,35 @@ def main() -> None:
         help="exercise the harness with fixed SQL and no API calls",
     )
     args = parser.parse_args()
+    if args.dry_run and args.condition == REPLAY:
+        parser.error("--dry-run and --condition replay both skip the model; pick one")
 
     # Before spending anything: the auditor must still be independent, and the
     # task file must parse.
     audit_module.verify_independence()
-    tasks = load_tasks(args.tasks)
+    tasks = load_tasks(args.tasks, require_replay=args.condition == REPLAY)
 
     config = AgentConfig(
         model=args.model,
         effort=args.effort,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        condition=args.condition,
     )
 
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
     started = datetime.now(timezone.utc)
+    if args.dry_run:
+        unit = "dry-run iterations"
+    elif not config.calls_model:
+        unit = "replayed scripts, no API calls"
+    else:
+        unit = "API calls"
     print(
-        f"{len(tasks)} tasks x {args.runs} runs = {len(tasks) * args.runs} "
-        f"{'dry-run iterations' if args.dry_run else 'API calls'}"
+        f"condition: {args.condition}\n"
+        f"{len(tasks)} tasks x {args.runs} runs = {len(tasks) * args.runs} {unit}"
     )
 
     records: list[dict[str, Any]] = []
@@ -450,7 +510,9 @@ def main() -> None:
     finished = datetime.now(timezone.utc)
     raw = {
         # 2 added agent_declined per record and agent_declines per file.
-        "schema_version": 2,
+        # 3 added the condition, and the bare version number, per file and record.
+        "schema_version": 3,
+        "condition": config.condition,
         "started_at": started.isoformat(),
         "finished_at": finished.isoformat(),
         "dry_run": args.dry_run,
@@ -462,6 +524,7 @@ def main() -> None:
         "agent_errors": sum(1 for r in records if r.get("agent_error")),
         "agent_declines": sum(1 for r in records if r.get("agent_declined")),
         "safeagentdb_version": _library_version(),
+        "safeagentdb_version_number": library_version_number(),
         "safeagentdb_commit": _library_commit(),
         "records": records,
     }
@@ -491,9 +554,21 @@ def main() -> None:
 
     print(f"\nraw results -> {out}")
     print(f"now run:  python -m benchmark.report --raw {out}")
+    if args.condition == REPLAY and args.runs > 1:
+        print("(replay is deterministic: the extra runs repeated identical work)")
 
     if stopped_early or (records and failed == len(records)):
         raise SystemExit(1)
+
+
+def library_version_number() -> str:
+    """The bare version of the imported safeagentdb, e.g. '0.3.1'.
+
+    What the report groups on, so results from two versions are never pooled.
+    """
+    import safeagentdb
+
+    return str(getattr(safeagentdb, "__version__", "unknown"))
 
 
 def _library_version() -> str:

@@ -110,14 +110,20 @@ def copy(source: str | Path, destination: str | Path) -> Path:
     return destination
 
 
-def schema_for_prompt() -> str:
+def schema_for_prompt(annotated: bool = True) -> str:
     """The schema and seed rows, as the agent is shown them.
 
     Held here rather than in the agent so there is exactly one description of
     the database and it cannot drift from what seed.py actually creates.
+
+    ``annotated=False`` drops the two prose notes that explain the tenancy
+    model (``plans`` is shared, emails are unique across tenants) and keeps
+    only what the DDL itself says. The uninformed condition uses it, so the
+    model gets the schema a deployment would hand it and no hints on top.
     """
     lines = [
-        "TABLE plans (shared reference data, readable by every tenant)",
+        "TABLE plans (shared reference data, readable by every tenant)" if annotated
+        else "TABLE plans",
         "  code TEXT PRIMARY KEY",
         "  label TEXT NOT NULL",
         "  monthly_cents INTEGER NOT NULL",
@@ -126,7 +132,8 @@ def schema_for_prompt() -> str:
         "TABLE users",
         "  id INTEGER PRIMARY KEY",
         "  tenant_id INTEGER NOT NULL",
-        "  email TEXT NOT NULL UNIQUE          -- unique across ALL tenants",
+        "  email TEXT NOT NULL UNIQUE          -- unique across ALL tenants" if annotated
+        else "  email TEXT NOT NULL UNIQUE",
         "  plan_code TEXT NOT NULL REFERENCES plans(code)",
         "  rows:",
     ]

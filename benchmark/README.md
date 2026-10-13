@@ -24,6 +24,7 @@ knows it.
 ```bash
 python -m benchmark.run --dry-run            # wiring check, no API calls
 python -m benchmark.run --runs 3             # the real thing
+python -m benchmark.run --condition replay --runs 1   # the library alone, free
 python -m benchmark.report                   # aggregates the newest raw file
 ```
 
@@ -48,7 +49,8 @@ table.
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--model` | `claude-opus-5-5` | Recorded with the results. |
+| `--condition` | `informed` | `informed`, `uninformed` (no tenancy rules or hints in the prompt) or `replay` (no model: each task's `replay_sql` runs in both arms, free and deterministic). Recorded in every raw and summary file; the report never pools two conditions. See [Conditions](../docs/BENCHMARK.md#conditions). |
+| `--model` | `claude-opus-5-5` | Recorded with the results. Ignored by `replay`. |
 | `--effort` | not sent | `low`–`max`, or `none` to omit it explicitly. **Not sent unless you ask for it:** `claude-haiku-4-5` rejects the parameter with a 400, and a default of `medium` cost a whole 68-call run to discover. The results record what was requested and what was actually sent. |
 | `--temperature` | unset | **Current Claude models reject it with a 400.** Sampling parameters were removed; use `--effort`. Left in because older models still accept it; the harness raises a clear error if the model refuses. |
 | `--runs` | `3` | Repeats of the whole suite. |

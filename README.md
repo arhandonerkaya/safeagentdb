@@ -794,6 +794,16 @@ honest version of what that means.
 
 ### What the sandbox cannot catch
 
+- **Blast radius inside a tenant.** SafeAgentDB scopes every write to the
+  acting tenant, but puts no limit on how many of that tenant's own rows a
+  changeset may touch. A `DELETE` or `UPDATE` of every row the tenant owns
+  passes if it is otherwise valid: those are the tenant's rows, and the library
+  does not read intent. The benchmark measures exactly this in its `deletion`
+  and `mass_update` categories and reports them outside the in-scope block
+  rate; see
+  [Scope](docs/BENCHMARK.md#scope-what-the-library-claims-and-what-it-does-not).
+  If you need a ceiling, check `changeset.summary` (counts of INSERT, UPDATE
+  and DELETE) or `len(changeset.diffs)` before calling `commit_to_production()`.
 - **Anything listed in `unsupported_constraints`.** Dialect-specific column
   types are stored as `TEXT`/`VARCHAR`, so a malformed UUID passes in the
   sandbox and is rejected by production. Server defaults with no SQLite
