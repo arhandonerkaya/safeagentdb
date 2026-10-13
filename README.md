@@ -703,6 +703,20 @@ survive. Known limits:
 
 ---
 
+## Benchmark
+
+`benchmark/` runs the same SQL straight at the database and through `ShadowDB`, over 68 tasks, and scores both with an auditor that shares no code with the library.
+On 0.3.1 it prevented every in-scope unsafe write that reached it (16/16 in replay, 12/12 and 11/11 for the two uninformed agents), with no false positives in any run.
+An informed Sonnet let no in-scope unsafe write reach the library, so the library is a second line of defence, not the first.
+Fewer of those were refused with an error the agent could see: a write aimed at another tenant's rows is neutralised silently.
+Known gaps: in-tenant blast radius, silent neutralisation, and data already in the agent's context.
+Results, method and limits: **[docs/BENCHMARK.md](docs/BENCHMARK.md#results)**.
+
+```bash
+pip install -e . && pip install -r benchmark/requirements.txt
+python -m benchmark.run --condition replay --runs 1   # no model, no API key, no cost
+```
+
 ## Guarantees and limits
 
 SafeAgentDB is a safety net, not a proof of correctness. This section is the
@@ -776,6 +790,25 @@ honest version of what that means.
 
 ### What the sandbox cannot catch
 
+- **Blast radius inside a tenant.** SafeAgentDB scopes every write to the
+  acting tenant, but puts no limit on how many of that tenant's own rows a
+  changeset may touch. A `DELETE` or `UPDATE` of every row the tenant owns
+  passes if it is otherwise valid: those are the tenant's rows, and the library
+  does not read intent. The benchmark measures exactly this in its `deletion`
+  and `mass_update` categories and reports them outside the in-scope block
+  rate; see
+  [Scope](docs/BENCHMARK.md#scope-what-the-library-claims-and-what-it-does-not).
+  If you need a ceiling, check `changeset.summary` (counts of INSERT, UPDATE
+  and DELETE) or `len(changeset.diffs)` before calling `commit_to_production()`.
+- **Data the agent already has.** SafeAgentDB guards writes to the database. It
+  cannot stop an agent from writing data it already holds in its context -- from
+  the prompt, a previous read, or a tool's output -- into the acting tenant's own
+  rows. A statement like `INSERT ... VALUES ('<another tenant's title>')` names
+  no other tenant's row, so tenant scoping has nothing to refuse, and the write
+  is valid. The benchmark found exactly this: an agent copied another tenant's
+  task title, shown to it in the prompt, into its own tenant
+  ([details](docs/BENCHMARK.md#data-the-agent-already-has)). Keep other tenants'
+  data out of the agent's context; the library cannot take it back out.
 - **Anything listed in `unsupported_constraints`.** Dialect-specific column
   types are stored as `TEXT`/`VARCHAR`, so a malformed UUID passes in the
   sandbox and is rejected by production. Server defaults with no SQLite

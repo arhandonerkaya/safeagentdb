@@ -32,6 +32,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
+          # So tests/test_benchmark_harness.py runs instead of skipping. It
+          # needs pyyaml, and anthropic because benchmark.agent imports it; no
+          # test calls the API. CI-only: neither is a runtime dependency of
+          # the package, and the package job checks the wheel says so.
+          python -m pip install -r benchmark/requirements.txt
 
       - name: Run tests
         run: python -m pytest -q --junitxml=junit.xml
@@ -96,9 +101,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,pg]"
+          # Without these tests/test_benchmark_harness.py is skipped at module
+          # level, and the guard below counts that as a skipped test.
+          python -m pip install -r benchmark/requirements.txt
 
+      # The MySQL tests are server-backed too, but need MYSQL_DATABASE_URL and a
+      # MySQL server this job does not have; they would only ever skip here.
       - name: Run the server-backed tests
-        run: python -m pytest -q -m requires_db --junitxml=junit.xml
+        run: >-
+          python -m pytest -q -m requires_db --junitxml=junit.xml
+          --deselect tests/test_review_b1.py::TestB1_MySQLAutoIncrement
 
       # A mis-set DATABASE_URL would skip every test and leave the job green,
       # which would be worse than no job at all.
@@ -120,6 +132,70 @@ jobs:
               sys.exit("No server-backed test ran -- DATABASE_URL is not reaching them.")
           if skipped:
               sys.exit(f"{skipped} server-backed test(s) skipped; expected none.")
+          PY
+
+  package:
+    name: build artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build
+        run: python -m pip install --upgrade pip build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      # benchmark/ calls a paid LLM API. It must not reach anyone who installs
+      # the library, and config alone is too easy to undo by accident.
+      - name: Assert the benchmark is not shipped
+        run: |
+          python - <<'PY'
+          import sys
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          problems = []
+
+          for sdist in Path("dist").glob("*.tar.gz"):
+              with tarfile.open(sdist) as archive:
+                  names = archive.getnames()
+              leaked = [n for n in names if "/benchmark/" in n]
+              print(f"{sdist.name}: {len(names)} files, {len(leaked)} under benchmark/")
+              problems += [f"{sdist.name}: {n}" for n in leaked]
+
+          for wheel in Path("dist").glob("*.whl"):
+              with zipfile.ZipFile(wheel) as archive:
+                  names = archive.namelist()
+              leaked = [n for n in names if n.startswith("benchmark/")]
+              print(f"{wheel.name}: {len(names)} files, {len(leaked)} under benchmark/")
+              problems += [f"{wheel.name}: {n}" for n in leaked]
+
+              with zipfile.ZipFile(wheel) as archive:
+                  metadata = next(
+                      archive.read(n).decode()
+                      for n in names
+                      if n.endswith(".dist-info/METADATA")
+                  )
+              for line in metadata.splitlines():
+                  if line.startswith("Provides-Extra:") and "benchmark" in line:
+                      problems.append(f"{wheel.name}: advertises {line!r}")
+                  if line.startswith("Requires-Dist:") and "anthropic" in line:
+                      problems.append(f"{wheel.name}: declares {line!r}")
+
+          if problems:
+              sys.exit(
+                  "the benchmark leaked into a distribution:\n  "
+                  + "\n  ".join(problems)
+              )
+          print("benchmark/ absent from every artifact")
           PY
 
   lint:

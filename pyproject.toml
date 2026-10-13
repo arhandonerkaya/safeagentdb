@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "safeagentdb"
-version = "0.3.1"
+dynamic = ["version"]
 description = "Shadow-Sandbox DB Layer -- let AI agents modify your database safely with tenant isolation, Pydantic validation, and atomic sync."
 readme = "README.md"
 license = "MIT"
@@ -50,8 +50,19 @@ pg = ["psycopg2-binary>=2.9"]
 mysql = ["pymysql>=1.1"]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
+[tool.hatch.version]
+# One source of truth: the package the benchmark imports is the package
+# whose version gets published.
+path = "safeagentdb/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["safeagentdb"]
+
+[tool.hatch.build.targets.sdist]
+# The benchmark calls a paid LLM API. It must not reach anyone who installs
+# the library -- not as runnable code, and not as an advertised extra.
+# tests/, docs/ and examples/ stay: downstream packagers run the suite.
+exclude = ["/benchmark"]
 
 [tool.ruff]
 line-length = 100
@@ -61,6 +72,8 @@ target-version = "py310"
 select = ["E", "F", "I", "B", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
+# Report labels read better aligned than wrapped.
+"benchmark/report.py" = ["E501"]
 # Script-style files that deliberately import partway through, to show the
 # public import surface at the point it is exercised.
 "examples/hello_world.py" = ["E402"]
