@@ -301,7 +301,7 @@ test in `tests/test_review_round4.py` before it was fixed.
   (refined to row level by the pre-0.3.0 review, above), and rows that
   reference each other in a cycle are refused rather than attempted.
 
-## [0.2.0] - 2026-09-20
+## [0.2.0] - 2026-10-05
 
 A safety release. Every item under **Fixed** is a case where 0.1.x could lose or
 corrupt production data while reporting success. The four findings are written
@@ -459,15 +459,15 @@ If you are on 0.1.x, read **Breaking changes** before upgrading.
   partial view of production.
 - `ShadowDB.__enter__` disposes the sandbox engine if setup fails partway.
 
-## [0.1.2] - 2026-09-20
+## [0.1.2] - 2026-03-06
 
 - Use raw GitHub links in the README so images render on PyPI.
 
-## [0.1.1] - 2026-09-20
+## [0.1.1] - 2026-03-06
 
 - Documentation and safety screenshots.
 
-## [0.1.0] - 2026-09-20
+## [0.1.0] - 2026-03-06
 
 - Initial release: tenant-scoped SQLite sandbox, row-level diff dashboard,
   Pydantic validation and atomic sync to production.
