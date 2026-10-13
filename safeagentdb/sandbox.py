@@ -164,6 +164,7 @@ class ShadowDB:
         self._unsupported: list[str] = []
         self._cascade_references: list[CascadeReference] = []
         self._converted_columns: dict[str, dict[str, str]] = {}
+        self._naive_datetime_columns: dict[str, list[str]] = {}
         self._generated_columns: dict[str, list[str]] = {}
         self._skipped_conflicts: list[SkippedConflict] = []
         self._assigned_keys: list[AssignedKey] = []
@@ -253,6 +254,12 @@ class ShadowDB:
         self._converted_columns = dict(
             self._sandbox_metadata.info.get("converted_columns", {})
         )
+        # SQLite production keeps the offset as text (P2-3), so only a server
+        # with a real timestamp-without-time-zone type is checked.
+        if self.prod_engine.dialect.name != "sqlite":
+            self._naive_datetime_columns = dict(
+                self._sandbox_metadata.info.get("naive_datetime_columns", {})
+            )
 
         # Fail fast, before any data is copied, if rows cannot be identified.
         self._row_keys = self._resolve_row_keys()
@@ -300,20 +307,33 @@ class ShadowDB:
         and ``UUID`` values are bound as text.
 
         Raises:
-            AgentSQLError: If the statement fails. The sandbox keeps everything
-                done before it; the driver's error is the ``__cause__``.
+            AgentSQLError: If the statement fails; the driver's error is the
+                ``__cause__``. The message says whether the agent's earlier
+                changes survived: usually they do, but ``OR ROLLBACK`` or a
+                trigger's ``RAISE(ROLLBACK)`` discards every change since the
+                sandbox was opened or last diffed.
             UsageError: Outside the ``with`` block.
         """
         self._ensure_open()
+        dbapi = self.session.connection().connection.dbapi_connection
+        was_open = dbapi.in_transaction
         try:
             if params:
                 bound = {name: _bindable_param(value) for name, value in params.items()}
                 return self.session.execute(text(sql), bound)
             return self.session.connection().exec_driver_sql(sql)
         except SQLAlchemyError as exc:
+            if was_open and not dbapi.in_transaction:
+                outcome = (
+                    "SQLite rolled back the sandbox's open transaction with it, so "
+                    "every change since the sandbox was opened or last diffed was "
+                    "discarded"
+                )
+            else:
+                outcome = "Earlier changes are kept"
             raise AgentSQLError(
                 f"The agent's statement failed in the sandbox: "
-                f"{getattr(exc, 'orig', None) or exc}. Earlier changes are kept."
+                f"{getattr(exc, 'orig', None) or exc}. {outcome}."
             ) from exc
 
     def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -403,6 +423,7 @@ class ShadowDB:
             converted_columns=self._converted_columns,
             explicit_keys=explicit,
             provisional_references=self._provisional_references,
+            naive_datetime_columns=self._naive_datetime_columns,
         )
         changeset.blocking_errors.extend(self._key_change_errors(original, current, key_changes))
         changeset.blocking_errors.extend(self._preflight_errors(changeset))
@@ -699,7 +720,7 @@ class ShadowDB:
         self,
         original: dict[str, list[dict[str, Any]]],
         current: dict[str, list[dict[str, Any]]],
-        key_changes: dict[str, list[tuple[tuple, tuple]]],
+        key_changes: dict[str, list[tuple[tuple, tuple | None]]],
     ) -> list[str]:
         """Rows whose row key the agent changed with an UPDATE.
 
@@ -709,8 +730,8 @@ class ShadowDB:
         UPDATE action the agent's statement triggers -- deleting children an
         UPDATE would have re-pointed, say. That is not what was reviewed, so it
         is refused. The changes are replayed in order, so a key changed and
-        changed back is not reported, and a row moved and then deleted is a
-        plain DELETE.
+        changed back is not reported, a row moved and then deleted is a plain
+        DELETE, and a new row reusing a deleted row's key is not that row.
         """
         problems: list[str] = []
         for table_name, moves in sorted(key_changes.items()):
@@ -724,6 +745,9 @@ class ShadowDB:
                 source = holder.pop(old, None)
                 if source is None:
                     continue  # a row the agent inserted itself
+                if new is None:
+                    del position[source]  # deleted: no longer tracked
+                    continue
                 position[source] = new
                 holder[new] = source
 

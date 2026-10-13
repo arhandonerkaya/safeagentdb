@@ -15,10 +15,11 @@ Safety guarantees:
    SET NULL, SET DEFAULT) on rows the diff does not show is refused, unless
    ``allow_cascades=True``; one that would reach another tenant always is
 9. Statements run in the standard unit-of-work order -- INSERTs parents first,
-   then UPDATEs, then DELETEs children first, with rows of one table ordered by
-   the references between them -- as a deterministic function of the
-   changeset, so two concurrent changesets cannot deadlock by touching the
-   same rows in opposite orders
+   then UPDATEs, then DELETEs children first -- except where a foreign key
+   between two rows of the changeset needs otherwise, in any table and any
+   phase; rows whose references allow no order are refused. The order is a
+   deterministic function of the changeset, so two concurrent changesets cannot
+   deadlock by touching the same rows in opposite orders
 
 Builds every statement, including the cascade check, from SQLAlchemy Core
 constructs, so identifiers are quoted by the dialect in use.
@@ -813,19 +814,22 @@ def _foreign_keys(
 # The standard unit-of-work order. INSERTs come first, parents before
 # children, so every new row's parent exists; UPDATEs next, so a child is
 # re-pointed before its old parent goes; DELETEs last, children before parents.
+# A reference between two rows overrides it (see _order_rows).
 _PHASES = (DiffType.INSERT, DiffType.UPDATE, DiffType.DELETE)
 
 
 def _order_diffs(changeset: ChangeSet, metadata: MetaData) -> list[RowDiff]:
     """The changeset in an order production will accept.
 
-    Within the INSERT and DELETE phases rows are ordered by the references
-    between them, across tables and inside one table alike, so a manager is
-    inserted before a report keyed below it and deleted after it. Ties fall to
-    the topological table order and then the row key, so the result is a total
-    deterministic function of the changeset: two concurrent commits take shared
-    rows in the same order and cannot deadlock against each other. Rows that
-    reference each other in a cycle have no such order and are refused.
+    Rows are ordered by the references between them, across tables, inside one
+    table and across phases alike: a manager is inserted before a report keyed
+    below it and deleted after it, a child is re-pointed before the UNIQUE value
+    it referenced changes, and a parent takes a new value before a child
+    references it. Otherwise rows follow the phases, then the topological table
+    order, then the row key, so the result is a total deterministic function of
+    the changeset: two concurrent commits take shared rows in the same order
+    and cannot deadlock against each other. Rows whose references have no such
+    order are refused.
     """
     try:
         order = table_write_order(_dependencies(metadata))
@@ -842,47 +846,66 @@ def _order_diffs(changeset: ChangeSet, metadata: MetaData) -> list[RowDiff]:
         if diff.diff_type == DiffType.DELETE:
             position = depth - position
         return (
+            _PHASES.index(diff.diff_type),
             position,
             diff.table,
             tuple(sorted((k, repr(v)) for k, v in (diff.pk or {}).items())),
         )
 
-    ordered: list[RowDiff] = []
-    for phase in _PHASES:
-        group = sorted(
-            (d for d in changeset.diffs if d.diff_type == phase), key=tie_break
-        )
-        if phase == DiffType.UPDATE:
-            ordered.extend(group)
-        else:
-            ordered.extend(_order_rows(group, fks, tie_break, phase))
-    return ordered
+    return _order_rows(sorted(changeset.diffs, key=tie_break), fks, tie_break)
 
 
 def _reference_key(values: list[Any]) -> str:
     return json.dumps(canonical_value(list(values)), sort_keys=True)
 
 
+def _gained_and_lost(
+    diff: RowDiff, columns: tuple[str, ...]
+) -> tuple[str | None, str | None]:
+    """The value of ``columns`` this row starts to hold, and the one it stops
+    holding, as reference keys. None where there is none, or it is NULL."""
+
+    def key(row: dict[str, Any] | None) -> str | None:
+        if row is None:
+            return None
+        values = [row.get(c) for c in columns]
+        if any(v is None for v in values):
+            return None
+        return _reference_key(values)
+
+    new, old = key(diff.new), key(diff.old)
+    if new == old:
+        return None, None
+    return new, old
+
+
 def _order_rows(
     group: list[RowDiff],
     fks: list[tuple[str, tuple[str, ...], str, tuple[str, ...]]],
     tie_break: Any,
-    phase: DiffType,
 ) -> list[RowDiff]:
-    rows = [(d.new if phase == DiffType.INSERT else d.old) or {} for d in group]
+    """Order rows so every foreign key holds after each statement.
 
-    index: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] = {}
+    For each foreign key, a referenced value a row starts to hold (an INSERT,
+    or an UPDATE that changes it) must exist before any child starts to
+    reference it, and a value a row stops holding (a DELETE, or an UPDATE that
+    changes it) must be released by every child first. Rows nothing constrains
+    run in ``tie_break`` order.
+    """
+    # {(parent, parent columns): {value: rows gaining it}}, and the same for
+    # rows losing it.
+    gains: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] = {}
+    losses: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] = {}
     targets = {(parent, parent_cols) for _c, _cc, parent, parent_cols in fks}
     for position, diff in enumerate(group):
         for parent, parent_cols in targets:
             if diff.table != parent:
                 continue
-            values = [rows[position].get(c) for c in parent_cols]
-            if any(v is None for v in values):
-                continue
-            index.setdefault((parent, parent_cols), {}).setdefault(
-                _reference_key(values), []
-            ).append(position)
+            gained, lost = _gained_and_lost(diff, parent_cols)
+            if gained is not None:
+                gains.setdefault((parent, parent_cols), {}).setdefault(gained, []).append(position)
+            if lost is not None:
+                losses.setdefault((parent, parent_cols), {}).setdefault(lost, []).append(position)
 
     # before[i]: rows that must be written before row i.
     before: list[set[int]] = [set() for _ in group]
@@ -890,15 +913,13 @@ def _order_rows(
         for child, child_cols, parent, parent_cols in fks:
             if diff.table != child:
                 continue
-            values = [rows[position].get(c) for c in child_cols]
-            if any(v is None for v in values):
-                continue
-            for other in index.get((parent, parent_cols), {}).get(_reference_key(values), []):
-                if other == position:
-                    continue  # a row referencing itself is one statement
-                if phase == DiffType.INSERT:
+            target = (parent, parent_cols)
+            gained, lost = _gained_and_lost(diff, child_cols)
+            for other in gains.get(target, {}).get(gained, []) if gained else []:
+                if other != position:  # a row referencing itself is one statement
                     before[position].add(other)
-                else:
+            for other in losses.get(target, {}).get(lost, []) if lost else []:
+                if other != position:
                     before[other].add(position)
 
     waiting = [set(deps) for deps in before]
@@ -925,9 +946,13 @@ def _order_rows(
         described = ", ".join(f"'{d.table}' {d.pk!r}" for d in stuck)
         raise SchemaError(
             f"These rows reference each other in a cycle: {described}. There is "
-            f"no order in which production would accept the {phase.value}s one "
-            f"statement at a time, so SafeAgentDB will not guess one. Commit "
-            f"them in separate changesets, or break the cycle with a NULL first."
+            f"no order in which production would accept these statements one at "
+            f"a time, so SafeAgentDB will not guess one. This happens when rows "
+            f"point at each other, or when a child follows a parent's new "
+            f"referenced value (as ON UPDATE CASCADE does in the sandbox): the "
+            f"parent would have to change both before and after the child. "
+            f"Commit them in separate changesets, or break the cycle with a "
+            f"NULL first."
         )
     return result
 
@@ -1033,8 +1058,9 @@ def _execute(
             f"enforces something the tenant-scoped clone could not check -- "
             f"typically a row in another tenant or in a table that was not "
             f"cloned -- or the statement order SafeAgentDB uses (INSERTs, then "
-            f"UPDATEs, then DELETEs) does not suit this changeset, as when a "
-            f"unique value moves from a deleted row to a new one.",
+            f"UPDATEs, then DELETEs, adjusted only for foreign keys between "
+            f"the rows) does not suit this changeset, as when a unique value "
+            f"moves from a deleted row to a new one.",
             table=diff.table,
             row_key=row_key,
         ) from exc

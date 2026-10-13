@@ -727,6 +727,28 @@ NULL, so production assigns the next rowid. Every script exits 0.
 `r9b_baseline_variant.py` is `r9` without `allow_cascades`, for running against
 `1e18b73`.
 
+### Status after the fixes
+
+Added after the review, on `hardening-2`. Each reproduction became a test in
+`tests/test_review_round4.py` that failed first, then was fixed; the two
+suspected PostgreSQL cases, and R4-2 and R4-3, also have tests in
+`tests/test_server_backed.py`. The scripts in `p4/` are kept as they were run;
+run against the working tree they now print the fixed behaviour.
+
+| ID | Status | Resolution |
+|----|--------|------------|
+| R4-1 | Fixed | `same_tenant()` compares exactly, after a lossless conversion only: `'042'`, `'+42'`, `' 42'`, `'42.0'` and `42.0` are not tenant 42; `Decimal('42')` and `'42'` are. |
+| R4-2 | Fixed | `normalise_tenant_id()` takes any exact conversion between `int`, `Decimal` and integer text. |
+| R4-3 | Fixed | One ordering over the whole changeset: a referenced value a row gains is written before a child references it, and a child stops referencing a value before its row loses it, across tables and phases. Rows with no such order, including a cloned child under `ON UPDATE CASCADE`, are refused in `diff()`. |
+| R4-4 | Fixed | The explicit-key trigger also fires `BEFORE UPDATE OF` the key column. |
+| R4-5 | Documented | README known limits. |
+| R4-6 | Fixed | DELETEs are logged too, and a deleted original is dropped from the replay. |
+| R4-7 | Documented | README known limits. |
+| R4-8 | Fixed | `sqlite_stat1` and `sqlite_stat4` are left out of the schema signature. |
+| R4-9 | Fixed | The message checks whether the sandbox transaction survived and says so either way. |
+| Suspected: `numeric` tenant on an uncloned child | Tested | Passes on PostgreSQL with the R4-1 comparison. |
+| Suspected: naive `timestamp` | Fixed | An offset-aware value for a column without time zone is refused in `diff()` and at commit (non-SQLite production). |
+
 ### Index
 
 9 findings: **3 medium, 6 low**. Five of the six low findings either refuse a

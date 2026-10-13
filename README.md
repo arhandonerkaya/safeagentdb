@@ -85,8 +85,9 @@ Gate 6: COMPARE AND SWAP
 
 Gate 7: ATOMIC SYNC
   The entire changeset executes in ONE transaction, in unit-of-work order
-  (INSERTs parents first, then UPDATEs, then DELETEs children first),
-  writing only the columns the agent actually changed.
+  (INSERTs parents first, then UPDATEs, then DELETEs children first, except
+  where a foreign key between two of its rows needs otherwise), writing
+  only the columns the agent actually changed.
 ```
 
 The gates that need only the sandbox and the schema also run inside `diff()`,
@@ -235,9 +236,10 @@ ShadowDB(
 ```
 
 `tenant_id` is converted once, at `__enter__`, to the Python type of the tenant
-column, so `"42"` taken from a URL works for an integer column and every later
-comparison is like with like. A value that does not convert exactly
-(`"forty-two"`, `"42.0"`) raises `UsageError`.
+column, so `"42"` taken from a URL works for an integer column, `42` works for
+a `NUMERIC` one, and every later comparison is like with like. A value that does
+not convert exactly (`"forty-two"`, `"42.0"`, `Decimal("42.5")` for an integer
+column) raises `UsageError`.
 
 **Keyword options:**
 
@@ -661,7 +663,10 @@ as follows:
   sandbox, as in SQLAlchemy's own `JSON` type.
 - **Datetimes**: held as ISO 8601 text, which keeps a UTC offset. A
   `timestamptz` keeps its instant; on a SQLite production the stored text is
-  read as it is and an offset is written back with the value.
+  read as it is and an offset is written back with the value. A value with an
+  offset for a column without time zone (PostgreSQL `timestamp`) is refused,
+  since the database would convert it by its session time zone and drop the
+  offset without saying so; write the time without an offset.
 - **Text-mapped types** (`UUID`, `INET`, ...): held and written back as text.
 
 #### SQLite production
@@ -717,7 +722,11 @@ honest version of what that means.
   permits it within the tenant. **Another tenant's rows, and rows with no
   determinable owner, are refused either way**: an audit log keyed only on
   `task_id` cannot be attributed to anyone, and an unknown owner is not treated
-  as the acting tenant. When the referencing table is cloned, the sandbox runs
+  as the acting tenant. A referencing row is the acting tenant's only when its
+  tenant value equals the tenant id after a lossless conversion: `42`,
+  `Decimal("42")` and `'42'` are tenant 42, while `'042'`, `'+42'`, `' 42'` and
+  `'42.0'` in a `TEXT` column belong to another tenant. When the referencing
+  table is cloned, the sandbox runs
   the action itself, so the diff shows its effect and the commit needs no
   opt-in.
 - **Key changes**: an `UPDATE` that changes a row key is refused, because it
@@ -744,11 +753,15 @@ honest version of what that means.
   sandbox. Supplying one by hand, or pointing at a placeholder that does not
   exist yet, is refused with `GeneratedValueError`.
 - **Statement order**: INSERTs parents first, then UPDATEs, then DELETEs
-  children first, with rows of the same table (an org chart, a comment thread)
-  ordered by their references. Re-pointing a child and then deleting its old
-  parent commits. Rows that reference each other in a cycle have no order
-  production would accept one statement at a time, and are refused in
-  `diff()`.
+  children first, except where a foreign key between two rows of the changeset
+  needs otherwise -- in one table (an org chart, a comment thread) or across
+  tables, and including a foreign key onto a `UNIQUE` column that is not the
+  primary key. A value a parent starts to hold is written before any child
+  references it, and a child stops referencing a value before its parent gives
+  it up: re-pointing a child and then deleting or renaming its old parent
+  commits. Rows with no order production would accept one statement at a time
+  -- rows that reference each other in a cycle, or a child that follows its
+  parent's new value through `ON UPDATE CASCADE` -- are refused in `diff()`.
 
 ### What the sandbox cannot catch
 
@@ -794,11 +807,23 @@ honest version of what that means.
   written). Commit the delete first, in its own changeset.
 - **Key changes.** Refused, never translated: change keys through the
   application.
-- **An `ON UPDATE` action on a cloned child, with `allow_cascades=True`.** The
-  parent's `UPDATE` runs first and production updates the children itself, so
-  the children's own `UPDATE`s then match nothing and the commit refuses with a
-  `ConflictError` that names the earlier referential action. Without
-  `allow_cascades` it is refused up front with `CascadeError`.
+- **An `ON UPDATE CASCADE` on a cloned child.** The children follow the
+  parent's new value in the sandbox, which no order of single statements can
+  reproduce: the parent would have to change both before and after them. It is
+  refused in `diff()`. Change the referenced value through the application.
+  (`ON UPDATE SET NULL` and `SET DEFAULT` commit: the children are written
+  first, so production has nothing left to act on.)
+- **An upsert on the agent's own new row, in a table whose key production
+  assigns.** `INSERT ... ON CONFLICT DO UPDATE` or `INSERT OR IGNORE` naming a
+  key the sandbox generated is recorded as a key the agent supplied, so the row
+  is refused with `GeneratedValueError`. Update the row with a plain `UPDATE`
+  instead.
+- **Rows the agent inserts into SafeAgentDB's own change log.** The log of key
+  changes refuses `UPDATE` and `DELETE`, and dropping or altering it raises
+  `SchemaError`, but an agent that inserts a forged row into it can hide a key
+  change. What is then committed is the `DELETE` plus `INSERT` the diff shows,
+  truthfully, and a referential action that would reach rows outside the diff
+  is still refused unless `allow_cascades=True`.
 - **Unguarded columns on an UPDATE.** By design only the changed columns are
   guarded, so a concurrent edit to a column the agent did not touch is allowed
   through. That is the point -- it keeps unrelated work from colliding -- but it
@@ -939,6 +964,7 @@ tests/
 |-- test_audit_followups.py  Five issues found reviewing that work
 |-- test_review_findings.py  The six findings of the second review (docs/AUDIT.md)
 |-- test_review_0_3.py       The findings of the pre-0.3.0 review (docs/REVIEW_0_3.md)
+|-- test_review_round4.py    Round 4 of that review: the findings in its fixes
 '-- test_server_backed.py    Claims only a real server can settle (PostgreSQL in CI)
 
 docs/

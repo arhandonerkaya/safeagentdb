@@ -797,7 +797,9 @@ def clone_schema_to_sandbox(
     Anything that had to be given up is recorded in
     ``metadata.info["unsupported_constraints"]`` and surfaced by
     ``ShadowDB.unsupported_constraints``. Columns whose production default could
-    not be reproduced are recorded in ``metadata.info["generated_columns"]``.
+    not be reproduced are recorded in ``metadata.info["generated_columns"]``,
+    and datetime columns without a time zone in
+    ``metadata.info["naive_datetime_columns"]``.
 
     Args:
         empty_tables: Tables that will hold no rows in the sandbox. Foreign keys
@@ -812,6 +814,7 @@ def clone_schema_to_sandbox(
     generated: dict[str, list[str]] = {}
     provisional: dict[str, list[str]] = {}
     converted: dict[str, dict[str, str]] = {}
+    naive: dict[str, list[str]] = {}
     empty = set(empty_tables or ())
 
     # .tables rather than .sorted_tables: sorting resolves foreign keys, which
@@ -820,6 +823,13 @@ def clone_schema_to_sandbox(
     known_tables = {table.name for table in source_metadata.tables.values()}
     for table in source_metadata.tables.values():
         sandbox_table = table.to_metadata(sandbox_metadata)
+        without_zone = [
+            col.name
+            for col in table.columns
+            if isinstance(col.type, DateTime) and not col.type.timezone
+        ]
+        if without_zone:
+            naive[sandbox_table.name] = without_zone
         if actions and sandbox_table.name in actions:
             _apply_referential_actions(sandbox_table, actions[sandbox_table.name])
         conversions = _adapt_column_types(sandbox_table, unsupported)
@@ -842,6 +852,7 @@ def clone_schema_to_sandbox(
     sandbox_metadata.info["generated_columns"] = generated
     sandbox_metadata.info["provisional_key_columns"] = provisional
     sandbox_metadata.info["converted_columns"] = converted
+    sandbox_metadata.info["naive_datetime_columns"] = naive
     return sandbox_metadata
 
 
@@ -1013,6 +1024,7 @@ def install_change_tracking(
                 Column("seq", Integer, primary_key=True),
                 *[Column(f"o{j}", table.c[c].type) for j, c in enumerate(key_columns)],
                 *[Column(f"n{j}", table.c[c].type) for j, c in enumerate(key_columns)],
+                Column("deleted", Integer),
                 prefixes=["TEMPORARY"],
             )
             log.create(conn)
@@ -1026,6 +1038,15 @@ def install_change_tracking(
                 f"main.{quote(table.name)} WHEN {changed} BEGIN INSERT INTO "
                 f"{quote(log.name)} ({', '.join(targets)}) VALUES "
                 f"({', '.join(values)}); END"
+            )
+            # A deletion is logged too, so a key the agent frees and reuses is
+            # not taken for the row that held it before.
+            olds = [f"o{j}" for j in range(len(key_columns))]
+            conn.exec_driver_sql(
+                f"CREATE TEMP TRIGGER {quote(log.name + '_d')} AFTER DELETE ON "
+                f"main.{quote(table.name)} BEGIN INSERT INTO {quote(log.name)} "
+                f"({', '.join(olds)}, deleted) VALUES "
+                f"({', '.join(f'OLD.{quote(c)}' for c in key_columns)}, 1); END"
             )
             _make_read_only(conn, quote, log.name)
             key_logs[table_name] = (log, list(key_columns))
@@ -1051,6 +1072,15 @@ def install_change_tracking(
                 f"main.{quote(table.name)} WHEN NEW.{quote(column)} >= "
                 f"{PROVISIONAL_KEY_BASE} BEGIN INSERT INTO {quote(log.name)} (k) "
                 f"VALUES (NEW.{quote(column)}); END"
+            )
+            # A key the agent sets by UPDATE, on its own new row or any other,
+            # is supplied just the same.
+            conn.exec_driver_sql(
+                f"CREATE TEMP TRIGGER {quote(log.name + '_u')} BEFORE UPDATE OF "
+                f"{quote(column)} ON main.{quote(table.name)} WHEN "
+                f"NEW.{quote(column)} >= {PROVISIONAL_KEY_BASE} AND "
+                f"NEW.{quote(column)} IS NOT OLD.{quote(column)} BEGIN INSERT INTO "
+                f"{quote(log.name)} (k) VALUES (NEW.{quote(column)}); END"
             )
             _make_read_only(conn, quote, log.name)
             explicit_logs[table_name] = (log, column)
@@ -1089,16 +1119,22 @@ def tracking_problems(sandbox_engine: Engine, tracker: ChangeTracker) -> list[st
 
 def read_key_changes(
     sandbox_engine: Engine, tracker: ChangeTracker
-) -> dict[str, list[tuple[tuple, tuple]]]:
-    """{table: [(old key, new key), ...]} in the order the agent made them."""
-    changes: dict[str, list[tuple[tuple, tuple]]] = {}
+) -> dict[str, list[tuple[tuple, tuple | None]]]:
+    """{table: [(old key, new key), ...]} in the order the agent made them.
+
+    A deleted row appears as (old key, None).
+    """
+    changes: dict[str, list[tuple[tuple, tuple | None]]] = {}
     with sandbox_engine.connect() as conn:
         for table_name, (log, key_columns) in tracker.key_logs.items():
             width = len(key_columns)
             rows = conn.execute(select(log).order_by(log.c.seq)).fetchall()
             if rows:
                 changes[table_name] = [
-                    (tuple(row[1 : 1 + width]), tuple(row[1 + width : 1 + 2 * width]))
+                    (
+                        tuple(row[1 : 1 + width]),
+                        None if row.deleted else tuple(row[1 + width : 1 + 2 * width]),
+                    )
                     for row in rows
                 ]
     return changes
@@ -1116,10 +1152,15 @@ def read_explicit_keys(sandbox_engine: Engine, tracker: ChangeTracker) -> dict[s
 
 
 def schema_signature(sandbox_engine: Engine) -> tuple[tuple, ...]:
-    """Every object in the sandbox's main schema, to detect DDL by the agent."""
+    """Every object in the sandbox's main schema, to detect DDL by the agent.
+
+    SQLite's statistics tables are left out: ANALYZE creates them, and they
+    change no table a diff reads.
+    """
     with sandbox_engine.connect() as conn:
         rows = conn.exec_driver_sql(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            "SELECT type, name, tbl_name, sql FROM sqlite_master"
+            " WHERE name NOT IN ('sqlite_stat1', 'sqlite_stat4') ORDER BY type, name"
         ).fetchall()
     return tuple(tuple(row) for row in rows)
 

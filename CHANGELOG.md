@@ -44,10 +44,14 @@ known limits documented in the README. MySQL is untested.
   `ShadowDB(..., allow_cascades=True)` to allow it within the tenant. A cascade
   the diff already shows, because the child table is cloned, needs no opt-in.
 - **Statement order is unit-of-work order**: INSERTs parents first, then
-  UPDATEs, then DELETEs children first, with rows ordered by their references.
-  DELETEs used to run first, so re-pointing a child and then deleting its old
-  parent never committed. A cycle between tables is no longer refused outright;
-  only rows that really reference each other in a cycle are.
+  UPDATEs, then DELETEs children first, except where a foreign key between two
+  rows of the changeset needs otherwise, in any table and any phase (including
+  a foreign key onto a `UNIQUE` column that is not the primary key). DELETEs
+  used to run first, so re-pointing a child and then deleting its old parent
+  never committed. A cycle between tables is no longer refused outright; rows
+  with no order production would accept one statement at a time are refused in
+  `diff()`, including a cloned child that follows its parent's new value
+  through `ON UPDATE CASCADE`.
 - **`commit_to_production()` raises `RowValidationError`** (a `SyncError`) for a
   row that fails its `SafeModel`, instead of pydantic's `ValidationError`, which
   is kept as `__cause__`. `except pydantic.ValidationError` around a commit
@@ -70,10 +74,14 @@ known limits documented in the README. MySQL is untested.
   string.
 - **Datetimes are held as ISO 8601 text in the sandbox**, keeping a UTC offset.
   `RowDiff.old`/`new` hold that text; `RowDiff.logical_row()` gives the
-  `datetime`.
+  `datetime`. A value with an offset for a column without time zone (PostgreSQL
+  `timestamp`) is refused, where the database used to convert it silently.
 - **`tenant_id` is converted to the tenant column's type at `__enter__`**, so
-  `ShadowDB.tenant_id` may differ from what you passed (`"42"` becomes `42`). A
-  value that does not convert exactly raises `UsageError`.
+  `ShadowDB.tenant_id` may differ from what you passed (`"42"` becomes `42`, and
+  `42` becomes `Decimal("42")` for a `NUMERIC` column). A value that does not
+  convert exactly raises `UsageError`. A referencing row counts as the acting
+  tenant's only when its tenant value equals the tenant id exactly, so `'042'`
+  in a `TEXT` column is another tenant's.
 - **On a SQLite production, `DATETIME`, `DATE`, `TIME` and `BOOLEAN` columns are
   no longer part of the compare-and-swap guard**, so a concurrent edit confined
   to one is not detected there.
@@ -130,8 +138,8 @@ known limits documented in the README. MySQL is untested.
   `RowValidationError` and `UsageError`; `ChangeSet.blocking_errors` entries for
   key changes and row cycles; `diff.canonical_value()`, the type-tagged form
   behind change detection and the fingerprint; `models.format_validation_error()`.
-  72 tests in `tests/test_review_0_3.py` and 9 more server-backed tests: 280
-  local tests and 29 against PostgreSQL.
+  72 tests in `tests/test_review_0_3.py`, 47 in `tests/test_review_round4.py`
+  and 15 more server-backed tests: 327 local tests and 35 against PostgreSQL.
 
 ### Fixed (pre-0.3.0 review)
 
@@ -189,6 +197,37 @@ Ids refer to [docs/REVIEW_0_3.md](docs/REVIEW_0_3.md).
 - The cascade check is built from SQLAlchemy Core rather than f-string SQL, so
   it no longer double-quotes identifiers (suspected to fail on MySQL).
 - MySQL `TINYINT` is an integer in the sandbox, not a string.
+
+### Fixed (pre-0.3.0 review, round 4)
+
+A review of the fixes above (Round 4 in
+[docs/REVIEW_0_3.md](docs/REVIEW_0_3.md)). Each reproduction became a failing
+test in `tests/test_review_round4.py` before it was fixed.
+
+- **R4-1** The cascade check counted another tenant's rows as the acting
+  tenant's when a `TEXT` tenant column held `'042'`, `'+42'` or `' 42'`, so
+  `allow_cascades=True` let production delete them. Tenant values are now
+  compared exactly, after a lossless conversion only.
+- **R4-2** A `NUMERIC`/`DECIMAL` tenant column refused an integer `tenant_id`.
+  Any exact conversion between `int`, `Decimal` and integer text is taken.
+- **R4-3** UPDATEs were not ordered by the references between rows, so a
+  changeset re-pointing a child and renaming its parent's `UNIQUE` value, or
+  renaming a value and inserting a child that references it, was shown as SAFE
+  and then rejected by production.
+- **R4-4** A key the agent set by `UPDATE` on its own new row was treated as one
+  the sandbox generated, and production replaced it. It is refused as a
+  supplied value, exactly like the same key set by `INSERT`.
+- **R4-6** Deleting a row, inserting a new one under its key and moving that was
+  reported as a key change of the deleted row.
+- **R4-8** `ANALYZE` was refused as a schema change.
+- **R4-9** `AgentSQLError` said earlier changes were kept after `OR ROLLBACK`
+  had discarded them. It now says which happened.
+- A datetime with an offset for a PostgreSQL `timestamp` column was converted by
+  the session time zone without notice. It is refused.
+- Documented, not changed: an upsert on the agent's own new row in a table
+  whose key production assigns is refused (R4-5), and a forged row inserted
+  into the key-change log can hide a key change (R4-7). See the README's known
+  limits.
 
 ### Fixed (second review)
 

@@ -159,6 +159,9 @@ class RowDiff:
     provisional_references: dict[str, frozenset] = field(default_factory=dict)
     # Every key the sandbox generated, in any table of the changeset.
     all_generated_keys: frozenset = frozenset()
+    # Datetime columns whose production type has no time zone, where the
+    # database would silently convert an offset-aware value.
+    naive_datetime_columns: tuple[str, ...] = ()
 
     def logical_row(self, row: dict[str, Any] | None) -> dict[str, Any]:
         """A row as production sees it, not as the sandbox had to store it.
@@ -203,8 +206,10 @@ class RowDiff:
     def undecodable_columns(self) -> dict[str, str]:
         """{column: reason} for written values production's type cannot take.
 
-        Text in a JSON column that is not JSON, or text in a datetime column
-        that is not a timestamp. Refused rather than written as a guess.
+        Text in a JSON column that is not JSON, text in a datetime column that
+        is not a timestamp, or a UTC offset for a column without time zone,
+        which the database would convert by its session time zone and drop
+        without saying so. Refused rather than written as a guess.
         """
         problems: dict[str, str] = {}
         row = self.new or {}
@@ -213,9 +218,20 @@ class RowDiff:
             if conversion not in (JSON_CONVERSION, DATETIME_CONVERSION):
                 continue
             try:
-                decode_sandbox_value(row.get(col), conversion)
+                decoded = decode_sandbox_value(row.get(col), conversion)
             except SandboxValueError as exc:
                 problems[col] = str(exc)
+                continue
+            if (
+                col in self.naive_datetime_columns
+                and isinstance(decoded, dt.datetime)
+                and decoded.utcoffset() is not None
+            ):
+                problems[col] = (
+                    f"{row.get(col)!r} carries a UTC offset, but the production "
+                    f"column has no time zone, so the database would convert it "
+                    f"by its session time zone and drop the offset"
+                )
         return problems
 
     def undecodable_message(self, problems: dict[str, str]) -> str:
@@ -230,6 +246,11 @@ class RowDiff:
             hints.append(
                 "a datetime column holds ISO 8601 text, such as "
                 "'2024-01-01 10:00:00' or '2024-01-01 10:00:00+02:00'"
+            )
+        if any("no time zone" in reason for reason in problems.values()):
+            hints.append(
+                "a column without time zone takes a value without an offset, "
+                "such as '2024-01-01 10:00:00', in the time it should hold"
             )
         return (
             f"{details} in '{self.table}'. SafeAgentDB will not guess what was "
@@ -806,14 +827,21 @@ def normalise_tenant_id(value: Any, python_type: type) -> Any:
     usually an integer. Comparing '42' with 42 in Python made every write a
     "tenant breach". Raises ValueError when the conversion would not be exact,
     so nothing is guessed: '42' becomes 42, '42.0' and 'forty-two' do not.
+    Between int, Decimal and integer text any exact conversion is taken, so 42
+    works for a NUMERIC column and Decimal('42') for an INTEGER one.
     """
-    if isinstance(value, python_type) and not (
-        python_type is int and isinstance(value, bool)
-    ):
+    if isinstance(value, bool):
+        if python_type is bool:
+            return value
+        raise ValueError(f"{value!r} (bool) does not convert exactly to {python_type.__name__}")
+    if isinstance(value, python_type):
         return value
-    if python_type is int and isinstance(value, str) and _INTEGER_TEXT.fullmatch(value.strip()):
-        return int(value.strip())
-    if python_type is str and isinstance(value, int | uuid.UUID) and not isinstance(value, bool):
+    if python_type in (int, decimal.Decimal):
+        if isinstance(value, str) and _INTEGER_TEXT.fullmatch(value.strip()):
+            return python_type(int(value.strip()))
+        if isinstance(value, int | decimal.Decimal) and _is_integral(value):
+            return python_type(int(value))
+    if python_type is str and isinstance(value, int | uuid.UUID):
         return str(value)
     if python_type is uuid.UUID and isinstance(value, str):
         return uuid.UUID(value)
@@ -822,14 +850,34 @@ def normalise_tenant_id(value: Any, python_type: type) -> Any:
     )
 
 
+def _is_integral(value: int | decimal.Decimal) -> bool:
+    return isinstance(value, int) or (value.is_finite() and value == value.to_integral_value())
+
+
 def same_tenant(value: Any, tenant_id: Any) -> bool:
-    """Whether a row's tenant value is the acting tenant, compared normalised."""
+    """Whether a row's tenant value is the acting tenant, compared exactly.
+
+    ``tenant_id`` is already normalised. A value of another type matches only
+    when one converts to the other without loss and they are then equal: 42,
+    Decimal('42') and the text '42' are tenant 42, while '042', '+42', ' 42',
+    '42.0' and 42.0 are not, since text that differs is a different value in a
+    TEXT column. Anything that cannot be compared this way is not the tenant,
+    so a check built on this refuses rather than assumes.
+    """
     if value is None or tenant_id is None:
         return False
-    try:
-        return normalise_tenant_id(value, type(tenant_id)) == tenant_id
-    except (TypeError, ValueError):
-        return False
+    if isinstance(value, bool) or isinstance(tenant_id, bool):
+        return type(value) is type(tenant_id) and value == tenant_id
+    numeric = int | decimal.Decimal
+    if isinstance(value, numeric) and isinstance(tenant_id, numeric):
+        # Python compares int and Decimal exactly.
+        return value == tenant_id
+    exact_text = int | decimal.Decimal | uuid.UUID
+    if isinstance(value, str) and isinstance(tenant_id, exact_text):
+        return value == str(tenant_id)
+    if isinstance(tenant_id, str) and isinstance(value, exact_text):
+        return str(value) == tenant_id
+    return type(value) is type(tenant_id) and value == tenant_id
 
 
 def _display_value(d: RowDiff, column: str, value: Any) -> str:
@@ -881,6 +929,7 @@ def compute_diff(
     converted_columns: dict[str, dict[str, str]] | None = None,
     explicit_keys: dict[str, set] | None = None,
     provisional_references: dict[str, dict[str, str]] | None = None,
+    naive_datetime_columns: dict[str, list[str]] | None = None,
 ) -> ChangeSet:
     """Diff two snapshots, row by row, keyed on each table's row key.
 
@@ -890,6 +939,8 @@ def compute_diff(
             sentinel is a key the sandbox generated.
         provisional_references: {table: {column: referenced table}} for
             foreign-key columns pointing at a provisional key column.
+        naive_datetime_columns: {table: datetime columns without time zone},
+            into which an offset-aware value is refused.
     """
     changeset = ChangeSet(unsupported_constraints=list(unsupported_constraints or []))
     generated = generated_columns or {}
@@ -897,6 +948,7 @@ def compute_diff(
     converted = converted_columns or {}
     explicit = explicit_keys or {}
     references = provisional_references or {}
+    naive = naive_datetime_columns or {}
 
     # The keys the sandbox generated, per provisional table. Cloned rows are
     # all below the sentinel (seed_provisional_keys guarantees it), so a value
@@ -921,6 +973,7 @@ def compute_diff(
         table_generated = tuple(generated.get(table_name, ()))
         table_provisional = tuple(provisional.get(table_name, ()))
         table_converted = dict(converted.get(table_name, {}))
+        table_naive = tuple(naive.get(table_name, ()))
         own_generated = generated_keys.get(table_name, frozenset())
         table_references = {
             column: generated_keys.get(parent, frozenset())
@@ -957,6 +1010,7 @@ def compute_diff(
                     generated_keys=own_generated,
                     provisional_references=table_references,
                     all_generated_keys=all_generated,
+                    naive_datetime_columns=table_naive,
                     pk=dict(zip(pks, pk_key, strict=False)),
                     new=curr_rows[pk_key],
                 )
@@ -981,6 +1035,7 @@ def compute_diff(
                         generated_keys=own_generated,
                         provisional_references=table_references,
                         all_generated_keys=all_generated,
+                        naive_datetime_columns=table_naive,
                     )
                 )
 

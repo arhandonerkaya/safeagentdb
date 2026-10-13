@@ -931,3 +931,119 @@ class TestReviewTypesOnServer:
         external = _scalar(engine, "SELECT external_id FROM r3_ev WHERE id = 1")
         assert external == 1234567890123456789
         assert _scalar(engine, "SELECT COUNT(*) FROM r3_ev") == 1
+
+
+class TestRound4OnServer:
+    """Round 4 of the review: the cases only a server can show."""
+
+    NAIVE = [
+        "CREATE TABLE r4_ev (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,"
+        " at TIMESTAMP WITHOUT TIME ZONE)",
+        "INSERT INTO r4_ev VALUES (1, 42, '2024-01-01 10:00:00')",
+    ]
+
+    def _naive(self, make_tables):
+        import datetime as dt
+
+        engine = make_tables(self.NAIVE, ["r4_ev"])
+        _validator("r4_ev", id=int, user_id=int, at=dt.datetime | None)
+        return engine
+
+    @pytest.mark.parametrize(
+        "value", ["2024-06-01 12:00:00+02:00", "2024-06-01T12:00:00Z"]
+    )
+    def test_an_offset_into_a_naive_timestamp_is_refused(self, make_tables, value):
+        """Suspected in round 4: PostgreSQL converted by the session TimeZone
+        and dropped the offset without saying so."""
+        from safeagentdb import SyncError
+
+        engine = self._naive(make_tables)
+        with ShadowDB(engine, tables=["r4_ev"], tenant_id=42) as sandbox:
+            sandbox.execute(f"UPDATE r4_ev SET at = '{value}' WHERE id = 1")
+            sandbox.execute(f"INSERT INTO r4_ev VALUES (2, 42, '{value}')")
+            changeset = sandbox.diff()
+            assert changeset.is_valid is False
+            assert all("time zone" in msg for _, ok, msg in changeset.validate_all() if not ok)
+            with pytest.raises(SyncError, match="time zone"):
+                sandbox.commit_to_production()
+
+        assert _scalar(engine, "SELECT COUNT(*) FROM r4_ev") == 1
+        assert str(_scalar(engine, "SELECT at FROM r4_ev WHERE id = 1")) == "2024-01-01 10:00:00"
+
+    def test_a_naive_value_is_still_written(self, make_tables):
+        engine = self._naive(make_tables)
+        with ShadowDB(engine, tables=["r4_ev"], tenant_id=42) as sandbox:
+            sandbox.execute("UPDATE r4_ev SET at = '2024-06-01 12:00:00' WHERE id = 1")
+            sandbox.execute("INSERT INTO r4_ev SELECT 2, user_id, at FROM r4_ev WHERE id = 1")
+            changeset = sandbox.diff()
+            assert changeset.is_valid is True, changeset.validate_all()
+            assert sandbox.commit_to_production(changeset=changeset) == 2
+
+        assert _scalar(engine, "SELECT COUNT(*) FROM r4_ev WHERE at = '2024-06-01 12:00:00'") == 2
+
+    def test_a_numeric_tenant_on_an_uncloned_child_is_the_tenant(self, make_tables):
+        """Suspected in round 4: psycopg2 returns Decimal('42') for a numeric
+        column, which same_tenant() could not compare with 42."""
+        engine = make_tables(
+            [
+                "CREATE TABLE r4_parent (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)",
+                "CREATE TABLE r4_share (id INTEGER PRIMARY KEY, user_id NUMERIC NOT NULL,"
+                " parent_id INTEGER REFERENCES r4_parent(id) ON DELETE CASCADE)",
+                "INSERT INTO r4_parent VALUES (1, 42)",
+                "INSERT INTO r4_share VALUES (100, 42, 1)",
+            ],
+            ["r4_share", "r4_parent"],
+        )
+        _validator("r4_parent", id=int, user_id=int)
+        with ShadowDB(
+            engine, tables=["r4_parent"], tenant_id=42, allow_cascades=True
+        ) as sandbox:
+            sandbox.execute("DELETE FROM r4_parent WHERE id = 1")
+            assert sandbox.commit_to_production() == 1
+        assert _scalar(engine, "SELECT COUNT(*) FROM r4_share") == 0
+
+    def test_a_numeric_tenant_column_takes_an_integer_tenant_id(self, make_tables):
+        import decimal
+
+        engine = make_tables(
+            [
+                "CREATE TABLE r4_num (id INTEGER PRIMARY KEY, user_id NUMERIC(10,0) NOT NULL,"
+                " title TEXT)",
+                "INSERT INTO r4_num VALUES (1, 42, 'a'), (2, 7, 'theirs')",
+            ],
+            ["r4_num"],
+        )
+        _validator("r4_num", id=int, user_id=decimal.Decimal, title=str)
+        with ShadowDB(engine, tables=["r4_num"], tenant_id=42) as sandbox:
+            assert sandbox.query("SELECT id FROM r4_num") == [{"id": 1}]
+            sandbox.execute("UPDATE r4_num SET title = 'b' WHERE id = 1")
+            assert sandbox.commit_to_production() == 1
+        assert _scalar(engine, "SELECT title FROM r4_num WHERE id = 2") == "theirs"
+
+    def test_updates_are_ordered_by_references_to_a_unique_column(self, make_tables):
+        """R4-3 on a server that checks every NOT DEFERRABLE foreign key per
+        statement."""
+        engine = make_tables(
+            [
+                "CREATE TABLE r4_p (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,"
+                " code TEXT NOT NULL UNIQUE)",
+                "CREATE TABLE r4_c (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,"
+                " pcode TEXT REFERENCES r4_p(code))",
+                "INSERT INTO r4_p VALUES (1, 42, 'A'), (2, 42, 'C')",
+                "INSERT INTO r4_c VALUES (10, 42, 'A')",
+            ],
+            ["r4_c", "r4_p"],
+        )
+        _validator("r4_p", id=int, user_id=int, code=str)
+        _validator("r4_c", id=int, user_id=int, pcode=str | None)
+        with ShadowDB(engine, tables=["r4_p", "r4_c"], tenant_id=42) as sandbox:
+            # The child leaves 'A' before the parent gives it up, and the
+            # parent takes 'B' before the new child references it.
+            sandbox.execute("UPDATE r4_c SET pcode = 'C' WHERE id = 10")
+            sandbox.execute("UPDATE r4_p SET code = 'B' WHERE id = 1")
+            sandbox.execute("INSERT INTO r4_c VALUES (11, 42, 'B')")
+            assert sandbox.commit_to_production() == 3
+
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT id, pcode FROM r4_c ORDER BY id")).fetchall()
+        assert [tuple(r) for r in rows] == [(10, "C"), (11, "B")]
