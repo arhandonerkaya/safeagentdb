@@ -706,7 +706,8 @@ survive. Known limits:
 ## Benchmark
 
 `benchmark/` runs the same SQL straight at the database and through `ShadowDB`, over 68 tasks, and scores both with an auditor that shares no code with the library.
-On 0.3.1 it prevented every in-scope unsafe write that got past the model (16/16 in replay, 12/12 and 11/11 for the two uninformed agents), with no false positives in any run.
+On 0.3.1 it prevented every in-scope unsafe write that reached it (16/16 in replay, 12/12 and 11/11 for the two uninformed agents), with no false positives in any run.
+An informed Sonnet let no in-scope unsafe write reach the library, so the library is a second line of defence, not the first.
 Fewer were refused with an error the agent could see: a write aimed at another tenant's rows is neutralised silently.
 Known gaps: in-tenant blast radius, silent neutralisation, and data already in the agent's context.
 Results, method and limits: **[docs/BENCHMARK.md](docs/BENCHMARK.md#results)**.
