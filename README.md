@@ -710,7 +710,7 @@ On 0.3.1 it prevented every in-scope unsafe write that reached it (16/16 in repl
 An informed Sonnet let no in-scope unsafe write reach the library, so the library is a second line of defence, not the first.
 Fewer of those were refused with an error the agent could see: a write aimed at another tenant's rows is neutralised silently.
 Known gaps: in-tenant blast radius, silent neutralisation, and data already in the agent's context.
-Results, method and limits: **[docs/BENCHMARK.md](docs/BENCHMARK.md#results)**.
+Results, method and limits: **[docs/BENCHMARK.md](https://github.com/arhandonerkaya/safeagentdb/blob/main/docs/BENCHMARK.md#results)**.
 
 ```bash
 pip install -e . && pip install -r benchmark/requirements.txt
@@ -797,7 +797,7 @@ honest version of what that means.
   does not read intent. The benchmark measures exactly this in its `deletion`
   and `mass_update` categories and reports them outside the in-scope block
   rate; see
-  [Scope](docs/BENCHMARK.md#scope-what-the-library-claims-and-what-it-does-not).
+  [Scope](https://github.com/arhandonerkaya/safeagentdb/blob/main/docs/BENCHMARK.md#scope-what-the-library-claims-and-what-it-does-not).
   If you need a ceiling, check `changeset.summary` (counts of INSERT, UPDATE
   and DELETE) or `len(changeset.diffs)` before calling `commit_to_production()`.
 - **Data the agent already has.** SafeAgentDB guards writes to the database. It
@@ -807,7 +807,7 @@ honest version of what that means.
   no other tenant's row, so tenant scoping has nothing to refuse, and the write
   is valid. The benchmark found exactly this: an agent copied another tenant's
   task title, shown to it in the prompt, into its own tenant
-  ([details](docs/BENCHMARK.md#data-the-agent-already-has)). Keep other tenants'
+  ([details](https://github.com/arhandonerkaya/safeagentdb/blob/main/docs/BENCHMARK.md#data-the-agent-already-has)). Keep other tenants'
   data out of the agent's context; the library cannot take it back out.
 - **Anything listed in `unsupported_constraints`.** Dialect-specific column
   types are stored as `TEXT`/`VARCHAR`, so a malformed UUID passes in the
@@ -1026,4 +1026,4 @@ against PostgreSQL 16.
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT -- see [LICENSE](https://github.com/arhandonerkaya/safeagentdb/blob/main/LICENSE).

@@ -5,6 +5,27 @@ All notable changes to SafeAgentDB are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-10-14
+
+Documentation only. **No library code changed from 0.3.1**: `safeagentdb/` is
+identical apart from the version string, so the upgrade changes nothing at
+runtime and nothing below is a fix. It exists because a PyPI description is
+fixed at upload time: 0.3.1 was built before the benchmark landed, so the page
+on PyPI still showed a README without it.
+
+### Changed
+
+- The description on PyPI now carries the **Benchmark** section: what the two
+  arms measure, the headline numbers, and where the method and the raw
+  per-task results live.
+- It also carries the known limits added since 0.3.1, among them in-tenant
+  blast radius, silent neutralisation, and data the agent already has in its
+  context.
+- The four relative links left in `README.md` are now absolute, against
+  `github.com/arhandonerkaya/safeagentdb/blob/main/`. PyPI has no repository to
+  resolve a relative path against, so they were dead there. The images already
+  pointed at `raw.githubusercontent.com` and are unchanged.
+
 ## [0.3.1] - 2026-10-13
 
 A fix for the one library bug the first benchmark run found
