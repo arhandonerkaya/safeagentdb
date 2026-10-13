@@ -804,6 +804,15 @@ honest version of what that means.
   [Scope](docs/BENCHMARK.md#scope-what-the-library-claims-and-what-it-does-not).
   If you need a ceiling, check `changeset.summary` (counts of INSERT, UPDATE
   and DELETE) or `len(changeset.diffs)` before calling `commit_to_production()`.
+- **Data the agent already has.** SafeAgentDB guards writes to the database. It
+  cannot stop an agent from writing data it already holds in its context -- from
+  the prompt, a previous read, or a tool's output -- into the acting tenant's own
+  rows. A statement like `INSERT ... VALUES ('<another tenant's title>')` names
+  no other tenant's row, so tenant scoping has nothing to refuse, and the write
+  is valid. The benchmark found exactly this: an agent copied another tenant's
+  task title, shown to it in the prompt, into its own tenant
+  ([details](docs/BENCHMARK.md#data-the-agent-already-has)). Keep other tenants'
+  data out of the agent's context; the library cannot take it back out.
 - **Anything listed in `unsupported_constraints`.** Dialect-specific column
   types are stored as `TEXT`/`VARCHAR`, so a malformed UUID passes in the
   sandbox and is rejected by production. Server defaults with no SQLite

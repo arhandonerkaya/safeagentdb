@@ -911,13 +911,115 @@ class TestUninformedPrompt:
         ):
             assert phrase not in text, phrase
 
-    def test_the_informed_prompt_is_unchanged(self):
+    def test_prompt_version_1_is_the_informed_prompt_the_old_runs_saw(self):
         from benchmark.agent import SYSTEM_PROMPT, TOOL_NAME, USER_PROMPT, prompts_for
         from benchmark.seed import schema_for_prompt
 
-        system, user = prompts_for("informed", 42, "x")
+        system, user = prompts_for("informed", 42, "x", version=1)
         assert system == SYSTEM_PROMPT.format(tool=TOOL_NAME, schema=schema_for_prompt())
         assert user == USER_PROMPT.format(tenant_id=42, prompt="x")
+        assert "lin@globex.test" in system  # every tenant's rows, as before
+
+
+class TestPromptVersion2:
+    @staticmethod
+    def _foreign_values(tenant):
+        from benchmark.seed import TASKS, USERS
+
+        return [row[3] for row in TASKS if row[1] != tenant] + [
+            row[2] for row in USERS if row[1] != tenant
+        ]
+
+    @pytest.mark.parametrize("condition", ["informed", "uninformed"])
+    @pytest.mark.parametrize("tenant", [42, 99])
+    def test_no_other_tenant_s_seed_value_appears(self, condition, tenant):
+        from benchmark.agent import prompts_for
+
+        system, user = prompts_for(condition, tenant, "Tidy up the board.", version=2)
+        text = system + user
+        foreign = self._foreign_values(tenant)
+        assert foreign  # the seed has rows for the other tenant to leak
+        for value in foreign:
+            assert value not in text, value
+
+    @pytest.mark.parametrize("tenant", [42, 99])
+    def test_the_tenant_s_own_rows_and_shared_plans_are_shown(self, tenant):
+        from benchmark.agent import prompts_for
+        from benchmark.seed import TASKS, USERS
+
+        system, _ = prompts_for("informed", tenant, "x", version=2)
+        for row in TASKS:
+            if row[1] == tenant:
+                assert row[3] in system
+        for row in USERS:
+            if row[1] == tenant:
+                assert row[2] in system
+        assert "'enterprise', 'Enterprise', 49000" in system
+
+    def test_it_is_the_default_and_is_recorded(self, workdir, no_model, replay_tasks):
+        from benchmark.agent import PROMPT_VERSION
+
+        assert PROMPT_VERSION == 2
+        assert AgentConfig().as_dict()["prompt_version"] == 2
+        (record,) = _replay(replay_tasks[:1], workdir)
+        assert record["prompt_version"] == 2
+
+    def test_two_prompt_versions_are_never_pooled(self):
+        a, b = _R._good("s1"), _R._good("s2")
+        a["prompt_version"], b["prompt_version"] = 1, 2
+        with pytest.raises(report_module.MixedResultsError, match="prompt"):
+            report_module.compute(_R._raw([a, b]))
+        report = report_module.compute_all([_R._raw([a, b])])
+        assert sorted(r["prompt_version"] for r in report["results"]) == [1, 2]
+
+    def test_a_legacy_file_was_shown_prompt_1(self):
+        assert report_module.compute(_R._raw([_R._good("s1")]))["prompt_version"] == 1
+
+
+class TestEstimate:
+    def test_replay_costs_nothing_and_makes_no_call(self, no_model):
+        from benchmark.estimate import estimate
+
+        result = estimate("replay", "claude-opus-5-5", None, 3, 68)
+        assert result.calls == 204 and result.mean_cost == 0.0
+
+    def test_it_reads_recorded_usage_and_never_calls(self, tmp_path, no_model):
+        from benchmark.estimate import estimate
+
+        record = _R._good("s1")
+        record["agent"]["usage"] = {
+            "input_tokens": 1_000_000,
+            "output_tokens": 100_000,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+        raw = _R._raw([record])
+        raw["agent_config"] = {"model": "claude-sonnet-5-5", "effort_sent": None}
+        (tmp_path / "raw-1.json").write_text(json.dumps(raw), encoding="utf-8")
+
+        result = estimate("informed", "claude-sonnet-5-5", "none", 2, 3, tmp_path)
+        # $2 input + $1 output per call, 6 calls.
+        assert result.calls == 6
+        assert result.mean_cost == pytest.approx(18.0)
+        assert result.basis.startswith("same condition, model and effort")
+
+    def test_the_flag_prints_and_exits_before_any_run(self, monkeypatch, no_model, capsys):
+        monkeypatch.setattr(
+            sys, "argv",
+            ["run", "--estimate", "--condition", "uninformed", "--model", "claude-sonnet-5-5"],
+        )
+        monkeypatch.setattr(
+            run_module, "run_once", lambda *a, **k: pytest.fail("--estimate started a run")
+        )
+        run_module.main()
+        out = capsys.readouterr().out
+        assert "expected: $" in out and "No call was made" in out
+
+    def test_an_unpriced_model_is_refused(self):
+        from benchmark.estimate import estimate
+
+        with pytest.raises(SystemExit, match="no price"):
+            estimate("informed", "claude-unknown-9", None, 1, 68)
 
     def test_the_request_sends_the_uninformed_prompt(self):
         from benchmark import agent as agent_module

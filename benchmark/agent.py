@@ -61,6 +61,15 @@ UNINFORMED = "uninformed"
 REPLAY = "replay"
 CONDITIONS = (INFORMED, UNINFORMED, REPLAY)
 
+# What the schema text shows the agent. Recorded with every result, and the
+# report never pools two versions.
+#   1  every tenant's seed rows -- what every run before 2026-10-13 was shown;
+#   2  only the acting tenant's users and tasks, as a deployment would. Under
+#      version 1 an agent could copy another tenant's data from the prompt
+#      itself (the Haiku run's authority-02).
+PROMPT_VERSION = 2
+PROMPT_VERSIONS = (1, 2)
+
 SUBMIT_SQL_TOOL: dict[str, Any] = {
     "name": TOOL_NAME,
     "description": (
@@ -135,17 +144,22 @@ Request:
 """
 
 
-def prompts_for(condition: str, tenant_id: int, prompt: str) -> tuple[str, str]:
-    """(system, user) text for a model-backed condition."""
+def prompts_for(
+    condition: str, tenant_id: int, prompt: str, version: int = PROMPT_VERSION
+) -> tuple[str, str]:
+    """(system, user) text for a model-backed condition and prompt version."""
+    if version not in PROMPT_VERSIONS:
+        raise ValueError(f"no prompt version {version}; known: {PROMPT_VERSIONS}")
+    shown = None if version == 1 else tenant_id
     if condition == INFORMED:
         return (
-            SYSTEM_PROMPT.format(tool=TOOL_NAME, schema=schema_for_prompt()),
+            SYSTEM_PROMPT.format(tool=TOOL_NAME, schema=schema_for_prompt(tenant=shown)),
             USER_PROMPT.format(tenant_id=tenant_id, prompt=prompt),
         )
     if condition == UNINFORMED:
         return (
             UNINFORMED_SYSTEM_PROMPT.format(
-                tool=TOOL_NAME, schema=schema_for_prompt(annotated=False)
+                tool=TOOL_NAME, schema=schema_for_prompt(annotated=False, tenant=shown)
             ),
             UNINFORMED_USER_PROMPT.format(tenant_id=tenant_id, prompt=prompt),
         )
@@ -161,6 +175,7 @@ class AgentConfig:
     temperature: float | None = None
     max_tokens: int = DEFAULT_MAX_TOKENS
     condition: str = INFORMED
+    prompt_version: int = PROMPT_VERSION
 
     @property
     def calls_model(self) -> bool:
@@ -182,6 +197,7 @@ class AgentConfig:
             # Nothing was sent anywhere, so nothing is recorded as if it were.
             return {
                 "condition": self.condition,
+                "prompt_version": self.prompt_version,
                 "model": None,
                 "effort_requested": None,
                 "effort_sent": None,
@@ -190,6 +206,7 @@ class AgentConfig:
             }
         return {
             "condition": self.condition,
+            "prompt_version": self.prompt_version,
             "model": self.model,
             "effort_requested": self.effort,
             "effort_sent": self.effort if self.sends_effort else None,
@@ -317,7 +334,7 @@ def generate_sql(
     tenant_id: int,
 ) -> AgentResult:
     """Ask the agent for the SQL that carries out one task."""
-    system, user = prompts_for(config.condition, tenant_id, prompt)
+    system, user = prompts_for(config.condition, tenant_id, prompt, config.prompt_version)
     request: dict[str, Any] = {
         "model": config.model,
         "max_tokens": config.max_tokens,
@@ -446,6 +463,9 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--condition", choices=(INFORMED, UNINFORMED), default=INFORMED)
     parser.add_argument(
+        "--prompt-version", type=int, choices=PROMPT_VERSIONS, default=PROMPT_VERSION
+    )
+    parser.add_argument(
         "--print-prompt",
         action="store_true",
         help="print the system and user prompt for the task, and exit without a call",
@@ -466,10 +486,13 @@ def main() -> None:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         condition=args.condition,
+        prompt_version=args.prompt_version,
     )
     task = tasks[0]
     if args.print_prompt:
-        system, user = prompts_for(args.condition, task["tenant_id"], task["prompt"])
+        system, user = prompts_for(
+            args.condition, task["tenant_id"], task["prompt"], args.prompt_version
+        )
         print(f"--- system ---\n{system}\n--- user ---\n{user}")
         return
     result = generate_sql(build_client(), config, task["prompt"], task["tenant_id"])

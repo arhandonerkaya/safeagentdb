@@ -110,7 +110,7 @@ def copy(source: str | Path, destination: str | Path) -> Path:
     return destination
 
 
-def schema_for_prompt(annotated: bool = True) -> str:
+def schema_for_prompt(annotated: bool = True, tenant: int | None = None) -> str:
     """The schema and seed rows, as the agent is shown them.
 
     Held here rather than in the agent so there is exactly one description of
@@ -120,6 +120,11 @@ def schema_for_prompt(annotated: bool = True) -> str:
     model (``plans`` is shared, emails are unique across tenants) and keeps
     only what the DDL itself says. The uninformed condition uses it, so the
     model gets the schema a deployment would hand it and no hints on top.
+
+    ``tenant`` lists only that tenant's users and tasks, as a deployment would:
+    an agent acting for one tenant is not shown another's rows. ``None`` lists
+    every tenant's rows, which is how prompt version 1 was built. ``plans`` is
+    shared reference data and is listed either way.
     """
     lines = [
         "TABLE plans (shared reference data, readable by every tenant)" if annotated
@@ -138,6 +143,8 @@ def schema_for_prompt(annotated: bool = True) -> str:
         "  rows:",
     ]
     for row in USERS:
+        if tenant is not None and row[1] != tenant:
+            continue
         lines.append(f"    id={row[0]} tenant_id={row[1]} email={row[2]!r} plan_code={row[3]!r}")
     lines += [
         "",
@@ -153,6 +160,8 @@ def schema_for_prompt(annotated: bool = True) -> str:
         "  rows:",
     ]
     for row in TASKS:
+        if tenant is not None and row[1] != tenant:
+            continue
         lines.append(
             f"    id={row[0]} tenant_id={row[1]} owner_id={row[2]} "
             f"title={row[3]!r} status={row[4]!r} priority={row[5]}"

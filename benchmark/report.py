@@ -87,6 +87,9 @@ LEGACY_CONDITION = "informed"
 # Raw files written before the auditor was versioned were scored by version 1.
 LEGACY_AUDITOR_VERSION = 1
 
+# Raw files written before the prompt was versioned showed every tenant's rows.
+LEGACY_PROMPT_VERSION = 1
+
 
 class MixedResultsError(ValueError):
     """Raised rather than pool records from different conditions or versions."""
@@ -124,8 +127,22 @@ def auditor_version_of(raw: dict[str, Any], record: dict[str, Any] | None = None
     return LEGACY_AUDITOR_VERSION
 
 
-def _group_key(raw: dict[str, Any], record: dict[str, Any]) -> tuple[str, str, int]:
-    return condition_of(raw, record), version_of(raw, record), auditor_version_of(raw, record)
+def prompt_version_of(raw: dict[str, Any], record: dict[str, Any] | None = None) -> int:
+    """Which prompt the agent was shown. Different prompts are never pooled."""
+    if record and record.get("prompt_version") is not None:
+        return int(record["prompt_version"])
+    if raw.get("prompt_version") is not None:
+        return int(raw["prompt_version"])
+    return LEGACY_PROMPT_VERSION
+
+
+def _group_key(raw: dict[str, Any], record: dict[str, Any]) -> tuple[str, str, int, int]:
+    return (
+        condition_of(raw, record),
+        version_of(raw, record),
+        auditor_version_of(raw, record),
+        prompt_version_of(raw, record),
+    )
 
 
 def split_groups(raw: dict[str, Any]) -> list[dict[str, Any]]:
@@ -134,18 +151,21 @@ def split_groups(raw: dict[str, Any]) -> list[dict[str, Any]]:
     A file from run.py holds a single condition and version, so this usually
     returns it unchanged. It exists so that nothing downstream can pool two.
     """
-    groups: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, int, int], list[dict[str, Any]]] = {}
     for record in raw.get("records") or []:
         groups.setdefault(_group_key(raw, record), []).append(record)
     if not groups:
-        groups[(condition_of(raw), version_of(raw), auditor_version_of(raw))] = []
+        groups[
+            (condition_of(raw), version_of(raw), auditor_version_of(raw), prompt_version_of(raw))
+        ] = []
 
     out = []
-    for (condition, version, auditor), records in groups.items():
+    for (condition, version, auditor, prompt), records in groups.items():
         part = dict(raw)
         part["condition"] = condition
         part["safeagentdb_version_number"] = version
         part["auditor_version"] = auditor
+        part["prompt_version"] = prompt
         part["records"] = records
         out.append(part)
     return out
@@ -270,16 +290,18 @@ def compute(raw: dict[str, Any]) -> dict[str, Any]:
     all_records = raw["records"]
     keys = {_group_key(raw, r) for r in all_records}
     if len(keys) > 1:
-        found = ", ".join(f"{c} on {v} (auditor {a})" for c, v, a in sorted(keys))
-        raise MixedResultsError(
-            f"refusing to pool records from different conditions, versions or "
-            f"auditors ({found}) into one number. Use compute_all(), which reports "
-            f"each separately."
+        found = ", ".join(
+            f"{c} on {v} (auditor {a}, prompt {pv})" for c, v, a, pv in sorted(keys)
         )
-    condition, version, auditor = (
+        raise MixedResultsError(
+            f"refusing to pool records from different conditions, versions, "
+            f"auditors or prompts ({found}) into one number. Use compute_all(), "
+            f"which reports each separately."
+        )
+    condition, version, auditor, prompt_version = (
         keys.pop()
         if keys
-        else (condition_of(raw), version_of(raw), auditor_version_of(raw))
+        else (condition_of(raw), version_of(raw), auditor_version_of(raw), prompt_version_of(raw))
     )
     failed = [r for r in all_records if _is_agent_error(r)]
     records = [r for r in all_records if not _is_agent_error(r)]
@@ -318,6 +340,7 @@ def compute(raw: dict[str, Any]) -> dict[str, Any]:
             "condition": condition,
             "safeagentdb_version_number": version,
             "auditor_version": auditor,
+            "prompt_version": prompt_version,
             "dry_run": raw.get("dry_run", False),
             "agent_config": raw.get("agent_config", {}),
             "safeagentdb_version": raw.get("safeagentdb_version"),
@@ -463,6 +486,7 @@ def compute(raw: dict[str, Any]) -> dict[str, Any]:
         "condition": condition,
         "safeagentdb_version_number": version,
         "auditor_version": auditor,
+        "prompt_version": prompt_version,
         "dry_run": raw.get("dry_run", False),
         "agent_config": raw.get("agent_config", {}),
         "safeagentdb_version": raw.get("safeagentdb_version"),
@@ -496,6 +520,7 @@ def compute_all(raws: list[dict[str, Any]]) -> dict[str, Any]:
         "conditions": sorted({r["condition"] for r in results}),
         "safeagentdb_versions": sorted({r["safeagentdb_version_number"] for r in results}),
         "auditor_versions": sorted({r["auditor_version"] for r in results}),
+        "prompt_versions": sorted({r["prompt_version"] for r in results}),
         "results": results,
     }
 
@@ -691,6 +716,10 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"- Condition: `{condition}`")
     lines.append(f"- Auditor: version {summary.get('auditor_version', LEGACY_AUDITOR_VERSION)}")
+    prompt_note = " (ignored: no model)" if condition == "replay" else ""
+    lines.append(
+        f"- Prompt: version {summary.get('prompt_version', LEGACY_PROMPT_VERSION)}{prompt_note}"
+    )
     if condition == "replay":
         lines.append(
             "- Model: none. Each task's fixed `replay_sql` from tasks.yaml ran in "
@@ -911,13 +940,14 @@ def render_report(report: dict[str, Any]) -> str:
     lines = [
         f"# SafeAgentDB agent benchmark: {len(results)} separate results",
         "",
-        "Each condition, SafeAgentDB version and auditor version is reported on "
-        "its own. No figure below pools records from two of them.",
+        "Each condition, SafeAgentDB version, auditor version and prompt version "
+        "is reported on its own. No figure below pools records from two of them.",
         "",
     ]
     headers = [
         f"`{r['condition']}` {r['safeagentdb_version_number']} "
-        f"auditor {r.get('auditor_version', LEGACY_AUDITOR_VERSION)}"
+        f"auditor {r.get('auditor_version', LEGACY_AUDITOR_VERSION)} "
+        f"prompt {r.get('prompt_version', LEGACY_PROMPT_VERSION)}"
         + (f" ({(r.get('agent_config') or {}).get('model')})"
            if (r.get("agent_config") or {}).get("model") else "")
         for r in results

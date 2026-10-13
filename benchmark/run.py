@@ -49,6 +49,8 @@ from benchmark.agent import (
     CONDITIONS,
     EMPTY_STATEMENTS,
     INFORMED,
+    PROMPT_VERSION,
+    PROMPT_VERSIONS,
     REPLAY,
     AgentConfig,
     AgentResult,
@@ -326,6 +328,7 @@ def run_once(
                     "condition": config.condition,
                     "safeagentdb_version": version,
                     "auditor_version": audit_module.AUDITOR_VERSION,
+                    "prompt_version": config.prompt_version,
                     "task_id": task["id"],
                     "category": task["category"],
                     "expected": task["expected"],
@@ -383,6 +386,7 @@ def run_once(
                 "condition": config.condition,
                 "safeagentdb_version": version,
                 "auditor_version": audit_module.AUDITOR_VERSION,
+                "prompt_version": config.prompt_version,
                 "task_id": task["id"],
                 "category": task["category"],
                 "expected": task["expected"],
@@ -457,6 +461,24 @@ def main() -> None:
     )
     parser.add_argument("--max-tokens", type=int, default=AgentConfig.max_tokens)
     parser.add_argument(
+        "--prompt-version",
+        type=int,
+        choices=PROMPT_VERSIONS,
+        default=PROMPT_VERSION,
+        help=(
+            "2 (default): the schema shows only the acting tenant's rows. 1: every "
+            "tenant's rows, as in the runs before 2026-10-13. Recorded with the results."
+        ),
+    )
+    parser.add_argument(
+        "--estimate",
+        action="store_true",
+        help=(
+            "print the expected API cost for this condition, model, effort and --runs, "
+            "from the token usage recorded in benchmark/results, and exit. No call is made."
+        ),
+    )
+    parser.add_argument(
         "--workdir",
         default="benchmark/results/work",
         help="scratch space for the per-task database copies",
@@ -476,12 +498,20 @@ def main() -> None:
     audit_module.verify_independence()
     tasks = load_tasks(args.tasks, require_replay=args.condition == REPLAY)
 
+    if args.estimate:
+        from benchmark.estimate import estimate, render
+
+        result = estimate(args.condition, args.model, args.effort, args.runs, len(tasks))
+        print(render(result, args.condition, args.model, args.effort, args.runs))
+        return
+
     config = AgentConfig(
         model=args.model,
         effort=args.effort,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         condition=args.condition,
+        prompt_version=args.prompt_version,
     )
 
     workdir = Path(args.workdir)
@@ -515,9 +545,11 @@ def main() -> None:
         # 2 added agent_declined per record and agent_declines per file.
         # 3 added the condition, and the bare version number, per file and record.
         # 4 added the auditor version, per file and record.
-        "schema_version": 4,
+        # 5 added the prompt version, per file and record.
+        "schema_version": 5,
         "condition": config.condition,
         "auditor_version": audit_module.AUDITOR_VERSION,
+        "prompt_version": config.prompt_version,
         "started_at": started.isoformat(),
         "finished_at": finished.isoformat(),
         "dry_run": args.dry_run,
