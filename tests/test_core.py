@@ -16,11 +16,10 @@ Run:  python release_test.py
 import sys
 from typing import Literal
 
-from pydantic import ValidationError
 from rich.console import Console
 from sqlalchemy import create_engine, text
 
-from safeagentdb import SafeModel, ShadowDB, SyncError
+from safeagentdb import RowValidationError, SafeModel, ShadowDB, SyncError
 
 console = Console()
 PASS = 0
@@ -191,8 +190,8 @@ with ShadowDB(prod_engine, tables=["tasks"], tenant_id=42) as sb:
 
     try:
         sb.commit_to_production()
-        check("Invalid sync blocked", False, "Should have raised ValidationError")
-    except ValidationError:
+        check("Invalid sync blocked", False, "Should have raised RowValidationError")
+    except RowValidationError:
         check("Invalid sync blocked by Pydantic", True)
 
 console.print()

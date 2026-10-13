@@ -35,6 +35,7 @@ from safeagentdb import (
     SafeModel,
     SchemaError,
     ShadowDB,
+    UsageError,
 )
 from safeagentdb.engine import (
     _is_balanced,
@@ -374,9 +375,9 @@ class TestForeignKeyHandling:
             with sandbox.sandbox_engine.connect() as conn:
                 assert conn.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
 
-            from sqlalchemy.exc import IntegrityError
+            from safeagentdb import AgentSQLError
 
-            with pytest.raises(IntegrityError):
+            with pytest.raises(AgentSQLError):
                 sandbox.execute(
                     "INSERT INTO tasks (id,user_id,owner_id,title) "
                     "VALUES (99,42,777,'orphan')"
@@ -507,7 +508,7 @@ class TestUnsupportedConstraintReport:
 class TestConflictOptions:
     def test_invalid_on_conflict_is_rejected_up_front(self, tmp_path):
         engine, _ = _prod_engine(tmp_path, "badopt.db", TASKS_DDL)
-        with pytest.raises(ValueError, match="on_conflict"):
+        with pytest.raises(UsageError, match="on_conflict"):
             ShadowDB(engine, tables=["tasks"], tenant_id=42, on_conflict="explode")
 
     def test_conflict_error_is_a_sync_error(self):
@@ -599,7 +600,7 @@ class TestValidatorPolicy:
             assert all("No SafeModel registered for table 'tasks'" in m for m in messages)
 
     def test_a_registered_validator_still_blocks_bad_data(self, tmp_path):
-        from pydantic import ValidationError
+        from safeagentdb import RowValidationError
 
         engine, _ = _prod_engine(tmp_path, "stillblocks.db", TASKS_DDL)
 
@@ -613,7 +614,7 @@ class TestValidatorPolicy:
         with ShadowDB(engine, tables=["tasks"], tenant_id=42) as sandbox:
             sandbox.execute("UPDATE tasks SET status='yolo' WHERE id=1")
             assert sandbox.diff().is_valid is False
-            with pytest.raises(ValidationError):
+            with pytest.raises(RowValidationError):
                 sandbox.commit_to_production()
 
         with engine.connect() as conn:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import warnings
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from safeagentdb.errors import MissingValidatorError, MissingValidatorWarning
 
@@ -61,6 +61,25 @@ def missing_validator_message(table_name: str) -> str:
         f"No SafeModel registered for table '{table_name}'. "
         f"Create a SafeModel subclass with __table_name__ = '{table_name}'."
     )
+
+
+def format_validation_error(exc: ValidationError) -> str:
+    """Every failing field with pydantic's reason and the value it got.
+
+    The dashboard once kept only the second line of pydantic's message, which
+    is the field name, so the reviewer saw which field failed but not why.
+    """
+    parts = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ())) or "(row)"
+        part = f"{location}: {error.get('msg', 'invalid')}"
+        if error.get("type") != "missing" and "input" in error:
+            shown = repr(error["input"])
+            if len(shown) > 80:
+                shown = shown[:77] + "..."
+            part += f" (got {shown})"
+        parts.append(part)
+    return "; ".join(parts) or str(exc)
 
 
 def validate_row(

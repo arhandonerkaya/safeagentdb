@@ -10,3 +10,4 @@ build/
 *.whl
 *.tar.gz
 junit.xml
+logs
