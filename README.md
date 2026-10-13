@@ -276,8 +276,8 @@ raises `SchemaError`.
 
 #### Generated keys
 
-A `serial` primary key is filled by a sequence that lives in production. SQLite
-has no equivalent, so the sandbox fills the column with a **placeholder** and
+A `serial` or identity (`GENERATED ... AS IDENTITY`) primary key is filled by a
+sequence that lives in production. SQLite has no equivalent, so the sandbox fills the column with a **placeholder** and
 the diff says so rather than showing an id that will not survive:
 
 ```
@@ -331,13 +331,6 @@ own uniqueness check decides, and a key another tenant holds fails the commit
 with `IntegrityViolationError`. Whether a SQLite column is a rowid alias is
 asked of SQLite rather than read off the declaration, since `INT PRIMARY KEY`,
 `INTEGER PRIMARY KEY DESC` and `WITHOUT ROWID` tables are not.
-
-**Not yet handled: PostgreSQL identity columns** (`GENERATED ... AS IDENTITY`).
-They reflect without the `nextval()` default a `serial` has, so the sandbox
-counts on from the cloned rows: for a tenant that does not hold the highest
-ids, an INSERT passes `diff()` and is rejected at commit (`BY DEFAULT`
-collides with another tenant's key; `ALWAYS` refuses any explicit value).
-Nothing wrong is written. Insert into such tables through the application.
 
 #### Reference tables
 

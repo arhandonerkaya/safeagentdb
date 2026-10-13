@@ -387,6 +387,20 @@ def _adapt_server_defaults(table: Table, unsupported: list[str]) -> list[str]:
     """Translate server defaults, returning the columns whose default was lost."""
     dropped: list[str] = []
     for col in table.columns:
+        if col.identity is not None:
+            # An identity column is filled by a sequence in production, like a
+            # serial, but reflects with the Identity itself as its default
+            # rather than a nextval() expression, so it is detected here.
+            kind = "ALWAYS" if col.identity.always else "BY DEFAULT"
+            col.identity = None
+            col.server_default = None
+            dropped.append(col.name)
+            unsupported.append(
+                f"{table.name}.{col.name}: GENERATED {kind} AS IDENTITY has no "
+                f"SQLite equivalent"
+            )
+            continue
+
         default = col.server_default
         if default is None:
             continue
