@@ -98,7 +98,7 @@ commit-only: drift since the clone, uniqueness against rows outside the
 tenant, and referential actions on rows the sandbox did not clone. A clean
 banner says so.
 
-See [Guarantees and limits](#guarantees-and-limits) for what these gates
+See [Guarantees and limits](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#guarantees-and-limits) for what these gates
 deliberately do **not** cover.
 
 ## Getting Started
@@ -246,7 +246,7 @@ column) raises `UsageError`.
 | Option | Default | What it does |
 |--------|---------|--------------|
 | `row_key` | `None` | Explicit row-identifying columns per table, e.g. `{"events": ["tenant_id", "event_uuid"]}`. Required for a table with no primary key, and usable to override one. The columns must exist and must be unique across the cloned rows, or `SchemaError` is raised. |
-| `reference_tables` | `None` | Tables to clone **in full**, ignoring the tenant filter. Use it for shared lookup tables (statuses, currencies, plans) so that foreign keys pointing at them are enforced in the sandbox. See [Reference tables](#reference-tables). |
+| `reference_tables` | `None` | Tables to clone **in full**, ignoring the tenant filter. Use it for shared lookup tables (statuses, currencies, plans) so that foreign keys pointing at them are enforced in the sandbox. See [Reference tables](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#reference-tables). |
 | `on_conflict` | `"abort"` | `"abort"` raises `ConflictError` when a production row changed between clone and commit, rolling the whole changeset back. `"ignore"` **applies the changeset in part**: it skips the drifted row, applies the rest, records each skip in `skipped_conflicts` and raises a `ConflictWarning` per skipped row. |
 | `require_validators` | `True` | `True`: a table with no registered `SafeModel` is a failed row in `diff()` and a `MissingValidatorError` at commit. `False`: a warning in both places, and the row is written unvalidated. |
 | `allow_cascades` | `False` | `False`: a `DELETE`, or an `UPDATE` of a referenced column, that would make production run a referential action (`CASCADE`, `SET NULL`, `SET DEFAULT`) on any existing row raises `CascadeError`, because that effect is not in the diff that was reviewed. `True`: such actions may run on this tenant's rows. Rows of another tenant, or rows whose owner cannot be determined, are refused either way. A cascade the diff already shows -- the child table is cloned and the agent's delete removed the children in the sandbox too -- needs no opt-in, because the children are deleted first and the parent's `DELETE` then triggers nothing. |
@@ -384,7 +384,7 @@ is), and so does entering one that has committed.
 | `execute` | `(sql: str, params: dict \| None) -> CursorResult` | Execute raw SQL inside the sandbox and return a standard SQLAlchemy `CursorResult`. **Without `params`** the string goes to SQLite exactly as written, so a literal such as `'{"a":1}'` is never read as a bind parameter. **With `params`** it runs as a `text()` statement with `:name` placeholders; `Decimal`, `datetime`, `date`, `time` and `UUID` values are bound as text. A failing statement raises `AgentSQLError` (driver error as `__cause__`); everything the agent did before it is kept. |
 | `query` | `(sql: str, params: dict \| None) -> list[dict]` | Execute a statement that returns rows and return them as plain dictionaries. A statement that returns no rows raises `AgentSQLError` -- it has still run, so use `execute()` for writes. |
 | `diff` | `() -> ChangeSet` | Flushes pending changes, snapshots the current sandbox state, and computes a row-level diff against the original clone. Returns a `ChangeSet` object. Raises `SchemaError` if the agent changed the sandbox schema, `SyncError` if it changed a reference table, and `UsageError` after a successful commit (the committed changes would otherwise be shown for approval again). |
-| `commit_to_production` | `(changeset: ChangeSet \| None = None) -> int` | Pass the `ChangeSet` you reviewed and the commit refuses with `ChangesetMismatchError` if the sandbox changed since -- **the recommended form wherever anything approves the change**. Omit it to commit whatever the sandbox currently holds. Runs all 7 safety gates and syncs approved changes to production in one atomic transaction, writing only the columns the agent changed. Returns the number of rows **SafeAgentDB's own statements wrote**, summed from each statement's rowcount; rows production changed through a referential action you allowed with `allow_cascades=True` are not counted. Raises `CascadeError`, `ChangesetMismatchError`, `ConflictError`, `GeneratedValueError`, `IntegrityViolationError`, `MissingValidatorError`, `RowValidationError`, `SchemaError` or `SyncError` -- see [Errors](#errors) -- and `UsageError` outside the `with` block or when `changeset` is not a `ChangeSet`. Can only be called once per sandbox (double-commit raises `SyncError`). |
+| `commit_to_production` | `(changeset: ChangeSet \| None = None) -> int` | Pass the `ChangeSet` you reviewed and the commit refuses with `ChangesetMismatchError` if the sandbox changed since -- **the recommended form wherever anything approves the change**. Omit it to commit whatever the sandbox currently holds. Runs all 7 safety gates and syncs approved changes to production in one atomic transaction, writing only the columns the agent changed. Returns the number of rows **SafeAgentDB's own statements wrote**, summed from each statement's rowcount; rows production changed through a referential action you allowed with `allow_cascades=True` are not counted. Raises `CascadeError`, `ChangesetMismatchError`, `ConflictError`, `GeneratedValueError`, `IntegrityViolationError`, `MissingValidatorError`, `RowValidationError`, `SchemaError` or `SyncError` -- see [Errors](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#errors) -- and `UsageError` outside the `with` block or when `changeset` is not a `ChangeSet`. Can only be called once per sandbox (double-commit raises `SyncError`). |
 
 **Properties:**
 
@@ -396,7 +396,7 @@ is), and so does entering one that has committed.
 | `row_keys` | `dict[str, list[str]]` | The row-identifying columns in use for each cloned table. |
 | `reference_table_names` | `list[str]` | Tables cloned in full and treated as read-only. |
 | `generated_columns` | `dict[str, list[str]]` | Columns whose production-side generated default the sandbox could not reproduce. |
-| `provisional_key_columns` | `dict[str, list[str]]` | Key columns the sandbox fills with a placeholder for production to replace. See [Generated keys](#generated-keys). |
+| `provisional_key_columns` | `dict[str, list[str]]` | Key columns the sandbox fills with a placeholder for production to replace. See [Generated keys](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#generated-keys). |
 | `assigned_keys` | `list[AssignedKey]` | For the last commit, the real keys production assigned to rows that held a placeholder. |
 | `skipped_conflicts` | `list[SkippedConflict]` | Rows the last commit left unapplied under `on_conflict="ignore"`. Empty otherwise. |
 | `unsupported_constraints` | `list[str]` | Schema elements that could not be reproduced in the sandbox, and are therefore **not enforced** there. See below. |
@@ -516,7 +516,7 @@ low-level `safeagentdb.models.validate_row()` helper, which raises pydantic's
 | `SchemaError` | A cloned table has no primary key and no usable `row_key`; a `row_key` names missing columns or is not unique in the cloned rows; the production schema cannot be reproduced in SQLite; `__enter__` hit a database error (unknown table, unreachable server); the tenant column holds different types in different tables; the agent changed the sandbox schema or dropped the tracking triggers. |
 | `SyncError` | Anything `diff()` reports as blocking (tenant breach, changed row key, cycle between rows, write to a reference table); an `UPDATE`/`DELETE` has no row-identifying key; a value production's type cannot take (text in a JSON column that is not JSON, text in a datetime column that is not a timestamp); a database error during the commit; the sandbox is committed twice. |
 | `ConflictError` | A guarded `UPDATE`/`DELETE` matched nothing, or a row key matches more than one row. Carries `.table`, `.row_key` and `.columns` (the drifted column names). The message only blames another writer when re-reading the row shows a column that changed; otherwise it says it cannot name one, and if an earlier statement's referential action (under `allow_cascades=True`) could have changed the row, it says that. |
-| `GeneratedValueError` | A new row supplies a key production is meant to assign, needs a generated value the sandbox could not hold for it, references a key the sandbox generated, or was deleted and re-inserted under the same custom `row_key`. Carries `.table` and `.columns`. See [Generated keys](#generated-keys). |
+| `GeneratedValueError` | A new row supplies a key production is meant to assign, needs a generated value the sandbox could not hold for it, references a key the sandbox generated, or was deleted and re-inserted under the same custom `row_key`. Carries `.table` and `.columns`. See [Generated keys](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#generated-keys). |
 | `IntegrityViolationError` | Production rejected a row the sandbox accepted. The message gives the driver's reason and the possible causes without claiming one: a row outside the tenant or in a table that was not cloned, or the unit-of-work order not suiting the changeset (a unique value moved from a deleted row to a new one). Carries `.table` and `.row_key`, and the driver's `IntegrityError` as `__cause__`. |
 | `RowValidationError` | A row failed its `SafeModel` at commit. `diff()` reports the same row as failed first. Carries `.table`, `.row_key`, `.errors` (pydantic's structured errors) and pydantic's `ValidationError` as `__cause__`. |
 | `MissingValidatorError` | A table has no registered `SafeModel` and `require_validators` is `True`. Also subclasses `KeyError`, so 0.1.x handlers keep working. |
@@ -658,8 +658,8 @@ The sandbox is always in-memory SQLite. What differs is how well each
 | Production | Support | What that means |
 |------------|---------|-----------------|
 | **PostgreSQL** | **First-class** | The production target SafeAgentDB is designed and tested for. CI runs the server-backed suite (`tests/test_server_backed.py`) against PostgreSQL 16: tenant isolation, compare-and-swap against a concurrent transaction, sequences, foreign keys and their order, cascades, key changes, `JSONB`/`ARRAY` and `timestamptz` round-trips. `JSONB`, `JSON`, `ARRAY` and `HSTORE` are carried as JSON text; `UUID`, `INET`, `CIDR`, `MACADDR`, `CITEXT`, `TSVECTOR` as text. |
-| **SQLite** | **Best-effort** | Exercised by most of the suite, which uses SQLite as the stand-in production, and the issues that were cheap to fix are fixed. The known limits are listed under [SQLite production](#sqlite-production). |
-| **MySQL / MariaDB** | **Untested** | Nothing in the library is MySQL-specific and every production statement is built from SQLAlchemy Core, so identifiers are quoted by the dialect. `TINYINT`/`MEDIUMINT` are integers in the sandbox; `ENUM`, `SET` and `YEAR` are carried as text. `AUTO_INCREMENT` keys are held provisionally (see [Generated keys](#generated-keys)); the three tests for that in `tests/test_review_b1.py` were run against MySQL 8.0 and run when `MYSQL_DATABASE_URL` is set, but CI has no MySQL job and nothing else is tested against a MySQL server, so treat the rest as unverified. |
+| **SQLite** | **Best-effort** | Exercised by most of the suite, which uses SQLite as the stand-in production, and the issues that were cheap to fix are fixed. The known limits are listed under [SQLite production](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#sqlite-production). |
+| **MySQL / MariaDB** | **Untested** | Nothing in the library is MySQL-specific and every production statement is built from SQLAlchemy Core, so identifiers are quoted by the dialect. `TINYINT`/`MEDIUMINT` are integers in the sandbox; `ENUM`, `SET` and `YEAR` are carried as text. `AUTO_INCREMENT` keys are held provisionally (see [Generated keys](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#generated-keys)); the three tests for that in `tests/test_review_b1.py` were run against MySQL 8.0 and run when `MYSQL_DATABASE_URL` is set, but CI has no MySQL job and nothing else is tested against a MySQL server, so treat the rest as unverified. |
 | Others | Not supported | Other SQLAlchemy dialects may work, but nothing is known about them. |
 
 The production sync always uses the original production metadata; the type
@@ -756,7 +756,7 @@ honest version of what that means.
   opt-in.
 - **Key changes**: an `UPDATE` that changes a row key is refused, because it
   would reach production as `DELETE` + `INSERT` and run the wrong referential
-  actions. See [Key changes](#key-changes).
+  actions. See [Key changes](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#key-changes).
 - **Exactly what was reviewed**: `commit_to_production(changeset=...)` compares
   the changeset's fingerprint against a freshly computed diff and refuses if the
   sandbox moved on, so an approval cannot be widened after the fact. The
@@ -772,7 +772,7 @@ honest version of what that means.
   concurrent edit to a different column of the same row is allowed to coexist; a
   `DELETE` guards the whole row. On PostgreSQL this is verified in CI; on a
   SQLite production some column types are left out of the guard (see
-  [SQLite production](#sqlite-production)).
+  [SQLite production](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#sqlite-production)).
 - **Values only production can generate**: a `serial`/identity key is left for
   production's sequence to assign and reported back, never invented by the
   sandbox. Supplying one by hand, or pointing at a placeholder that does not
@@ -820,7 +820,7 @@ honest version of what that means.
   Clone the referencing table to see them.
 - **The validity rules of remapped columns.** JSON and datetime values are
   carried through the sandbox as text and converted back exactly (see
-  [Supported Databases](#supported-databases)), but the sandbox does not
+  [Supported Databases](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#supported-databases)), but the sandbox does not
   enforce, say, an `ARRAY` element type, and JSON and text-mapped columns are
   excluded from the compare-and-swap guard because the two sides hold
   different representations.
@@ -895,7 +895,7 @@ DATABASE_URL=postgresql+psycopg2://user:pass@localhost/db python -m pytest -m re
 
 MySQL is not covered beyond the `AUTO_INCREMENT` tests in `tests/test_review_b1.py`,
 which run when `MYSQL_DATABASE_URL` is set; see
-[Supported Databases](#supported-databases).
+[Supported Databases](https://github.com/arhandonerkaya/safeagentdb/blob/main/README.md#supported-databases).
 
 ### Operational notes
 

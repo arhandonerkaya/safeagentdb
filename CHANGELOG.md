@@ -21,10 +21,13 @@ on PyPI still showed a README without it.
 - It also carries the known limits added since 0.3.1, among them in-tenant
   blast radius, silent neutralisation, and data the agent already has in its
   context.
-- The four relative links left in `README.md` are now absolute, against
-  `github.com/arhandonerkaya/safeagentdb/blob/main/`. PyPI has no repository to
-  resolve a relative path against, so they were dead there. The images already
-  pointed at `raw.githubusercontent.com` and are unchanged.
+- Every link in `README.md` is now absolute, against
+  `github.com/arhandonerkaya/safeagentdb/blob/main/`: the four relative paths,
+  and the eleven in-page anchors. PyPI has no repository to resolve a relative
+  path against, and its renderer strips the `id` from every heading, so both
+  kinds were dead there. Each anchor was checked against the slug GitHub
+  generates for the heading. The images already pointed at
+  `raw.githubusercontent.com` and are unchanged.
 
 ## [0.3.1] - 2026-10-13
 
